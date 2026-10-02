@@ -15,6 +15,9 @@ export class ClientSecrets {
 
   sign(idempotencyKey: string | undefined, operation: string): string {
     if (!idempotencyKey) return Hashing.token();
+    if (!this.settings.jwk.activePrivate.trim()) {
+      throw new Error('AUTH_ACTIVE_PRIVATE_JWK is required to derive idempotent client secrets');
+    }
     const key = Hashing.sha256(`gsio-oauth-idempotency-v1\0${this.settings.jwk.activePrivate}`);
     return Hashing.hmacSha256Base64Url(key, `${idempotencyKey}\0${operation}`);
   }

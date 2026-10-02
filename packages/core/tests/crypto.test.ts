@@ -79,6 +79,12 @@ describe('client secrets', () => {
     expect(secrets.hash('a')).toBe(Hashing.sha256Hex('a'));
     expect(secrets.hint('a')).toBe(Hashing.sha256Hex('a').slice(0, 16));
   });
+
+  test('refuse to derive a secret without an active signing key', () => {
+    const secrets = new ClientSecrets(loadIdentitySettings({ AUTH_ACTIVE_PRIVATE_JWK: ' ' }));
+    expect(() => secrets.sign('urn:x', 'create:c')).toThrow('AUTH_ACTIVE_PRIVATE_JWK is required');
+    expect(secrets.sign(undefined, 'create:c')).toMatch(TOKEN_PATTERN);
+  });
 });
 
 describe('signing keys', () => {

@@ -87,7 +87,8 @@ export class ControlPlaneHandlers {
         request: RouteRequest,
       ) => Promise<{ status: number; body?: unknown }>;
       return HttpResponse.from(await method.call(controller, request));
-    } catch {
+    } catch (error) {
+      console.error(`control-plane ${name} failed`, error);
       return new Response(null, { status: 500 });
     }
   }

@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test';
+import { expect, spyOn, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { useContainer } from '@di-framework/core/container';
 import { PostgresGateway } from '@di-framework/identity/src/shared/infrastructure/postgres-gateway.ts';
@@ -12,6 +12,7 @@ test('unknown paths are not control-plane routes', async () => {
 });
 
 test('reports a server error with no body when an operation throws', async () => {
+  const logged = spyOn(console, 'error').mockImplementation(() => {});
   const handlers = useContainer().resolve(ControlPlaneHandlers);
   const failing = {
     get(): string | null {
@@ -24,6 +25,8 @@ test('reports a server error with no body when an operation throws', async () =>
   );
   expect(response.status).toBe(500);
   expect(await response.text()).toBe('');
+  expect(logged).toHaveBeenCalledWith('control-plane createUser failed', expect.any(Error));
+  logged.mockRestore();
 });
 
 test('serves the JSON control plane through application services', async () => {
