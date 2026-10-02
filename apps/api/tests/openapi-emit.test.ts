@@ -1,70 +1,40 @@
 import { expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { useContainer } from '@di-framework/core/container';
-import { generateOpenAPIDocument } from '@di-framework/http';
+import { generateOpenAPI } from '@di-framework/http';
 import { YAML } from 'bun';
-import { OpenApiCatalog } from '../src/control-plane.ts';
+import { Users } from '../src/contracts/api.schemas.ts';
+import '../src/generated/account/v1/http.ts';
+import '../src/generated/admin/v1/http.ts';
+import '../src/generated/organizations/v1/http.ts';
 
-const apiRoot = resolve(import.meta.dir, '..');
+const specPath = resolve(import.meta.dir, '../api/v1/openapi.yaml');
 
-const METHODS = ['get', 'post', 'put', 'patch', 'delete'] as const;
-
-test('emitted OpenAPI matches the JSON control plane', async () => {
-  const source = YAML.parse(readFileSync(resolve(apiRoot, 'api/v1/openapi.yaml'), 'utf8')) as {
-    info: { title: string; version: string; description: string };
-    paths: Record<string, Record<string, Record<string, unknown>>>;
-    components: { schemas: Record<string, unknown> };
+test('the generated OpenAPI document lists users from the endpoint metadata', () => {
+  const source = YAML.parse(readFileSync(specPath, 'utf8')) as {
+    paths: Record<string, Record<string, { operationId?: string; responses?: unknown }>>;
   };
-  const catalog = useContainer().resolve(OpenApiCatalog);
-  const { document } = await generateOpenAPIDocument({
-    controllerModules: [resolve(apiRoot, 'src/control-plane.ts')],
-    configuration: {
-      title: source.info.title,
-      version: source.info.version,
-      description: source.info.description,
-      schemas: source.components.schemas,
-    },
-  });
+  const users = source.paths['/api/admin/users']?.get;
+  expect(users?.operationId).toBe('users');
+  const responses = users?.responses as {
+    '200'?: { content?: Record<string, { schema?: unknown }> };
+  };
+  expect(responses?.['200']?.content?.['application/json']?.schema).toEqual(Users.jsonSchema);
 
-  const expectedPaths: Record<string, Record<string, unknown>> = {};
-  for (const [path, item] of Object.entries(source.paths)) {
-    if (!path.startsWith('/api/')) continue;
-    for (const method of METHODS) {
-      const operation = item[method];
-      if (!operation || !isJson(operation)) continue;
-      const operationId = String(operation.operationId);
-      expectedPaths[path] ??= {};
-      expectedPaths[path][method] = {
-        ...operation,
-        operationId: `ControlPlaneController.${operationId}`,
-        summary: operation.summary ?? operationId,
-      };
-      delete (expectedPaths[path][method] as { tags?: unknown }).tags;
+  const document = generateOpenAPI({
+    title: 'Identity Auth Control Plane API',
+    version: 'v1',
+    description: 'API for managing organizations, users, and OIDC clients.',
+  });
+  for (const methods of Object.values(document.paths)) {
+    for (const operation of Object.values(methods)) {
+      const operationId = operation.operationId;
+      if (typeof operationId === 'string') {
+        (operation as { operationId: string }).operationId = operationId.slice(
+          operationId.lastIndexOf('.') + 1,
+        );
+      }
     }
   }
-
-  expect(catalog.operations).toHaveLength(
-    Object.values(expectedPaths).reduce((count, item) => count + Object.keys(item).length, 0),
-  );
-  expect(json(document.info)).toEqual(json(source.info));
-  expect(json(document.paths)).toEqual(json(expectedPaths));
-  expect(json(document.components.schemas)).toEqual(json(source.components.schemas));
+  expect(JSON.parse(JSON.stringify(document.paths))).toEqual(source.paths);
 });
-
-function isJson(operation: Record<string, unknown>): boolean {
-  const responses = operation.responses as
-    | Record<string, { content?: Record<string, unknown> }>
-    | undefined;
-  for (const [code, response] of Object.entries(responses ?? {})) {
-    const status = Number(code);
-    if (status < 200 || status >= 300) continue;
-    if (response.content?.['application/json']) return true;
-    if (status === 204 && !response.content) return true;
-  }
-  return false;
-}
-
-function json(value: unknown): unknown {
-  return JSON.parse(JSON.stringify(value));
-}

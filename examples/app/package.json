@@ -9,8 +9,8 @@
     "build": "bun build.ts"
   },
   "dependencies": {
-    "@di-framework/auth": "link:@di-framework/auth",
-    "@di-framework/core": "link:@di-framework/core",
-    "@di-framework/http": "link:@di-framework/http"
+    "@di-framework/auth": "^6.0.3",
+    "@di-framework/core": "^6.0.3",
+    "@di-framework/http": "^6.0.3"
   }
 }

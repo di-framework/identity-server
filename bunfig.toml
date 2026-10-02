@@ -1,5 +1,5 @@
 [test]
-preload = ["./apps/client/src/ui/dom.ts"]
+preload = ["./apps/api/scripts/generate-openapi.ts", "./apps/client/src/ui/dom.ts"]
 coverage = true
 coverageSkipTestFiles = true
 # Line coverage is required for every file the tests load.
@@ -9,4 +9,5 @@ coveragePathIgnorePatterns = [
   "**/node_modules/**",
   "**/di-framework/packages/**",
   "**/T/identity-*/**",
+  "**/apps/api/src/generated/**",
 ]

@@ -106,7 +106,7 @@ export function RegisterClientScreen({ page }: { page: PageOf<'register-client'>
   const [grantTypes, setGrantTypes] = useState('authorization_code,refresh_token');
   const [scopes, setScopes] = useState('openid,profile,email');
   return (
-    <AppPage page={page}>
+    <AppPage page={page} layout="form">
       <PageTitle>{t('registerTitle')}</PageTitle>
       <PostForm action="/admin/oauth-clients/register" csrf={page.csrf}>
         <ErrorAlert error={page.error} />

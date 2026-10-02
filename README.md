@@ -8,7 +8,7 @@ The workspace compares the OpenAPI document emitted by the HTTP controllers with
 
 ## Getting Started
 
-Prerequisites: [Bun](https://bun.sh), [Podman](https://podman.io), and the sibling `di-framework` packages linked on this machine (`@di-framework/cli`, `config`, `core`, `http`, and `repo`).
+Prerequisites: [Bun](https://bun.sh) and [Podman](https://podman.io). Framework packages install from npm.
 
 Start Postgres with the Compose file in this repository. The database, user, and password are `identity`, and the server listens on port 5432.
 
@@ -21,13 +21,14 @@ bun typecheck
 
 `DATABASE_URL` overrides the Postgres URL. `IDENTITY_DATABASE__URL` sets the same value through `@di-framework/config`. When neither is set, the default is `postgres://identity:identity@127.0.0.1:5432/identity`.
 
-Generate the checked-in OpenAPI types after the local spec is present at `apps/api/api/v1/openapi.yaml`:
+`di-framework generate` writes the HTTP controllers from the schema manifests in `apps/api/src/contracts`. `bun run generate:api` does that, then writes `apps/api/api/v1/openapi.yaml` from the generated `@Endpoint` metadata. Tests write that spec before they run. The spec is not committed.
 
 ```bash
+bun run generate:api
 bun run generate:types
 ```
 
-That spec is generated locally and is not committed. `bun run lint` runs Biome.
+`bun run lint` runs Biome.
 
 | Package | Path | Role |
 | --- | --- | --- |

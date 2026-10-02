@@ -9,12 +9,7 @@ import {
 import { PostgresGateway } from '@di-framework/identity/src/shared/infrastructure/postgres-gateway.ts';
 import { applyMigrations } from '@di-framework/identity-migrations';
 import type { SqlDatabase } from '@di-framework/repo';
-import {
-  ControlPlaneController,
-  controlPlane,
-  IdentityServer,
-  openApiSpecPath,
-} from '../src/control-plane.ts';
+import { ControlPlaneController, controlPlane, IdentityServer } from '../src/control-plane.ts';
 
 const databaseName = 'identity_control_test';
 let database: SqlDatabase | undefined;
@@ -26,29 +21,9 @@ afterAll(async () => {
   await admin.close?.();
 });
 
-test('resolves the OpenAPI document from the source tree or the embedded copy', () => {
-  expect(
-    openApiSpecPath({
-      override: '/opt/spec.yaml',
-      source: '/src/openapi.yaml',
-      sourceExists: true,
-      embedded: '/embedded/openapi.yaml',
-    }),
-  ).toBe('/opt/spec.yaml');
-  expect(
-    openApiSpecPath({
-      source: '/src/openapi.yaml',
-      sourceExists: true,
-      embedded: '/embedded/openapi.yaml',
-    }),
-  ).toBe('/src/openapi.yaml');
-  expect(
-    openApiSpecPath({
-      source: '/src/openapi.yaml',
-      sourceExists: false,
-      embedded: '/embedded/openapi.yaml',
-    }),
-  ).toBe('/embedded/openapi.yaml');
+test('unknown paths are not control-plane routes', async () => {
+  const response = await controlPlane.fetch(new Request('https://identity.test/login'));
+  expect(response.status).toBe(404);
 });
 
 test('reports a server error when the database is not connected', async () => {

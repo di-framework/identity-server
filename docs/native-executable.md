@@ -1,8 +1,8 @@
 # Native executable
 
-`apps/server/build.ts` builds the browser client, stages the OpenAPI document, the sign-in page, and the SQL migrations, then compiles `@di-framework/identity-server` into one executable. It emits the TypeScript with `tsc` first so constructor injection is still present in the executable. The executable contains the Bun runtime. A machine that runs it does not need Bun or `node_modules`.
+`apps/server/build.ts` builds the browser client, stages the sign-in page and the SQL migrations, then compiles `@di-framework/identity-server` into one executable. It emits the TypeScript with `tsc` first so constructor injection is still present in the executable. The executable contains the Bun runtime. A machine that runs it does not need Bun or `node_modules`.
 
-The OpenAPI file is generated locally and is not committed. `apps/api/api/v1/openapi.yaml` has to be present before the build.
+Run `bun run generate:api` first when the schema manifests changed. That refreshes the generated controllers and the local OpenAPI document. The OpenAPI document is not committed.
 
 ```bash
 bun apps/server/build.ts
