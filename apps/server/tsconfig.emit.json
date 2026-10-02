@@ -17,5 +17,6 @@
     "../../apps/client/src/api/**/*.ts",
     "../../packages/core/src/**/*.ts",
     "../../packages/migrations/src/**/*.ts"
-  ]
+  ],
+  "exclude": ["../../**/*.test.ts", "../../**/*.test.tsx", "../../**/tests/**"]
 }

@@ -92,6 +92,7 @@ function linkPackages(directory: string): void {
     http: join(repoRoot, 'apps/api/node_modules/@di-framework/http'),
     repo: join(repoRoot, 'apps/api/node_modules/@di-framework/repo'),
     config: join(repoRoot, 'packages/core/node_modules/@di-framework/config'),
+    authz: join(repoRoot, 'packages/core/node_modules/@di-framework/authz'),
     'identity-codegen': join(repoRoot, 'packages/codegen'),
   };
   for (const [name, target] of Object.entries(links)) {
