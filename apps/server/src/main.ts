@@ -18,6 +18,16 @@ await applyMigrations(
   Bun.isStandaloneExecutable ? join(embeddedRoot, 'migrations') : undefined,
 );
 
+// Fail closed, as the auth server does: invalid signing keys or bootstrap settings stop startup.
+try {
+  await IdentityModule.prepare();
+} catch (error) {
+  console.error(
+    `identity startup failed: ${error instanceof Error ? error.message : 'unknown error'}`,
+  );
+  process.exit(1);
+}
+
 const assets = Bun.isStandaloneExecutable
   ? new URL('embedded/assets/', pathToFileURL(`${import.meta.dir}/`))
   : await buildClientAssets();

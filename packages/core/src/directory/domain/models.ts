@@ -7,6 +7,9 @@ export class UserAccount {
     readonly emailVerified: boolean,
     readonly status: string,
     readonly passwordHash: string | null,
+    /** `users.system_role`: `user` or `platform_admin`. Not part of the JSON user payload. */
+    readonly systemRole: string = 'user',
+    readonly avatarUrl: string | null = null,
   ) {}
 }
 
