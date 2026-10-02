@@ -8,7 +8,7 @@ The workspace compares the OpenAPI document emitted by the HTTP controllers with
 
 ## Getting Started
 
-Prerequisites: [Bun](https://bun.sh) and [Podman](https://podman.io). Framework packages install from npm.
+Prerequisites: [Bun](https://bun.sh) and [Podman](https://podman.io). Framework packages install from npm. The pre-commit hook also runs [Semgrep](https://semgrep.dev) when it is installed (`brew install semgrep` or `pipx install semgrep`); its rulesets download from the Semgrep registry on each run.
 
 Start Postgres with the Compose file in this repository. The database, user, and password are `identity`, and the server listens on port 5432.
 
@@ -56,7 +56,7 @@ bun run generate:types
 
 ## Contributing
 
-A `CONTRIBUTING.md` file is not in this repository yet. Changes are expected to keep `bun test` and `bun x tsc --noEmit` passing. The pre-commit hook typechecks, runs Biome on staged files, and runs Semgrep. The pre-push hook runs the test suite.
+A `CONTRIBUTING.md` file is not in this repository yet. Changes are expected to keep `bun test` and `bun x tsc --noEmit` passing. The pre-commit hook typechecks, runs Biome on staged files, and runs Semgrep on staged files (skipped with a warning when `semgrep` is not installed). `bun run semgrep` scans the whole repository. The pre-push hook runs the test suite.
 
 ## Scope
 
