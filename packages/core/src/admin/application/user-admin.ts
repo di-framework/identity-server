@@ -43,6 +43,13 @@ export class UserAdminService {
     const q = filter.q?.toLowerCase() ?? '';
     const status = filter.status?.toLowerCase() ?? '';
     const users = await this.directory.listUsers();
+    // Owners see users in their owned organizations: one membership read per owned organization.
+    const shared = new Set<string>([actorId]);
+    if (!context.isPlatformAdmin) {
+      for (const slug of context.ownedOrgSlugs) {
+        for (const m of await this.directory.membershipsForOrganization(slug)) shared.add(m.userId);
+      }
+    }
     const visible: UserAccount[] = [];
     for (const user of users) {
       if (status && user.status.toLowerCase() !== status) continue;
@@ -54,10 +61,7 @@ export class UserAdminService {
       ) {
         continue;
       }
-      if (!context.isPlatformAdmin && user.id !== actorId) {
-        const memberships = await this.directory.membershipsForUser(user.id);
-        if (!memberships.some((m) => context.ownedOrgSlugs.has(m.organizationSlug))) continue;
-      }
+      if (!context.isPlatformAdmin && !shared.has(user.id)) continue;
       visible.push(user);
     }
     return visible;
