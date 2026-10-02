@@ -552,4 +552,131 @@ describe('authorization code flow', () => {
         .updateAccount(userId, { status: 'active' });
     }
   });
+
+  test('prompt=login and max_age require a fresh sign-in; prompt=none never shows one', async () => {
+    const browser = await signedInBrowser();
+    const params = (extra: Record<string, string>) =>
+      new URLSearchParams({
+        response_type: 'code',
+        client_id: plain.clientId,
+        redirect_uri: CALLBACK,
+        scope: 'openid',
+        state: 'client-state',
+        ...extra,
+      });
+    const authorize = (extra: Record<string, string>) =>
+      browser.send('GET', `/oauth2/authorize?${params(extra)}`);
+    const errorOf = (response: Response) =>
+      new URL(response.headers.get('location') ?? '').searchParams.get('error');
+
+    expect(codeFrom((await authorize({ max_age: '3600' })).headers.get('location'))).toBeTruthy();
+    expect(errorOf(await authorize({ max_age: 'soon' }))).toBe('invalid_request');
+
+    const forced = await authorize({ prompt: 'login' });
+    expect(forced.status).toBe(302);
+    expect(forced.headers.get('location')).toBe('/login');
+    const again = await browser.signIn(login, PASSWORD);
+    expect(again.headers.get('location')).toBe(`/oauth2/authorize?${params({})}`);
+    expect(
+      codeFrom(
+        (await browser.send('GET', again.headers.get('location') ?? '')).headers.get('location'),
+      ),
+    ).toBeTruthy();
+
+    await database.run(
+      `UPDATE browser_sessions SET last_authenticated_at = now() - interval '2 hours' WHERE user_id = ?`,
+      [userId],
+    );
+    expect(codeFrom((await authorize({ max_age: '86400' })).headers.get('location'))).toBeTruthy();
+    expect((await authorize({ max_age: '60' })).headers.get('location')).toBe('/login');
+    expect(errorOf(await authorize({ max_age: '60', prompt: 'none' }))).toBe('login_required');
+    expect(errorOf(await authorize({ prompt: 'login none' }))).toBe('login_required');
+
+    const anonymous = new Browser(fetchApp);
+    await anonymous.page('/login');
+    expect(
+      errorOf(await anonymous.send('GET', `/oauth2/authorize?${params({ prompt: 'none' })}`)),
+    ).toBe('login_required');
+  });
+
+  test('archived users get no codes, no consent, and no tokens from codes or refresh', async () => {
+    const directory = useContainer().resolve<DirectoryRepository>(DIRECTORY);
+    const browser = await signedInBrowser();
+    // Consent once (an earlier test may already have), then read the code from the callback.
+    const approve = async (location: string) => {
+      const consent = new URL(location, 'https://identity.test');
+      if (consent.pathname !== '/oauth2/consent') return location;
+      await browser.page(`${consent.pathname}${consent.search}`);
+      const granted = await browser.send('POST', '/oauth2/authorize', {
+        form: {
+          client_id: app.clientId,
+          state: consent.searchParams.get('state') ?? '',
+          scope: (consent.searchParams.get('scope') ?? '').split(' '),
+        },
+      });
+      return granted.headers.get('location') ?? '';
+    };
+    const { url, verifier } = authorizeUrl(app, { scope: 'openid offline_access' });
+    const first = await token(app, {
+      grant_type: 'authorization_code',
+      code: codeFrom(await approve((await browser.send('GET', url)).headers.get('location') ?? '')),
+      redirect_uri: CALLBACK,
+      code_verifier: verifier,
+    });
+    expect(first.status).toBe(200);
+    const pending = authorizeUrl(app, { scope: 'openid offline_access' });
+    const pendingCode = codeFrom((await browser.send('GET', pending.url)).headers.get('location'));
+    const unconsented = await registerClient({
+      grantTypes: ['authorization_code'],
+      redirectUris: [CALLBACK],
+      scopes: ['openid', 'profile'],
+      requireAuthorizationConsent: true,
+    });
+    const second = authorizeUrl(unconsented, { scope: 'openid profile' });
+    const secondConsent = new URL(
+      (await browser.send('GET', second.url)).headers.get('location') ?? '',
+      'https://identity.test',
+    );
+    expect(secondConsent.pathname).toBe('/oauth2/consent');
+    await browser.page(`${secondConsent.pathname}${secondConsent.search}`);
+
+    await directory.updateAccount(userId, { status: 'archived' });
+    try {
+      const refused = await browser.send('GET', authorizeUrl(app).url);
+      expect(new URL(refused.headers.get('location') ?? '').searchParams.get('error')).toBe(
+        'access_denied',
+      );
+      const consent = await browser.send('POST', '/oauth2/authorize', {
+        form: {
+          client_id: unconsented.clientId,
+          state: secondConsent.searchParams.get('state') ?? '',
+          scope: 'profile',
+        },
+      });
+      expect(consent.status).toBe(400);
+      expect(
+        await token(app, {
+          grant_type: 'authorization_code',
+          code: pendingCode,
+          redirect_uri: CALLBACK,
+          code_verifier: pending.verifier,
+        }),
+      ).toEqual({ status: 400, body: { error: 'invalid_grant' } });
+      expect(
+        await token(app, {
+          grant_type: 'refresh_token',
+          refresh_token: first.body.refresh_token ?? '',
+        }),
+      ).toEqual({ status: 400, body: { error: 'invalid_grant' } });
+    } finally {
+      await directory.updateAccount(userId, { status: 'active' });
+    }
+    // The refused refresh deleted the authorization, so the token stays dead after restore.
+    expect(
+      await token(app, {
+        grant_type: 'refresh_token',
+        refresh_token: first.body.refresh_token ?? '',
+      }),
+    ).toEqual({ status: 400, body: { error: 'invalid_grant' } });
+  });
 });

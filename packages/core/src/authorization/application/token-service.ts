@@ -225,13 +225,21 @@ export class TokenService {
     });
   }
 
-  /** New access token, a rotated refresh token, and an ID token when `openid` was granted. */
+  /**
+   * New access token, a rotated refresh token, and an ID token when `openid` was granted. Only an
+   * active user gets tokens: for anyone else the authorization (and so its token family) is
+   * deleted and the grant refused.
+   */
   private async tokens(
     client: RegisteredClient,
     authorization: Authorization,
     scopes: string[],
     attributes: { nonce?: string | null; auth_time?: number },
-  ): Promise<TokenResponse> {
+  ): Promise<TokenResponse | OAuthError> {
+    if ((await this.directory.findUser(authorization.principalName))?.status !== 'active') {
+      await this.authorizations.delete(authorization.id);
+      return new OAuthError('invalid_grant');
+    }
     const access = this.issue(TOKEN_SETTINGS.accessTokenTtlSeconds);
     const refresh = client.grantTypes.includes('refresh_token')
       ? this.issue(TOKEN_SETTINGS.refreshTokenTtlSeconds)

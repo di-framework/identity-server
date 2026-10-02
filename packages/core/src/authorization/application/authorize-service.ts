@@ -15,11 +15,17 @@ export interface AuthorizeUser {
   userId: string;
   /** Epoch ms of the session's last sign-in, written as `auth_time`. */
   authenticatedAt: number;
+  /** Whether the account is active. Sessions of archived or pending users get no codes. */
+  active: boolean;
 }
 
 export type AuthorizeResult =
-  /** No signed-in user: send the browser to the login page and come back. */
-  | { kind: 'login' }
+  /**
+   * Send the browser to the login page, then back to `/oauth2/authorize?{resume}`. `resume` is
+   * the request without `prompt` and `max_age` when a fresh sign-in was required, so the request
+   * succeeds once the user has signed in again. Absent for the consent `POST`.
+   */
+  | { kind: 'login'; resume?: string }
   /** Redirect to the client, or to the consent page. */
   | { kind: 'redirect'; location: string }
   /** The client or redirect URI cannot be trusted, so the error is shown, not redirected. */
@@ -60,7 +66,22 @@ export class AuthorizeService {
     const method = params.get('code_challenge_method');
     if (challenge ? method !== 'S256' : client.settings.requireProofKey)
       return fail('invalid_request');
-    if (!user) return { kind: 'login' };
+    const prompt = (params.get('prompt') ?? '').split(' ').filter(Boolean);
+    const maxAge = params.get('max_age');
+    if (maxAge !== null && !/^\d+$/.test(maxAge)) return fail('invalid_request');
+    if (!user) return prompt.includes('none') ? fail('login_required') : login(params);
+    if (!user.active) return fail('access_denied');
+    // OpenID Connect `prompt=login` and `max_age` ask for a sign-in newer than the session's.
+    const stale =
+      prompt.includes('login') ||
+      (maxAge !== null && this.clock.now() - user.authenticatedAt > Number(maxAge) * 1000);
+    if (stale) {
+      if (prompt.includes('none')) return fail('login_required');
+      const fresh = new URLSearchParams(params);
+      fresh.delete('prompt');
+      fresh.delete('max_age');
+      return login(fresh);
+    }
 
     const attributes = {
       redirect_uri: redirectUri,
@@ -96,6 +117,7 @@ export class AuthorizeService {
   /** The consent form posts `client_id`, the consent `state`, and the approved `scope` values. */
   async consent(form: URLSearchParams, user: AuthorizeUser | undefined): Promise<AuthorizeResult> {
     if (!user) return { kind: 'login' };
+    if (!user.active) return { kind: 'error', message: 'The consent request is not valid.' };
     const consentState = form.get('state') ?? '';
     const pending = consentState
       ? await this.authorizations.findByState(Hashing.sha256Hex(consentState))
@@ -182,6 +204,10 @@ export class AuthorizeService {
       return client.redirectUris.length === 1 ? client.redirectUris[0] : undefined;
     return client.redirectUris.includes(requested) ? requested : undefined;
   }
+}
+
+function login(params: URLSearchParams): AuthorizeResult {
+  return { kind: 'login', resume: params.toString() };
 }
 
 function withQuery(base: string, params: Record<string, string | null>): string {

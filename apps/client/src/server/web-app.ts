@@ -258,6 +258,7 @@ export class WebApp {
       ? {
           userId: c.user.id,
           authenticatedAt: c.active.session.lastAuthenticatedAt ?? Date.now(),
+          active: c.user.status === 'active',
         }
       : undefined;
     const service = this.container.resolve(AuthorizeService);
@@ -268,11 +269,11 @@ export class WebApp {
       return page({ page: 'error', title: 'Bad Request', message: result.message }, 400);
     }
     if (result.kind === 'redirect') return redirect(result.location, get ? 302 : 303);
-    if (get) {
+    if (result.resume !== undefined) {
       c.active = await this.sessions.setAttribute(
         c.active,
         SESSION_ATTRIBUTES.savedRequest,
-        `${c.url.pathname}${c.url.search}`,
+        `/oauth2/authorize?${result.resume}`,
       );
     }
     return redirect('/login', get ? 302 : 303);
