@@ -1,10 +1,18 @@
+import { existsSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { createSession, findSession, type Store } from '../domain/model.ts';
 import { submit, view } from '../domain/service.ts';
 import { clearCookie, readCookie, writeCookie } from './cookies.ts';
 
 const SESSION = 'identity_session';
 const EMAIL = 'identity_email';
-const INDEX = new URL('../../index.html', import.meta.url);
+
+/** Source checkout first. A compiled binary serves `embedded/index.html`. */
+export function indexDocument(moduleUrl: string = import.meta.url): URL {
+  const source = new URL('../../index.html', moduleUrl);
+  if (existsSync(fileURLToPath(source))) return source;
+  return new URL('embedded/index.html', moduleUrl);
+}
 
 export async function handle(request: Request, store: Store): Promise<Response> {
   if (request.method !== 'GET' && request.method !== 'POST') {
@@ -47,7 +55,10 @@ export async function handle(request: Request, store: Store): Promise<Response> 
   }
   if (request.method === 'GET' && !wantsJson) {
     headers.set('content-type', 'text/html; charset=utf-8');
-    return new Response(await Bun.file(INDEX).text(), { status: outcome.status ?? 200, headers });
+    return new Response(await Bun.file(indexDocument()).text(), {
+      status: outcome.status ?? 200,
+      headers,
+    });
   }
   headers.set('content-type', 'application/json; charset=utf-8');
   const status = outcome.type === 'login-required' ? 401 : (outcome.status ?? 200);

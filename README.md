@@ -32,8 +32,9 @@ That spec is generated locally and is not committed. `bun run lint` runs Biome.
 | `@di-framework/identity` | `packages/core` | Directory, OAuth, audit, and identity-link domain services |
 | `@di-framework/identity-migrations` | `packages/migrations` | Versioned Flyway SQL and the migration runner |
 | `@di-framework/identity-codegen` | `packages/codegen` | OpenAPI projection and generated contract types |
-| `@di-framework/identity-server` | `apps/api` | JSON control-plane HTTP server |
+| `@di-framework/identity-api` | `apps/api` | JSON control-plane HTTP handlers |
 | `@di-framework/identity-client` | `apps/client` | UI application. No screens are implemented yet |
+| `@di-framework/identity-server` | `apps/server` | Serves the client and the JSON API on one port |
 
 ## Contributing
 
@@ -75,7 +76,8 @@ No public mailing list, chat channel, or meeting is set up for this repository.
 Roadmap, adopters, release notes, and a security policy are not in this repository yet.
 
 * [di-framework documentation](https://docs.di-framework.dev)
-* Repository layout: `packages/core`, `packages/migrations`, `packages/codegen`, `apps/api`, `apps/client`
+* [Build and example stack](docs/README.md)
+* Repository layout: `packages/core`, `packages/migrations`, `packages/codegen`, `apps/api`, `apps/client`, `apps/server`
 
 ## License
 

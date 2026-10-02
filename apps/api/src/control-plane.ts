@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { useContainer } from '@di-framework/core/container';
 import { Component, Container } from '@di-framework/core/decorators';
@@ -72,13 +73,32 @@ export class HttpResponse {
   }
 }
 
+/** Pick the OpenAPI file. A compiled binary keeps it under `embedded/`. */
+export function openApiSpecPath(input: {
+  override?: string;
+  source: string;
+  sourceExists: boolean;
+  embedded: string;
+}): string {
+  if (input.override) return input.override;
+  if (input.sourceExists) return input.source;
+  return input.embedded;
+}
+
 @Container()
 export class OpenApiCatalog {
   readonly spec: SpecDocument;
   readonly operations: ControlOperation[];
 
   constructor() {
-    this.spec = loadOpenApi(resolve(import.meta.dir, '../api/v1/openapi.yaml')) as SpecDocument;
+    const source = resolve(import.meta.dir, '../api/v1/openapi.yaml');
+    this.spec = loadOpenApi(
+      openApiSpecPath({
+        source,
+        sourceExists: existsSync(source),
+        embedded: resolve(import.meta.dir, 'embedded/openapi.yaml'),
+      }),
+    ) as SpecDocument;
     this.operations = this.collect();
   }
 

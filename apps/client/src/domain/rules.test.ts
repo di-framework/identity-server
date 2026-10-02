@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
 import { formatTimestamp, t } from '../i18n/messages.ts';
 import { clearCookie, readCookie, writeCookie } from '../server/cookies.ts';
-import { handle } from '../server/handler.ts';
+import { handle, indexDocument } from '../server/handler.ts';
 import { manualClock, systemClock } from './clock.ts';
 import type { PageModel, Session, Store } from './model.ts';
 import {
@@ -750,6 +750,13 @@ describe('identity client rules', () => {
 });
 
 describe('identity client HTTP', () => {
+  test('uses the source index page, or the embedded copy in a compiled binary', () => {
+    const source = indexDocument(import.meta.url);
+    expect(source.pathname.endsWith('/apps/client/index.html')).toBe(true);
+    const embedded = indexDocument('file:///tmp/identity-missing-index/a/b/server');
+    expect(embedded.pathname).toBe('/tmp/identity-missing-index/a/b/embedded/index.html');
+  });
+
   test('serves HTML, JSON, cookies, and redirects', async () => {
     const { store } = world();
     const html = await handle(new Request('http://localhost/login'), store);

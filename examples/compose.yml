@@ -1,0 +1,51 @@
+name: identity-example
+
+services:
+  postgres:
+    image: docker.io/library/postgres:16-alpine
+    pull_policy: if_not_present
+    environment:
+      POSTGRES_DB: identity
+      POSTGRES_USER: identity
+      POSTGRES_PASSWORD: identity
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U identity -d identity"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  identity:
+    build:
+      context: ../apps/server
+      dockerfile: Dockerfile
+    environment:
+      PORT: "4180"
+      DATABASE_URL: postgres://identity:identity@postgres:5432/identity
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "4180:4180"
+
+  app:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    environment:
+      PORT: "3000"
+      AUTH_SECRET: example-only-secret-not-for-production-use
+      AUTH_ISSUER: http://app:3000
+    ports:
+      - "3000:3000"
+
+  verify:
+    build:
+      context: .
+      dockerfile: verify.Dockerfile
+    environment:
+      IDENTITY_URL: http://identity:4180
+      APP_URL: http://app:3000
+    depends_on:
+      - identity
+      - app
+    restart: "no"

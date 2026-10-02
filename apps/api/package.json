@@ -1,5 +1,5 @@
 {
-  "name": "@di-framework/identity-server",
+  "name": "@di-framework/identity-api",
   "type": "module",
   "private": true,
   "license": "ISC",

@@ -1,0 +1,16 @@
+{
+  "name": "@di-framework/identity-example",
+  "type": "module",
+  "private": true,
+  "license": "ISC",
+  "scripts": {
+    "dev": "bun src/main.ts",
+    "start": "bun src/main.ts",
+    "build": "bun build.ts"
+  },
+  "dependencies": {
+    "@di-framework/auth": "link:@di-framework/auth",
+    "@di-framework/core": "link:@di-framework/core",
+    "@di-framework/http": "link:@di-framework/http"
+  }
+}

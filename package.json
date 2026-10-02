@@ -6,7 +6,8 @@
   "license": "ISC",
   "workspaces": [
     "packages/*",
-    "apps/*"
+    "apps/*",
+    "examples/app"
   ],
   "scripts": {
     "postinstall": "git config core.hooksPath .githooks",
@@ -16,7 +17,9 @@
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "format": "biome format --write .",
-    "client": "bun apps/client/src/server/main.ts"
+    "client": "bun apps/client/src/server/main.ts",
+    "start": "bun apps/server/src/main.ts",
+    "server:build": "bun apps/server/build.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.14",

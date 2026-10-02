@@ -1,0 +1,20 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "outDir": ".compile/tsc",
+    "rootDir": "../..",
+    "sourceMap": false,
+    "declaration": false,
+    "experimentalDecorators": true,
+    "rewriteRelativeImportExtensions": true
+  },
+  "include": [
+    "src/**/*.ts",
+    "../../apps/api/src/**/*.ts",
+    "../../apps/client/src/domain/**/*.ts",
+    "../../apps/client/src/server/**/*.ts",
+    "../../packages/core/src/**/*.ts",
+    "../../packages/migrations/src/**/*.ts"
+  ]
+}

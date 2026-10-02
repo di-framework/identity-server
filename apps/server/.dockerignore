@@ -1,0 +1,7 @@
+node_modules
+.compile
+src
+tests
+*.ts
+Dockerfile
+.dockerignore

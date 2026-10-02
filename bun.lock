@@ -14,7 +14,7 @@
       },
     },
     "apps/api": {
-      "name": "@di-framework/identity-server",
+      "name": "@di-framework/identity-api",
       "dependencies": {
         "@di-framework/core": "link:@di-framework/core",
         "@di-framework/http": "link:@di-framework/http",
@@ -40,6 +40,23 @@
         "@types/react": "^19.3.0",
         "@types/react-dom": "^19.3.0",
         "happy-dom": "^20.14.5",
+      },
+    },
+    "apps/server": {
+      "name": "@di-framework/identity-server",
+      "dependencies": {
+        "@di-framework/identity": "workspace:*",
+        "@di-framework/identity-api": "workspace:*",
+        "@di-framework/identity-client": "workspace:*",
+        "@di-framework/identity-migrations": "workspace:*",
+      },
+    },
+    "examples/app": {
+      "name": "@di-framework/identity-example",
+      "dependencies": {
+        "@di-framework/auth": "link:@di-framework/auth",
+        "@di-framework/core": "link:@di-framework/core",
+        "@di-framework/http": "link:@di-framework/http",
       },
     },
     "packages/codegen": {
@@ -94,6 +111,8 @@
 
     "@biomejs/cli-win32-x64": ["@biomejs/cli-win32-x64@2.5.15", "", { "os": "win32", "cpu": "x64" }, "sha512-yAzh4UqEImV6Hcy0zjUqNfJAsUhoD64FBQCdTG8Md/Z2wQeVP/ZmJ3XRYAs1g8J9fjTFyl2fCtc5FB5til47+g=="],
 
+    "@di-framework/auth": ["@di-framework/auth@link:@di-framework/auth", {}],
+
     "@di-framework/cli": ["@di-framework/cli@link:@di-framework/cli", { "bin": { "di-framework": "./main.ts" } }],
 
     "@di-framework/config": ["@di-framework/config@link:@di-framework/config", {}],
@@ -104,13 +123,17 @@
 
     "@di-framework/identity": ["@di-framework/identity@workspace:packages/core"],
 
+    "@di-framework/identity-api": ["@di-framework/identity-api@workspace:apps/api"],
+
     "@di-framework/identity-client": ["@di-framework/identity-client@workspace:apps/client"],
 
     "@di-framework/identity-codegen": ["@di-framework/identity-codegen@workspace:packages/codegen"],
 
+    "@di-framework/identity-example": ["@di-framework/identity-example@workspace:examples/app"],
+
     "@di-framework/identity-migrations": ["@di-framework/identity-migrations@workspace:packages/migrations"],
 
-    "@di-framework/identity-server": ["@di-framework/identity-server@workspace:apps/api"],
+    "@di-framework/identity-server": ["@di-framework/identity-server@workspace:apps/server"],
 
     "@di-framework/repo": ["@di-framework/repo@link:@di-framework/repo", {}],
 

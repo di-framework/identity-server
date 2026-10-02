@@ -1,0 +1,16 @@
+{
+  "name": "@di-framework/identity-server",
+  "type": "module",
+  "private": true,
+  "license": "ISC",
+  "scripts": {
+    "dev": "bun src/main.ts",
+    "start": "bun src/main.ts"
+  },
+  "dependencies": {
+    "@di-framework/identity": "workspace:*",
+    "@di-framework/identity-api": "workspace:*",
+    "@di-framework/identity-client": "workspace:*",
+    "@di-framework/identity-migrations": "workspace:*"
+  }
+}
