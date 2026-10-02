@@ -1,13 +1,7 @@
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import type { IdentityClient } from '../api/client.ts';
-import { applyDirectory } from '../api/directory.ts';
-import { createSession, findSession, type Outcome, type Store } from '../domain/model.ts';
-import { submit, view } from '../domain/service.ts';
-import { clearCookie, readCookie, writeCookie } from './cookies.ts';
-
-const SESSION = 'identity_session';
-const EMAIL = 'identity_email';
+import type { PageModel } from '../domain/page-model.ts';
+import { WebApp } from './web-app.ts';
 
 /** Source checkout first. A compiled binary serves `embedded/index.html`. */
 export function indexDocument(moduleUrl: string = import.meta.url): URL {
@@ -16,74 +10,50 @@ export function indexDocument(moduleUrl: string = import.meta.url): URL {
   return new URL('embedded/index.html', moduleUrl);
 }
 
-export async function handle(
-  request: Request,
-  store: Store,
-  directory?: IdentityClient,
-): Promise<Response> {
+/** JSON safe to place inside a `<script>` element. */
+export function scriptJson(value: unknown): string {
+  return JSON.stringify(value)
+    .replaceAll('<', '\\u003c')
+    .replaceAll('>', '\\u003e')
+    .replaceAll('&', '\\u0026')
+    .replaceAll(' ', '\\u2028')
+    .replaceAll(' ', '\\u2029');
+}
+
+const app = new WebApp();
+
+/**
+ * Browser pages. A request that accepts JSON gets the page model; any other GET or a form POST
+ * gets the HTML shell with the page model embedded, so a failed form post keeps the auth
+ * server's status code without a redirect.
+ */
+export async function handle(request: Request, web: WebApp = app): Promise<Response> {
   if (request.method !== 'GET' && request.method !== 'POST') {
-    return new Response(null, { status: 405 });
+    return new Response(null, { status: 405, headers: { allow: 'GET, POST' } });
   }
-  const url = new URL(request.url);
-  const incoming = readCookie(request.headers.get('cookie'), SESSION);
-  const emailToken = readCookie(request.headers.get('cookie'), EMAIL);
-  let session = findSession(store, incoming);
-  const created = !session;
-  if (!session) session = createSession(store, null, null);
-  const form =
-    request.method === 'POST' ? new URLSearchParams(await request.text()) : new URLSearchParams();
-  const wantsJson = (request.headers.get('accept') ?? '').includes('application/json');
-  const viewed =
-    request.method === 'GET' ? view(store, session, emailToken, url, wantsJson) : undefined;
-  const baseline: Outcome = viewed ?? { type: 'page', session };
-  let outcome = baseline;
-  if (directory) {
-    const next = await applyDirectory(directory, {
-      method: request.method,
-      url,
-      store,
-      session,
-      form,
-      outcome: baseline,
-      revealSecrets: wantsJson,
-    });
-    outcome =
-      request.method === 'POST' && next === baseline
-        ? submit(store, session, emailToken, url, form)
-        : next;
-  } else if (request.method === 'POST') {
-    outcome = submit(store, session, emailToken, url, form);
-  }
+  const { result, cookies, actor } = await web.run(request);
   const headers = new Headers();
-  if (outcome.session === null) {
-    headers.append('set-cookie', clearCookie(SESSION));
-  } else if (created || outcome.session.id !== incoming) {
-    headers.append('set-cookie', writeCookie(SESSION, outcome.session.id));
+  for (const value of cookies) headers.append('set-cookie', value);
+  headers.set('cache-control', 'no-store');
+  if (result.kind === 'redirect') {
+    headers.set('location', result.location);
+    return new Response(null, { status: result.status ?? 303, headers });
   }
-  if (outcome.emailCookie !== undefined) {
-    headers.append(
-      'set-cookie',
-      outcome.emailCookie === null
-        ? clearCookie(EMAIL)
-        : writeCookie(EMAIL, outcome.emailCookie, 15 * 60),
-    );
-  }
-  if (outcome.type === 'redirect' && outcome.location) {
-    headers.set('location', outcome.location);
-    return new Response(null, { status: 303, headers });
-  }
-  if (outcome.type === 'login-required' && (request.method === 'POST' || !wantsJson)) {
+  const wantsJson = (request.headers.get('accept') ?? '').includes('application/json');
+  const model = { ...actor, ...result.page } as PageModel;
+  if (model.page === 'unauthenticated' && !wantsJson) {
     headers.set('location', '/login');
-    return new Response(null, { status: request.method === 'POST' ? 303 : 302, headers });
+    return new Response(null, { status: 302, headers });
   }
-  if (request.method === 'GET' && !wantsJson) {
-    headers.set('content-type', 'text/html; charset=utf-8');
-    return new Response(await Bun.file(indexDocument()).text(), {
-      status: outcome.status ?? 200,
-      headers,
-    });
+  if (wantsJson) {
+    headers.set('content-type', 'application/json; charset=utf-8');
+    return new Response(JSON.stringify(model), { status: result.status ?? 200, headers });
   }
-  headers.set('content-type', 'application/json; charset=utf-8');
-  const status = outcome.type === 'login-required' ? 401 : (outcome.status ?? 200);
-  return new Response(JSON.stringify(outcome.page), { status, headers });
+  headers.set('content-type', 'text/html; charset=utf-8');
+  const shell = await Bun.file(indexDocument()).text();
+  const html = shell.replace(
+    '<div id="root"></div>',
+    `<div id="root"></div>\n    <script>window.__IDENTITY_PAGE__ = ${scriptJson(model)};</script>`,
+  );
+  return new Response(html, { status: result.status ?? 200, headers });
 }

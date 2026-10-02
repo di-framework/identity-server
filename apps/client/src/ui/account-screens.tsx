@@ -1,5 +1,5 @@
 import { ActionGroup, Button, Content, Grid, GridItem, Title } from '@patternfly/react-core';
-import type { PageModel } from '../domain/model.ts';
+import type { PageModel } from '../domain/page-model.ts';
 import { formatTimestamp, t } from '../i18n/messages.ts';
 import { AppPage, DataTable, ErrorAlert, PageTitle, PostForm, StatusBanner } from './chrome.tsx';
 import { Details } from './details.tsx';
@@ -19,15 +19,14 @@ export function LinksScreen({ page }: { page: PageOf<'links'> }) {
         emptyTitle={t('noLinks')}
         emptyBody={t('noLinks')}
         rows={page.links.map((link) => ({
-          key: `${link.issuer}:${link.subject}`,
+          key: link.id,
           cells: [
             link.issuer,
             link.subjectHint,
             formatTimestamp(link.linkedAt),
             <form key="unlink" method="post" action="/account/identity-links/unlink/start">
               <input type="hidden" name="_csrf" value={page.csrf} />
-              <input type="hidden" name="issuer" value={link.issuer} />
-              <input type="hidden" name="subject" value={link.subject} />
+              <input type="hidden" name="id" value={link.id} />
               <Button type="submit" variant="danger">
                 {t('unlink')}
               </Button>
@@ -70,6 +69,7 @@ export function LinkConfirmScreen({ page }: { page: PageOf<'link-confirm'> }) {
       </Grid>
       <Content component="p">{t('providerSignIn')}</Content>
       <PostForm action="/account/identity-links/confirm" csrf={page.csrf}>
+        <input type="hidden" name="token" value={page.token} />
         <ActionGroup>
           <Button type="submit" variant="primary">
             {t('confirmLink')}
@@ -77,6 +77,7 @@ export function LinkConfirmScreen({ page }: { page: PageOf<'link-confirm'> }) {
         </ActionGroup>
       </PostForm>
       <PostForm action="/account/identity-links/cancel" csrf={page.csrf}>
+        <input type="hidden" name="token" value={page.token} />
         <ActionGroup>
           <Button type="submit" variant="link">
             {t('cancel')}

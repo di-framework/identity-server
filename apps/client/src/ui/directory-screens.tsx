@@ -1,6 +1,6 @@
 import { ActionGroup, Button, Title, ToolbarItem } from '@patternfly/react-core';
 import { useState } from 'react';
-import type { PageModel } from '../domain/model.ts';
+import type { PageModel } from '../domain/page-model.ts';
 import { formatTimestamp, t } from '../i18n/messages.ts';
 import {
   AppPage,
@@ -144,7 +144,7 @@ export function InviteScreen({ page }: { page: PageOf<'invite'> }) {
         <SelectField
           id="invite-organization"
           label={t('organization')}
-          name="organization"
+          name="orgSlug"
           value={organization}
           onChange={setOrganization}
           options={organizations}
@@ -171,7 +171,7 @@ export function UserScreen({ page }: { page: PageOf<'user'> }) {
   const user = page.user;
   return (
     <AppPage page={page}>
-      <StatusBanner name={page.banner} />
+      <StatusBanner name={page.banner} text={page.message ?? undefined} />
       <PageTitle>{user.displayName}</PageTitle>
       <Details
         label={t('user')}
@@ -382,7 +382,7 @@ export function MembershipsScreen({ page }: { page: PageOf<'memberships'> }) {
     <AppPage page={page}>
       <StatusBanner
         name={page.banner}
-        text={page.banner === 'blocked' ? t('membershipBlocked') : undefined}
+        text={page.banner === 'blocked' ? (page.message ?? t('membershipBlocked')) : undefined}
       />
       <PageTitle>{t('membershipsTitle')}</PageTitle>
       <form method="get" action="/admin/memberships">
@@ -391,7 +391,7 @@ export function MembershipsScreen({ page }: { page: PageOf<'memberships'> }) {
             <SelectField
               id="membership-organization"
               label={t('organization')}
-              name="organization"
+              name="orgSlug"
               value={organization}
               onChange={setOrganization}
               options={page.organizations.map(orgOption)}
@@ -409,7 +409,7 @@ export function MembershipsScreen({ page }: { page: PageOf<'memberships'> }) {
         <SelectField
           id="add-organization"
           label={t('organization')}
-          name="organization"
+          name="orgSlug"
           value={organization}
           onChange={setOrganization}
           options={page.organizations.map(orgOption)}
@@ -418,7 +418,7 @@ export function MembershipsScreen({ page }: { page: PageOf<'memberships'> }) {
         <TextField
           id="add-user"
           label={t('userLoginOrEmail')}
-          name="user"
+          name="userLoginOrEmail"
           value={user}
           onChange={setUser}
           required
@@ -443,18 +443,18 @@ export function MembershipsScreen({ page }: { page: PageOf<'memberships'> }) {
         emptyTitle={t('noMembers')}
         emptyBody={t('noMembersBody')}
         rows={page.members.map((member) => ({
-          key: member.userId,
+          key: `${member.organizationId}:${member.userId}`,
           cells: [
             member.login,
             member.email,
             member.role,
             <form key="role" method="post" action="/admin/memberships/role-change">
               <input type="hidden" name="_csrf" value={page.csrf} />
-              <input type="hidden" name="organization" value={page.organizationId} />
-              <input type="hidden" name="user" value={member.userId} />
+              <input type="hidden" name="orgSlug" value={member.organizationId} />
+              <input type="hidden" name="userId" value={member.userId} />
               <input
                 type="hidden"
-                name="role"
+                name="newRole"
                 value={member.role === 'owner' ? 'member' : 'owner'}
               />
               <Button type="submit" variant="secondary">
@@ -463,8 +463,8 @@ export function MembershipsScreen({ page }: { page: PageOf<'memberships'> }) {
             </form>,
             <form key="remove" method="post" action="/admin/memberships/remove">
               <input type="hidden" name="_csrf" value={page.csrf} />
-              <input type="hidden" name="organization" value={page.organizationId} />
-              <input type="hidden" name="user" value={member.userId} />
+              <input type="hidden" name="orgSlug" value={member.organizationId} />
+              <input type="hidden" name="userId" value={member.userId} />
               <Button type="submit" variant="danger">
                 {t('remove')}
               </Button>

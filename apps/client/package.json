@@ -4,11 +4,11 @@
   "private": true,
   "license": "ISC",
   "scripts": {
-    "dev": "bun src/server/main.ts",
-    "start": "bun src/server/main.ts",
     "generate": "bun x openapi-typescript ../../apps/api/api/v1/openapi.yaml -o src/api/schema.d.ts"
   },
   "dependencies": {
+    "@di-framework/core": "^6.0.3",
+    "@di-framework/identity": "workspace:*",
     "@patternfly/react-core": "6",
     "@patternfly/react-icons": "6",
     "@patternfly/react-table": "6",

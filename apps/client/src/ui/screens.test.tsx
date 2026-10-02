@@ -2,7 +2,7 @@ import './dom.ts';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { cleanup, render, screen } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import type { PageModel } from '../domain/model.ts';
+import type { PageModel } from '../domain/page-model.ts';
 import { App, Screen } from './app.tsx';
 import { recordPath, safePath } from './chrome.tsx';
 
@@ -40,25 +40,37 @@ describe('identity client screens', () => {
       {
         page: 'consent',
         ...actor,
-        clientName: 'Acme web',
         clientId: 'cli_aaaaaaaaaaaaaaaa',
+        state: 'state-1',
         scopes: ['profile'],
-        redirectUri: 'https://acme.example/callback',
+        openid: true,
       },
       {
         page: 'consent',
         ...actor,
-        clientName: 'Acme web',
         clientId: 'cli_aaaaaaaaaaaaaaaa',
+        state: null,
         scopes: [],
-        redirectUri: '',
+        openid: false,
       },
       { page: 'unauthenticated', ...guest },
       { page: 'denied', ...actor, reason: 'inactive' },
       { page: 'denied', ...actor, reason: 'member' },
       { page: 'denied', ...actor, reason: 'platform' },
       { page: 'not-found', ...actor },
-      { page: 'link-unavailable', ...actor },
+      {
+        page: 'link-unavailable',
+        ...actor,
+        message: 'This unlink confirmation is invalid or expired.',
+      },
+      { page: 'link-unavailable', ...actor, message: null },
+      {
+        page: 'error',
+        ...actor,
+        title: 'Conflict',
+        message: 'A user with this email or login already exists.',
+      },
+      { page: 'error', ...actor, title: 'Not Found', message: '' },
       {
         page: 'users',
         ...actor,
@@ -87,6 +99,7 @@ describe('identity client screens', () => {
         page: 'user',
         ...actor,
         banner: 'invited',
+        message: null,
         showArchive: true,
         showRestore: false,
         showPasswordReset: true,
@@ -105,6 +118,7 @@ describe('identity client screens', () => {
         page: 'user',
         ...actor,
         banner: 'blocked',
+        message: 'Cannot archive the last active platform administrator',
         showArchive: false,
         showRestore: true,
         showPasswordReset: false,
@@ -177,6 +191,7 @@ describe('identity client screens', () => {
         organizationId: 'o_acme',
         banner: 'blocked',
         error: 'already-member',
+        message: 'Cannot remove last owner',
         organizations: [{ id: 'o_acme', slug: 'acme', name: 'Acme' }],
         members: [
           {
@@ -201,6 +216,7 @@ describe('identity client screens', () => {
         organizationId: '',
         banner: null,
         error: null,
+        message: null,
         organizations: [],
         members: [],
       },
@@ -313,8 +329,8 @@ describe('identity client screens', () => {
         error: 'last-method',
         links: [
           {
+            id: 'link-1',
             issuer: 'https://accounts.google.example',
-            subject: 'subject-nora-1',
             subjectHint: '••••ra-1',
             provider: 'google',
             linkedAt: '2026-01-02T00:00:00.000Z',
@@ -325,6 +341,7 @@ describe('identity client screens', () => {
       {
         page: 'link-confirm',
         ...actor,
+        token: 'pending-token',
         account: { displayName: 'Nora North', login: 'nora', email: 'nora@north.example' },
         external: {
           provider: 'google',
@@ -360,7 +377,9 @@ describe('identity client screens', () => {
         expect(screen.getByText('Enter a password of at least 12 characters.')).toBeTruthy();
       }
       if (page.page === 'passwordless' && page.notice) {
-        expect(screen.getByText('A link is on the way.')).toBeTruthy();
+        expect(
+          screen.getByText('If an eligible account exists, a sign-in link is on its way.'),
+        ).toBeTruthy();
       }
       view.unmount();
     }

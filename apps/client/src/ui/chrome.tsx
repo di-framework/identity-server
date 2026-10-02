@@ -40,7 +40,7 @@ import WarningIcon from '@patternfly/react-icons/dist/dynamic/icons/rh-ui-warnin
 import SearchIcon from '@patternfly/react-icons/dist/dynamic/icons/search-icon';
 import { Table, Tbody, Td, Th, Thead, Tr } from '@patternfly/react-table';
 import type { ReactNode } from 'react';
-import type { ActorFields, BannerName, FormErrorName } from '../domain/model.ts';
+import type { ActorFields, BannerName, FormErrorName } from '../domain/page-model.ts';
 import { type MessageKey, t } from '../i18n/messages.ts';
 
 const bannerText: Record<BannerName, MessageKey> = {
@@ -248,10 +248,35 @@ export function NotFound({ page }: { page: ActorFields }) {
   );
 }
 
-export function LinkUnavailable({ page }: { page: ActorFields }) {
+export function LinkUnavailable({ page, message }: { page: ActorFields; message: string | null }) {
   return (
     <AppPage page={page} layout="form">
-      <EmptyState titleText={t('linkUnavailable')} headingLevel="h1" icon={ExclamationCircleIcon} />
+      <EmptyState
+        titleText={t('linkUnavailableTitle')}
+        headingLevel="h1"
+        icon={ExclamationCircleIcon}
+      >
+        {message ? <EmptyStateBody>{message}</EmptyStateBody> : null}
+      </EmptyState>
+    </AppPage>
+  );
+}
+
+/** Auth-server error page: a title such as "Conflict" and its message. */
+export function ErrorPage({
+  page,
+  title,
+  message,
+}: {
+  page: ActorFields;
+  title: string;
+  message: string;
+}) {
+  return (
+    <AppPage page={page} layout="form">
+      <EmptyState titleText={title} headingLevel="h1" icon={ExclamationCircleIcon}>
+        {message ? <EmptyStateBody>{message}</EmptyStateBody> : null}
+      </EmptyState>
     </AppPage>
   );
 }
