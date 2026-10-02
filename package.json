@@ -18,6 +18,7 @@
     "typecheck": "bun x tsc --noEmit && bun x tsc --noEmit -p apps/client/tsconfig.json",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
+    "semgrep": "semgrep scan --metrics=off --disable-version-check --error --config p/javascript --config p/typescript --config p/nodejs --config p/react --config p/owasp-top-ten --exclude apps/api/src/generated --exclude coverage",
     "format": "biome format --write .",
     "start": "bun apps/server/src/main.ts",
     "server:build": "bun apps/server/build.ts"

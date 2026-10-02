@@ -2,3 +2,4 @@
 set -e
 bun typecheck
 bun x biome check --staged --write --files-ignore-unknown=true --no-errors-on-unmatched
+bun run semgrep

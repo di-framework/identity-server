@@ -56,7 +56,7 @@ bun run generate:types
 
 ## Contributing
 
-A `CONTRIBUTING.md` file is not in this repository yet. Changes are expected to keep `bun test` and `bun x tsc --noEmit` passing. The pre-commit hook typechecks and runs Biome on staged files. The pre-push hook runs the test suite.
+A `CONTRIBUTING.md` file is not in this repository yet. Changes are expected to keep `bun test` and `bun x tsc --noEmit` passing. The pre-commit hook typechecks, runs Biome on staged files, and runs Semgrep. The pre-push hook runs the test suite.
 
 ## Scope
 
