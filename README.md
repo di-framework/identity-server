@@ -1,4 +1,6 @@
-# Welcome to the @di-framework/identity Project!
+# @di-framework/identity
+
+> Status: Incubating
 
 `@di-framework/identity` is an identity control-plane service that stores directory, OAuth client, audit, and identity-link records in Postgres and serves them as a JSON HTTP API. Operators need a single place to create users and organizations, manage memberships and OAuth clients, and record who changed them. The service is a Bun and TypeScript workspace. Domain services sit behind repository ports, HTTP routes come from `@di-framework/http`, and the database URL comes from `@di-framework/config`.
 
@@ -33,8 +35,20 @@ That spec is generated locally and is not committed. `bun run lint` runs Biome.
 | `@di-framework/identity-migrations` | `packages/migrations` | Versioned Flyway SQL and the migration runner |
 | `@di-framework/identity-codegen` | `packages/codegen` | OpenAPI projection and generated contract types |
 | `@di-framework/identity-api` | `apps/api` | JSON control-plane HTTP handlers |
-| `@di-framework/identity-client` | `apps/client` | UI application. No screens are implemented yet |
+| `@di-framework/identity-client` | `apps/client` | PatternFly screens for sign-in, the directory, and the account |
 | `@di-framework/identity-server` | `apps/server` | Serves the client and the JSON API on one port |
+
+## Screens
+
+![Sign in](docs/images/sign-in.png)
+
+![Users](docs/images/users.png)
+
+![Organizations](docs/images/organizations.png)
+
+![OAuth clients](docs/images/oauth-clients.png)
+
+![Linked identities](docs/images/linked-identities.png)
 
 ## Contributing
 
@@ -42,24 +56,11 @@ A `CONTRIBUTING.md` file is not in this repository yet. Changes are expected to 
 
 ## Scope
 
-### In Scope
-
-`@di-framework/identity` is intended to serve the JSON admin control plane. The project implements:
-
 * Users, organizations, memberships, and directory member pages
 * OAuth client create, update, secret rotation, and revoke
 * Audit listing and identity-link list, prepare-unlink, and unlink
 * Postgres persistence with versioned SQL migrations
 * An emitted OpenAPI document checked against the JSON operations in the local spec
-
-### Out of Scope
-
-`@di-framework/identity` is an identity service, not the dependency-injection framework. The framework packages live in the `di-framework` repository. This service will not incorporate:
-
-* Browser and HTML routes, including login, consent, passwordless sign-in, `/health`, and `/ready`
-* OAuth scope checks on the admin API
-* Passwordless email invitations
-* End-user UI screens in `@di-framework/identity-client`
 
 ## Communications
 
@@ -76,6 +77,7 @@ No public mailing list, chat channel, or meeting is set up for this repository.
 Roadmap, adopters, release notes, and a security policy are not in this repository yet.
 
 * [di-framework documentation](https://docs.di-framework.dev)
+* [TODO](TODO.md)
 * [Build and example stack](docs/README.md)
 * Repository layout: `packages/core`, `packages/migrations`, `packages/codegen`, `apps/api`, `apps/client`, `apps/server`
 
@@ -83,6 +85,3 @@ Roadmap, adopters, release notes, and a security policy are not in this reposito
 
 This project is licensed under the [ISC License](LICENSE).
 
-## Conduct
-
-This repository does not include a `CODE_OF_CONDUCT.md` file yet. The README layout follows the [CNCF project README template](https://github.com/cncf/project-template/blob/main/README-template.md). The CNCF Code of Conduct is published at <https://github.com/cncf/foundation/blob/main/code-of-conduct.md>.
