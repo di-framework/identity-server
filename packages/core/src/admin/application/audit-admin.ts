@@ -34,7 +34,9 @@ export function redact(json: string): string {
 
 /**
  * `/admin/audit/**` (`AdminAuditController.kt`): the newest 500 records, filtered in memory.
- * Owners see a record only when an owned slug appears in its target or metadata.
+ * Owners see a record only when it belongs to an organization they own (`auditOrganization`).
+ * The auth server matches an owned slug anywhere in the target or metadata; that lets the owner
+ * of slug `a` read any record whose JSON contains the letter, so this repository does not.
  */
 @Container()
 export class AuditAdminService {
@@ -83,12 +85,41 @@ export class AuditAdminService {
 
 function inScope(record: AuditEntry, context: AuthorizationContext): boolean {
   if (context.isPlatformAdmin) return true;
-  const haystacks = [record.target ?? '', record.beforeMetadata, record.afterMetadata].map(
-    (value) => value.toLowerCase(),
-  );
-  return [...context.ownedOrgSlugs].some((slug) =>
-    haystacks.some((value) => value.includes(slug.toLowerCase())),
-  );
+  const slug = auditOrganization(record);
+  return slug !== undefined && context.ownedOrgSlugs.has(slug);
+}
+
+/**
+ * The organization a record belongs to, read from the target format its action writes:
+ * organization actions target the slug, HTML membership and client actions `{slug}:{id}`, JSON
+ * membership actions `{slug}/{userId}`, and HTML invites carry `orgSlug` in their metadata.
+ * Every other record (users, links, tokens, JSON clients) has no organization.
+ */
+export function auditOrganization(record: AuditEntry): string | undefined {
+  const target = record.target ?? '';
+  const action = record.action;
+  if (/^admin\.(org\.|organization_)/.test(action)) return target || undefined;
+  if (/^admin\.(membership|oauth_client)\./.test(action)) return prefix(target, ':');
+  if (/^admin\.membership_/.test(action)) return prefix(target, '/');
+  if (action === 'admin.user.invite') {
+    const slug = metadata(record.afterMetadata).orgSlug;
+    return typeof slug === 'string' && slug ? slug : undefined;
+  }
+  return undefined;
+}
+
+function prefix(target: string, separator: string): string | undefined {
+  const index = target.indexOf(separator);
+  return index > 0 ? target.slice(0, index) : undefined;
+}
+
+function metadata(json: string): Record<string, unknown> {
+  try {
+    const value: unknown = JSON.parse(json);
+    return typeof value === 'object' && value !== null ? (value as Record<string, unknown>) : {};
+  } catch {
+    return {};
+  }
 }
 
 /** `Instant.parse`: an ISO-8601 instant, otherwise the bound is ignored. */

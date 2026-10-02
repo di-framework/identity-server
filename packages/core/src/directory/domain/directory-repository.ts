@@ -76,4 +76,8 @@ export interface DirectoryRepository {
   /** Owners of an organization, in any user status (`countByOrganizationSlugAndRole`). */
   countOwners(slug: string): Promise<number>;
   countActivePlatformAdmins(): Promise<number>;
+  /** Locks an organization row (`FOR UPDATE`) until the current transaction ends. */
+  lockOrganization(slug: string): Promise<void>;
+  /** Serializes changes to the set of platform administrators until the transaction ends. */
+  lockPlatformAdmins(): Promise<void>;
 }

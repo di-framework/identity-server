@@ -8,12 +8,16 @@ import {
   formEncode,
   invalidId,
 } from '../src/admin/application/admin-policy.ts';
-import { AuditAdminService, redact } from '../src/admin/application/audit-admin.ts';
+import {
+  AuditAdminService,
+  auditOrganization,
+  redact,
+} from '../src/admin/application/audit-admin.ts';
 import { ClientAdminService } from '../src/admin/application/client-admin.ts';
 import { MembershipAdminService } from '../src/admin/application/membership-admin.ts';
 import { OrganizationAdminService } from '../src/admin/application/organization-admin.ts';
 import { UserAdminService } from '../src/admin/application/user-admin.ts';
-import type { AuditRepository } from '../src/audit/domain/audit-entry.ts';
+import { AuditEntry, type AuditRepository } from '../src/audit/domain/audit-entry.ts';
 import type { RegisteredClientRepository } from '../src/authorization/domain/models.ts';
 import type { DirectoryRepository } from '../src/directory/domain/directory-repository.ts';
 import { AUDIT, DIRECTORY, REGISTERED_CLIENTS } from '../src/shared/domain/tokens.ts';
@@ -448,6 +452,46 @@ describe('memberships', () => {
       location: expect.stringContaining('removed=1'),
     });
   });
+
+  test('concurrent demotions and removals never leave an organization ownerless', async () => {
+    const gammaId = await organization('gamma');
+    const first = await account('gamma-first');
+    const second = await account('gamma-second');
+    const owners = async () => {
+      await directory().upsertMembership(gammaId, first, 'owner');
+      await directory().upsertMembership(gammaId, second, 'owner');
+    };
+    await owners();
+    await Promise.all([
+      memberships().changeRole(world.admin, { orgSlug: 'gamma', userId: first, newRole: 'member' }),
+      memberships().changeRole(world.admin, {
+        orgSlug: 'gamma',
+        userId: second,
+        newRole: 'member',
+      }),
+    ]);
+    expect(await directory().countOwners('gamma')).toBe(1);
+    await owners();
+    await Promise.all([
+      memberships().remove(world.admin, { orgSlug: 'gamma', userId: first }),
+      memberships().remove(world.admin, { orgSlug: 'gamma', userId: second }),
+    ]);
+    expect(await directory().countOwners('gamma')).toBe(1);
+  });
+
+  test('concurrent archives never leave the platform without an active administrator', async () => {
+    const deputy = await account('deputy', { role: 'platform_admin' });
+    const archived = await Promise.all([
+      users().archive(world.admin, world.admin),
+      users().archive(world.admin, deputy),
+    ]);
+    expect(
+      archived.filter((result) => 'location' in result && result.location.includes('archived=1')),
+    ).toHaveLength(1);
+    expect(await directory().countActivePlatformAdmins()).toBe(1);
+    await directory().updateAccount(world.admin, { status: 'active' });
+    await directory().updateAccount(deputy, { status: 'archived' });
+  });
 });
 
 describe('oauth clients', () => {
@@ -532,6 +576,48 @@ describe('oauth clients', () => {
     expect(await clients().edit(world.owner, 'missing', { clientName: 'x' })).toMatchObject({
       status: 404,
     });
+    const renamed = await clients().edit(world.owner, clientId, { clientName: 'Portal 3' });
+    expect(renamed).toMatchObject({
+      kind: 'ok',
+      value: {
+        clientName: 'Portal 3',
+        redirectUris: ['https://a.example/cb'],
+        grantTypes: ['authorization_code'],
+        scopes: ['openid'],
+      },
+    });
+
+    for (const scopes of ['openid,admin:write', 'admin:read', 'directory:read']) {
+      expect(
+        await clients().register(world.owner, { orgSlug: 'acme', clientName: 'x', scopes }),
+      ).toMatchObject({ status: 400, title: 'Scope Not Allowed' });
+      expect(
+        await clients().edit(world.owner, clientId, { clientName: 'x', scopes }),
+      ).toMatchObject({ status: 400, title: 'Scope Not Allowed' });
+    }
+    const granted = await clients().register(world.admin, {
+      orgSlug: 'acme',
+      clientName: 'Provisioner',
+      grantTypes: 'client_credentials',
+      scopes: 'admin:read',
+    });
+    const grantedId = (granted as { value: { clientId: string } }).value.clientId;
+    expect(
+      await clients().edit(world.owner, grantedId, {
+        clientName: 'Provisioner 2',
+        scopes: 'admin:read,openid',
+      }),
+    ).toMatchObject({ kind: 'ok', value: { scopes: ['admin:read', 'openid'] } });
+    expect(
+      await clients().edit(world.owner, grantedId, {
+        clientName: 'Provisioner 3',
+        scopes: 'admin:read,admin:write',
+      }),
+    ).toMatchObject({
+      status: 400,
+      message: 'Only platform administrators can grant admin:write.',
+    });
+    await clients().revoke(world.admin, grantedId);
 
     const rotated = await clients().rotateSecret(world.owner, clientId);
     const fresh = (rotated as { value: { secret: string } }).value.secret;
@@ -551,8 +637,10 @@ describe('oauth clients', () => {
     });
     expect(await clients().revoke(world.owner, 'missing')).toMatchObject({ status: 404 });
     expect(
-      (await clients().list(world.owner, { status: 'revoked' })).clients.map((c) => c.clientId),
-    ).toEqual([clientId]);
+      (await clients().list(world.owner, { status: 'revoked' })).clients
+        .map((c) => c.clientId)
+        .sort(),
+    ).toEqual([clientId, grantedId].sort());
     expect((await clients().list(world.owner, { status: 'active' })).clients).toEqual([]);
     const orgs = await organizations().detail(world.admin, world.beta.id);
     expect(orgs).toMatchObject({ value: { clientCount: 1 } });
@@ -581,8 +669,49 @@ describe('audit', () => {
       actor: 'robot',
       target: 'elsewhere',
       correlationId: null,
-      after: { orgSlug: 'ACME' },
+      after: { orgSlug: 'acme' },
     });
+    const scoped = [
+      { action: 'test.org.scoped', target: 'acme' },
+      { action: 'admin.org.edit_settings', target: 'acme' },
+      { action: 'admin.organization_updated', target: 'acme' },
+      { action: 'admin.membership.add', target: 'acme:someone' },
+      { action: 'admin.oauth_client.revoke', target: 'acme:cli_x' },
+      { action: 'admin.membership_upserted', target: 'acme/someone' },
+      { action: 'admin.membership.remove', target: 'acme-two:someone' },
+      { action: 'admin.membership_deleted', target: '/someone' },
+      { action: 'admin.org.archive', target: null },
+      { action: 'admin.user.archive', target: crypto.randomUUID() },
+    ];
+    for (const record of scoped) {
+      await repository.append({
+        ...record,
+        actor: 'scope-test',
+        correlationId: null,
+        after: { status: 'archived', note: 'acme' },
+      });
+    }
+    for (const after of [{ orgSlug: 'acme' }, { orgSlug: '' }, {}]) {
+      await repository.append({
+        action: 'admin.user.invite',
+        actor: 'scope-test',
+        target: crypto.randomUUID(),
+        correlationId: null,
+        after,
+      });
+    }
+    expect(
+      (await audits().list(world.owner, { actor: 'scope-test' })).map((r) => r.action).sort(),
+    ).toEqual(
+      [
+        'admin.membership.add',
+        'admin.membership_upserted',
+        'admin.oauth_client.revoke',
+        'admin.org.edit_settings',
+        'admin.organization_updated',
+        'admin.user.invite',
+      ].sort(),
+    );
     const all = await audits().list(world.admin, { action: 'TEST.', actor: 'ROB' });
     expect(all.map((r) => r.action).sort()).toEqual(['test.metadata_only', 'test.secret_event']);
     expect((await audits().list(world.admin, { target: 'beta:' })).map((r) => r.action)).toContain(
@@ -595,8 +724,8 @@ describe('audit', () => {
     ).toBeGreaterThan(2);
     expect(await audits().list(world.admin, { to: '2000-01-01T00:00:00Z' })).toEqual([]);
     expect(await audits().list(world.admin, { actor: 'nobody-at-all' })).toEqual([]);
-    const owner = await audits().list(world.owner, { action: 'test.' });
-    expect(owner.map((r) => r.action)).toEqual(['test.metadata_only']);
+    // Slugs in a target or metadata of an unrelated action are not a tenant association.
+    expect(await audits().list(world.owner, { action: 'test.' })).toEqual([]);
     await denied(audits().list(world.member));
 
     const secretRecord = all.find((r) => r.action === 'test.secret_event');
@@ -609,6 +738,15 @@ describe('audit', () => {
     await denied(audits().detail(world.owner, secretRecord?.id ?? ''));
     expect((await audits().detail(world.admin, 'x')).kind).toBe('error');
     expect(await audits().detail(world.admin, crypto.randomUUID())).toMatchObject({ status: 404 });
+
+    const invite = (after: string) =>
+      auditOrganization(
+        new AuditEntry('i', 'admin.user.invite', null, null, null, '{}', after, ''),
+      );
+    expect(invite('{"orgSlug":"acme"}')).toBe('acme');
+    expect(invite('not json')).toBeUndefined();
+    expect(invite('"acme"')).toBeUndefined();
+    expect(invite('null')).toBeUndefined();
 
     expect(redact('')).toBe('{}');
     expect(redact('{"password":"a","apiKey":"b","Authorization":"c","n":"d"}')).toBe(

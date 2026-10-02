@@ -125,20 +125,30 @@ export class UserAdminService {
   async archive(actorId: string, id: string): Promise<AdminResult<never>> {
     if (!UUID_PATTERN.test(id)) return invalidId();
     await this.policy.check(actorId, 'USER_ARCHIVE', { userId: id });
-    const user = await this.directory.findUser(id);
-    if (!user) return failure(404, 'Not Found', '');
-    const blocked = await this.archiveBlock(id);
-    if (blocked) return redirect(`/admin/users/${id}?error=${formEncode(blocked)}`);
-    await this.directory.updateAccount(id, { status: 'archived' });
-    await this.audit.append({
-      action: 'admin.user.archive',
-      actor: actorId,
-      target: id,
-      correlationId: crypto.randomUUID(),
-      before: { status: user.status },
-      after: { status: 'archived' },
+    // Lock the platform-admin set and every organization the user owns, in slug order, so the
+    // last-admin and last-owner checks hold against concurrent archives and membership changes.
+    return this.directory.transaction(async () => {
+      await this.directory.lockPlatformAdmins();
+      const owned = (await this.directory.membershipsForUser(id))
+        .filter((m) => m.role === 'owner')
+        .map((m) => m.organizationSlug)
+        .sort();
+      for (const slug of owned) await this.directory.lockOrganization(slug);
+      const user = await this.directory.findUser(id);
+      if (!user) return failure(404, 'Not Found', '');
+      const blocked = await this.archiveBlock(id);
+      if (blocked) return redirect(`/admin/users/${id}?error=${formEncode(blocked)}`);
+      await this.directory.updateAccount(id, { status: 'archived' });
+      await this.audit.append({
+        action: 'admin.user.archive',
+        actor: actorId,
+        target: id,
+        correlationId: crypto.randomUUID(),
+        before: { status: user.status },
+        after: { status: 'archived' },
+      });
+      return redirect(`/admin/users/${id}?archived=1`);
     });
-    return redirect(`/admin/users/${id}?archived=1`);
   }
 
   async restore(actorId: string, id: string): Promise<AdminResult<never>> {

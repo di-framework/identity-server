@@ -1,5 +1,12 @@
 import { expect, test } from 'bun:test';
-import { applyMigrations, loadMigrations } from '@di-framework/identity-migrations';
+import { cpSync, mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import {
+  applyMigrations,
+  loadMigrations,
+  migrationsDirectory,
+} from '@di-framework/identity-migrations';
 import { User, UserRepository } from '../src/directory/infrastructure/user-repository.ts';
 import { PostgresAdapter, toPostgresParams } from '../src/shared/infrastructure/postgres.ts';
 import { withThrowawayDatabase } from './support/database.ts';
@@ -29,6 +36,7 @@ test('discovers the reused Flyway migrations in version order', async () => {
     ['9', 'identity unlink confirmations'],
     ['10', 'identity security notifications'],
     ['11', 'browser sessions'],
+    ['12', 'normalize jsonb metadata'],
   ]);
 });
 
@@ -48,6 +56,7 @@ test('applies the reused migrations and reads a user through UserRepository', as
       '9',
       '10',
       '11',
+      '12',
     ]);
 
     const again = await applyMigrations(db);
@@ -80,4 +89,45 @@ test('applies the reused migrations and reads a user through UserRepository', as
     });
     expect((await adapter.findAll()).some((user) => user.id === id)).toBe(true);
   });
+}, 30_000);
+
+test('V12 unwraps metadata and session attributes stored as JSON string scalars', async () => {
+  const earlier = mkdtempSync(join(tmpdir(), 'identity-v11-'));
+  const root = join(earlier, 'migrations');
+  cpSync(migrationsDirectory, root, { recursive: true });
+  for (const name of readdirSync(root)) if (name.startsWith('V12__')) rmSync(join(root, name));
+  try {
+    await withThrowawayDatabase('identity_v12_test', async (db) => {
+      await applyMigrations(db, root);
+      const audit = crypto.randomUUID();
+      await db.run(
+        `INSERT INTO auth_audit_records (id, action, before_metadata, after_metadata)
+         VALUES (?, 'test.legacy', to_jsonb(?::text), to_jsonb(?::text))`,
+        [audit, '{"role":"owner"}', 'plain text'],
+      );
+      await db.run(
+        `INSERT INTO browser_sessions (id, csrf_token, attributes, expires_at)
+         VALUES (?, 'csrf', to_jsonb(?::text), now())`,
+        ['a'.repeat(64), '{"saved":"/admin"}'],
+      );
+      expect((await applyMigrations(db)).applied.map((record) => record.version)).toEqual(['12']);
+      expect(
+        await db.first<Record<string, unknown>>(
+          `SELECT jsonb_typeof(before_metadata) AS before, before_metadata->>'role' AS role,
+                  after_metadata #>> '{}' AS after
+           FROM auth_audit_records WHERE id = ?`,
+          [audit],
+        ),
+      ).toEqual({ before: 'object', role: 'owner', after: 'plain text' });
+      expect(
+        await db.first<Record<string, unknown>>(
+          `SELECT attributes->>'saved' AS saved FROM browser_sessions`,
+        ),
+      ).toEqual({
+        saved: '/admin',
+      });
+    });
+  } finally {
+    rmSync(earlier, { recursive: true, force: true });
+  }
 }, 30_000);

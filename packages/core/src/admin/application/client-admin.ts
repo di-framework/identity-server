@@ -20,6 +20,12 @@ export interface ClientForm {
   scopes?: string | null;
 }
 
+/**
+ * Scopes the API bearer guard accepts. A token carrying them reads or changes every tenant, so
+ * only platform administrators may put them on a client.
+ */
+export const PRIVILEGED_SCOPES = ['admin:read', 'admin:write', 'directory:read'];
+
 /** A client id and its plain secret, shown once. */
 export interface IssuedSecret {
   clientId: string;
@@ -82,6 +88,9 @@ export class ClientAdminService {
     if (!organization || organization.archivedAt !== null) {
       return failure(400, 'Invalid Organization', 'Organization is invalid or archived.');
     }
+    const scopes = commaList(form.scopes ?? 'openid,profile,email');
+    const denied = await this.privilegedScopeDenied(actorId, scopes, []);
+    if (denied) return denied;
     const clientId = Hashing.clientId();
     const secret = Hashing.token();
     await this.clients.insert({
@@ -91,7 +100,7 @@ export class ClientAdminService {
       authenticationMethods: ['client_secret_basic'],
       grantTypes: commaList(form.grantTypes ?? 'authorization_code,refresh_token'),
       redirectUris: commaList(form.redirectUris),
-      scopes: commaList(form.scopes ?? 'openid,profile,email'),
+      scopes,
       settings: { requireProofKey: false, requireAuthorizationConsent: false },
       organizationSlug: form.orgSlug,
     });
@@ -123,11 +132,15 @@ export class ClientAdminService {
     if (!client) return failure(404, 'Not Found', '');
     await this.policy.check(actorId, 'OAUTH_CLIENT_EDIT', { orgSlug: client.organizationSlug });
     const clientName = form.clientName.trim();
+    // Omitted fields keep their stored values, as `register` falls back to defaults.
+    const scopes = form.scopes == null ? client.scopes : commaList(form.scopes);
+    const denied = await this.privilegedScopeDenied(actorId, scopes, client.scopes);
+    if (denied) return denied;
     await this.clients.update(clientId, {
       clientName,
-      redirectUris: commaList(form.redirectUris),
-      grantTypes: commaList(form.grantTypes),
-      scopes: commaList(form.scopes),
+      redirectUris: form.redirectUris == null ? client.redirectUris : commaList(form.redirectUris),
+      grantTypes: form.grantTypes == null ? client.grantTypes : commaList(form.grantTypes),
+      scopes,
     });
     await this.audit.append({
       action: 'admin.oauth_client.edit',
@@ -137,7 +150,7 @@ export class ClientAdminService {
       before: { name: client.clientName },
       after: { name: clientName },
     });
-    return ok(client);
+    return ok((await this.clients.find(clientId)) as RegisteredClient);
   }
 
   async rotateSecret(actorId: string, clientId: string): Promise<AdminResult<IssuedSecret>> {
@@ -171,6 +184,24 @@ export class ClientAdminService {
       after: { revokedAt: new Date(now).toISOString() },
     });
     return { kind: 'redirect', location: `/admin/oauth-clients/${clientId}?revoked=1` };
+  }
+
+  /** Refuses privileged scopes a non-platform-admin would add beyond those already granted. */
+  private async privilegedScopeDenied(
+    actorId: string,
+    scopes: string[],
+    existing: string[],
+  ): Promise<AdminResult<never> | undefined> {
+    const added = scopes.filter(
+      (scope) => PRIVILEGED_SCOPES.includes(scope) && !existing.includes(scope),
+    );
+    if (added.length === 0 || (await this.policy.context(actorId)).isPlatformAdmin)
+      return undefined;
+    return failure(
+      400,
+      'Scope Not Allowed',
+      `Only platform administrators can grant ${added.join(', ')}.`,
+    );
   }
 
   /** The admin pages only know clients that have a lifecycle row. */

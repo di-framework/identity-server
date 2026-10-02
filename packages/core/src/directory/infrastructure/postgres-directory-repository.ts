@@ -281,6 +281,18 @@ export class PostgresDirectoryRepository implements DirectoryRepository {
     return rows.map((row) => this.member(row));
   }
 
+  async lockOrganization(slug: string): Promise<void> {
+    await this.db.query(`SELECT id::text AS id FROM organizations WHERE slug = ? FOR UPDATE`, [
+      slug,
+    ]);
+  }
+
+  async lockPlatformAdmins(): Promise<void> {
+    await this.db.query(
+      `SELECT pg_advisory_xact_lock(hashtextextended('platform_admins', 0))::text AS locked`,
+    );
+  }
+
   async findOrganizationById(id: string): Promise<Organization | undefined> {
     const row = await this.db.one<OrganizationRow>(
       `SELECT id::text AS id, slug, name, created_at, archived_at FROM organizations WHERE id = ?`,

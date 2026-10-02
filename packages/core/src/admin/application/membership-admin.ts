@@ -79,31 +79,35 @@ export class MembershipAdminService {
   ): Promise<AdminResult<never>> {
     if (!UUID_PATTERN.test(form.userId)) return invalidId();
     await this.policy.check(actorId, 'MEMBERSHIP_ROLE_CHANGE', { orgSlug: form.orgSlug });
-    const organization = await this.directory.findOrganization(form.orgSlug);
-    const membership = organization
-      ? await this.directory.findMembership(organization.slug, form.userId)
-      : undefined;
-    if (!organization || !membership) return failure(404, 'Not Found', '');
-    const role = form.newRole === 'owner' ? 'owner' : 'member';
     const back = (query: string) =>
       redirect(`/admin/memberships?orgSlug=${formEncode(form.orgSlug)}&${query}`);
-    if (
-      membership.role === 'owner' &&
-      role === 'member' &&
-      !(await this.policy.canRemoveOrDemoteOrgOwner(form.orgSlug, form.userId))
-    ) {
-      return back(`error=${formEncode('Cannot demote last owner')}`);
-    }
-    await this.directory.upsertMembership(organization.id, form.userId, role);
-    await this.audit.append({
-      action: 'admin.membership.role_change',
-      actor: actorId,
-      target: `${form.orgSlug}:${form.userId}`,
-      correlationId: crypto.randomUUID(),
-      before: { role: membership.role },
-      after: { role },
+    // The organization row lock serializes owner-count checks with membership changes.
+    return this.directory.transaction(async () => {
+      await this.directory.lockOrganization(form.orgSlug);
+      const organization = await this.directory.findOrganization(form.orgSlug);
+      const membership = organization
+        ? await this.directory.findMembership(organization.slug, form.userId)
+        : undefined;
+      if (!organization || !membership) return failure(404, 'Not Found', '');
+      const role = form.newRole === 'owner' ? 'owner' : 'member';
+      if (
+        membership.role === 'owner' &&
+        role === 'member' &&
+        !(await this.policy.canRemoveOrDemoteOrgOwner(form.orgSlug, form.userId))
+      ) {
+        return back(`error=${formEncode('Cannot demote last owner')}`);
+      }
+      await this.directory.upsertMembership(organization.id, form.userId, role);
+      await this.audit.append({
+        action: 'admin.membership.role_change',
+        actor: actorId,
+        target: `${form.orgSlug}:${form.userId}`,
+        correlationId: crypto.randomUUID(),
+        before: { role: membership.role },
+        after: { role },
+      });
+      return back('changed=1');
     });
-    return back('changed=1');
   }
 
   async remove(
@@ -112,27 +116,30 @@ export class MembershipAdminService {
   ): Promise<AdminResult<never>> {
     if (!UUID_PATTERN.test(form.userId)) return invalidId();
     await this.policy.check(actorId, 'MEMBERSHIP_REMOVE', { orgSlug: form.orgSlug });
-    const organization = await this.directory.findOrganization(form.orgSlug);
-    const membership = organization
-      ? await this.directory.findMembership(organization.slug, form.userId)
-      : undefined;
-    if (!organization || !membership) return failure(404, 'Not Found', '');
     const back = (query: string) =>
       redirect(`/admin/memberships?orgSlug=${formEncode(form.orgSlug)}&${query}`);
-    if (
-      membership.role === 'owner' &&
-      !(await this.policy.canRemoveOrDemoteOrgOwner(form.orgSlug, form.userId))
-    ) {
-      return back(`error=${formEncode('Cannot remove last owner')}`);
-    }
-    await this.directory.deleteMembership(form.orgSlug, form.userId);
-    await this.audit.append({
-      action: 'admin.membership.remove',
-      actor: actorId,
-      target: `${form.orgSlug}:${form.userId}`,
-      correlationId: crypto.randomUUID(),
-      before: { role: membership.role },
+    return this.directory.transaction(async () => {
+      await this.directory.lockOrganization(form.orgSlug);
+      const organization = await this.directory.findOrganization(form.orgSlug);
+      const membership = organization
+        ? await this.directory.findMembership(organization.slug, form.userId)
+        : undefined;
+      if (!organization || !membership) return failure(404, 'Not Found', '');
+      if (
+        membership.role === 'owner' &&
+        !(await this.policy.canRemoveOrDemoteOrgOwner(form.orgSlug, form.userId))
+      ) {
+        return back(`error=${formEncode('Cannot remove last owner')}`);
+      }
+      await this.directory.deleteMembership(form.orgSlug, form.userId);
+      await this.audit.append({
+        action: 'admin.membership.remove',
+        actor: actorId,
+        target: `${form.orgSlug}:${form.userId}`,
+        correlationId: crypto.randomUUID(),
+        before: { role: membership.role },
+      });
+      return back('removed=1');
     });
-    return back('removed=1');
   }
 }
