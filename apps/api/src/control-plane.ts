@@ -1,39 +1,18 @@
-import { existsSync } from 'node:fs';
-import { resolve } from 'node:path';
 import { useContainer } from '@di-framework/core/container';
 import { Component, Container } from '@di-framework/core/decorators';
-import { Controller, Endpoint, HttpRouter, json } from '@di-framework/http';
+import { Controller, json } from '@di-framework/http';
 import { AuditService } from '@di-framework/identity/src/audit/application/audit-service.ts';
-import { loadOpenApi } from '@di-framework/identity-codegen';
 import '@di-framework/identity/src/composition.ts';
 import { DirectoryService } from '@di-framework/identity/src/directory/application/directory-service.ts';
 import { LinkService } from '@di-framework/identity/src/linking/application/link-service.ts';
 import { OAuthService } from '@di-framework/identity/src/oauth/application/oauth-service.ts';
 import type { ServiceResult } from '@di-framework/identity/src/shared/domain/service-result.ts';
 
-const METHODS = ['get', 'post', 'put', 'patch', 'delete'] as const;
-type Method = (typeof METHODS)[number];
-
-type SpecOperation = {
-  operationId?: string;
-  summary?: string;
-  description?: string;
-  parameters?: Array<{ in: string }>;
-  requestBody?: unknown;
-  responses?: Record<string, { content?: Record<string, unknown> }>;
-};
-
-type SpecDocument = {
-  info?: { title?: string; version?: string; description?: string };
-  paths: Record<string, Partial<Record<Method, SpecOperation>>>;
-  components?: { schemas?: Record<string, unknown> };
-};
-
 export interface RouteRequest {
   headers: { get(name: string): string | null };
   content?: unknown;
   params?: Record<string, string | undefined>;
-  query?: Record<string, string | undefined>;
+  query?: Record<string, string | string[] | undefined>;
 }
 
 export class RequestValues {
@@ -47,8 +26,9 @@ export class RequestValues {
 
   query(name: string): string | undefined {
     const value = this.request.query?.[name];
-    if (typeof value !== 'string' || value.trim() === '') return undefined;
-    return value.trim();
+    const text = Array.isArray(value) ? value[0] : value;
+    if (typeof text !== 'string' || text.trim() === '') return undefined;
+    return text.trim();
   }
 
   param(name: string): string {
@@ -71,83 +51,6 @@ export class HttpResponse {
     if (result.body === undefined) return new Response(null, { status: result.status });
     return json(result.body, { status: result.status });
   }
-}
-
-/** Pick the OpenAPI file. A compiled binary keeps it under `embedded/`. */
-export function openApiSpecPath(input: {
-  override?: string;
-  source: string;
-  sourceExists: boolean;
-  embedded: string;
-}): string {
-  if (input.override) return input.override;
-  if (input.sourceExists) return input.source;
-  return input.embedded;
-}
-
-@Container()
-export class OpenApiCatalog {
-  readonly spec: SpecDocument;
-  readonly operations: ControlOperation[];
-
-  constructor() {
-    const source = resolve(import.meta.dir, '../api/v1/openapi.yaml');
-    this.spec = loadOpenApi(
-      openApiSpecPath({
-        source,
-        sourceExists: existsSync(source),
-        embedded: resolve(import.meta.dir, 'embedded/openapi.yaml'),
-      }),
-    ) as SpecDocument;
-    this.operations = this.collect();
-  }
-
-  private collect(): ControlOperation[] {
-    const operations: ControlOperation[] = [];
-    for (const [path, item] of Object.entries(this.spec.paths)) {
-      for (const method of METHODS) {
-        const operation = item[method];
-        if (!operation) continue;
-        const jsonApi = this.isJson(operation);
-        if (!path.startsWith('/api/') || !jsonApi) continue;
-        operations.push(this.toOperation(path, method, operation));
-      }
-    }
-    return operations;
-  }
-
-  private isJson(operation: SpecOperation): boolean {
-    for (const [code, response] of Object.entries(operation.responses ?? {})) {
-      const status = Number(code);
-      if (status < 200 || status >= 300) continue;
-      if (response.content?.['application/json']) return true;
-      if (status === 204 && !response.content) return true;
-    }
-    return false;
-  }
-
-  private toOperation(path: string, method: Method, operation: SpecOperation): ControlOperation {
-    const parameters = (operation.parameters ?? []).filter((parameter) => parameter.in !== 'path');
-    return {
-      operationId: operation.operationId ?? '',
-      method,
-      ittyPath: path.replaceAll(/\{([^}]+)\}/g, ':$1'),
-      metadata: {
-        ...(operation.summary ? { summary: operation.summary } : {}),
-        ...(operation.description ? { description: operation.description } : {}),
-        ...(parameters.length > 0 ? { parameters } : {}),
-        ...(operation.requestBody ? { requestBody: operation.requestBody } : {}),
-        responses: operation.responses ?? {},
-      },
-    };
-  }
-}
-
-interface ControlOperation {
-  operationId: string;
-  method: Method;
-  ittyPath: string;
-  metadata: Record<string, unknown>;
 }
 
 @Controller()
@@ -346,37 +249,21 @@ export class ControlPlaneController {
 
 @Container()
 export class ControlPlaneRouter {
-  readonly http: ReturnType<ReturnType<typeof HttpRouter.builder>['build']>;
-
-  constructor(@Component(OpenApiCatalog) catalog: OpenApiCatalog) {
-    const http = HttpRouter.builder().build();
-    this.http = http;
-    for (const operation of catalog.operations) this.register(http, operation);
-  }
-
-  fetch(request: Request): Promise<Response> {
-    return this.http.fetch(request);
-  }
-
-  private register(http: ControlPlaneRouter['http'], operation: ControlOperation): void {
-    const handler = async (request: RouteRequest) => {
-      try {
-        const controller = useContainer().resolve(ControlPlaneController);
-        const result = await controller.dispatch(operation.operationId, request);
-        return HttpResponse.from(result);
-      } catch (error) {
-        return ControlPlaneRouter.error(error);
-      }
-    };
-    const routed = http[operation.method](operation.ittyPath, handler as never);
-    const target = ControlPlaneController as unknown as Record<string, unknown>;
-    target[operation.operationId] = routed;
-    Endpoint(operation.metadata)(ControlPlaneController, operation.operationId);
-  }
-
-  private static error(error: unknown): Response {
-    const message = error instanceof Error ? error.message : 'Request failed';
-    return json({ error: message }, { status: 500 });
+  async fetch(request: Request): Promise<Response> {
+    const { pathname } = new URL(request.url);
+    if (pathname.startsWith('/api/admin')) {
+      const { routes } = await import('./generated/admin/v1/http.ts');
+      return routes.fetch(request);
+    }
+    if (pathname.startsWith('/api/v1/account')) {
+      const { routes } = await import('./generated/account/v1/http.ts');
+      return routes.fetch(request);
+    }
+    if (pathname.startsWith('/api/v1/organizations')) {
+      const { routes } = await import('./generated/organizations/v1/http.ts');
+      return routes.fetch(request);
+    }
+    return new Response(null, { status: 404 });
   }
 }
 

@@ -2,7 +2,7 @@ import { ActionGroup, Button, Checkbox, Content, FormGroup } from '@patternfly/r
 import { useState } from 'react';
 import type { PageModel } from '../domain/model.ts';
 import { t } from '../i18n/messages.ts';
-import { AppPage, Notice, PageTitle, PostForm, TextField } from './chrome.tsx';
+import { AppPage, AuthPage, Notice, PageTitle, PostForm, TextField } from './chrome.tsx';
 
 type PageOf<Name extends PageModel['page']> = Extract<PageModel, { page: Name }>;
 
@@ -10,8 +10,7 @@ export function LoginScreen({ page }: { page: PageOf<'login'> }) {
   const [identifier, setIdentifier] = useState('');
   const [password, setPassword] = useState('');
   return (
-    <AppPage page={page}>
-      <PageTitle>{t('signInTitle')}</PageTitle>
+    <AuthPage title={t('signInTitle')}>
       <PostForm action="/login" csrf={page.csrf}>
         <TextField
           id="identifier"
@@ -41,15 +40,14 @@ export function LoginScreen({ page }: { page: PageOf<'login'> }) {
           </Button>
         </ActionGroup>
       </PostForm>
-    </AppPage>
+    </AuthPage>
   );
 }
 
 export function PasswordlessScreen({ page }: { page: PageOf<'passwordless'> }) {
   const [email, setEmail] = useState('');
   return (
-    <AppPage page={page}>
-      <PageTitle>{t('emailSignInTitle')}</PageTitle>
+    <AuthPage title={t('emailSignInTitle')}>
       {page.notice ? <Notice title={t('linkOnTheWay')} /> : null}
       <PostForm action="/passwordless" csrf={page.csrf}>
         <TextField
@@ -68,21 +66,16 @@ export function PasswordlessScreen({ page }: { page: PageOf<'passwordless'> }) {
           </Button>
         </ActionGroup>
       </PostForm>
-    </AppPage>
+    </AuthPage>
   );
 }
 
 export function ConfirmEmailScreen({ page }: { page: PageOf<'passwordless-confirm'> }) {
   if (page.unavailable) {
-    return (
-      <AppPage page={page}>
-        <PageTitle>{t('linkUnavailable')}</PageTitle>
-      </AppPage>
-    );
+    return <AuthPage title={t('linkUnavailable')} />;
   }
   return (
-    <AppPage page={page}>
-      <PageTitle>{t('emailSignInTitle')}</PageTitle>
+    <AuthPage title={t('emailSignInTitle')}>
       <Content component="p">{t('scannerProtection')}</Content>
       <PostForm action="/passwordless/confirm" csrf={page.csrf}>
         <ActionGroup>
@@ -91,7 +84,7 @@ export function ConfirmEmailScreen({ page }: { page: PageOf<'passwordless-confir
           </Button>
         </ActionGroup>
       </PostForm>
-    </AppPage>
+    </AuthPage>
   );
 }
 
@@ -99,7 +92,7 @@ export function PasswordScreen({ page }: { page: PageOf<'password'> }) {
   const [password, setPassword] = useState('');
   const invalid = page.error === 'short';
   return (
-    <AppPage page={page}>
+    <AppPage page={page} layout="form">
       <PageTitle>{t('setPassword')}</PageTitle>
       <PostForm action="/account/password" csrf={page.csrf}>
         <TextField
@@ -127,7 +120,7 @@ export function PasswordScreen({ page }: { page: PageOf<'password'> }) {
 export function ConsentScreen({ page }: { page: PageOf<'consent'> }) {
   const [scopes, setScopes] = useState(page.scopes);
   return (
-    <AppPage page={page}>
+    <AppPage page={page} layout="form">
       <PageTitle>{t('reviewAccess')}</PageTitle>
       <Content component="p">{t('consentBody', { client: page.clientName })}</Content>
       <PostForm action="/oauth2/authorize" csrf={page.csrf}>

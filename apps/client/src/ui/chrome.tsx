@@ -2,6 +2,8 @@ import {
   Alert,
   Banner,
   Button,
+  Card,
+  CardBody,
   EmptyState,
   EmptyStateBody,
   Flex,
@@ -93,7 +95,44 @@ export function Csrf({ csrf }: { csrf: string }) {
   return <input type="hidden" name="_csrf" value={csrf} />;
 }
 
-export function AppPage({ page, children }: { page: ActorFields; children: ReactNode }) {
+export function AuthPage({ title, children }: { title: string; children?: ReactNode }) {
+  return (
+    <Flex
+      direction={{ default: 'column' }}
+      justifyContent={{ default: 'justifyContentCenter' }}
+      alignItems={{ default: 'alignItemsCenter' }}
+      flexWrap={{ default: 'nowrap' }}
+      style={{
+        minHeight: '100vh',
+        background: 'var(--pf-t--global--background--color--secondary--default)',
+      }}
+    >
+      <FlexItem style={{ width: '100%', maxWidth: '34rem' }}>
+        <Card>
+          <CardBody>
+            <Stack hasGutter>
+              <Title headingLevel="h1" size="3xl">
+                {title}
+              </Title>
+              {children}
+            </Stack>
+          </CardBody>
+        </Card>
+      </FlexItem>
+    </Flex>
+  );
+}
+
+export function AppPage({
+  page,
+  children,
+  layout = 'wide',
+}: {
+  page: ActorFields;
+  children: ReactNode;
+  layout?: 'wide' | 'form';
+}) {
+  const form = layout === 'form';
   const masthead = (
     <Masthead>
       <MastheadMain>
@@ -122,9 +161,20 @@ export function AppPage({ page, children }: { page: ActorFields; children: React
     </Masthead>
   );
   return (
-    <Page masthead={masthead}>
-      <PageSection>
-        <Stack hasGutter>{children}</Stack>
+    <Page masthead={masthead} isContentFilled>
+      <PageSection isFilled variant={form ? 'default' : 'secondary'} hasBodyWrapper={false}>
+        <Card
+          isFullHeight={!form}
+          style={
+            form
+              ? { maxWidth: '34rem', marginInline: 'auto' }
+              : { minHeight: '100%', margin: 'var(--pf-t--global--spacer--md)' }
+          }
+        >
+          <CardBody>
+            <Stack hasGutter>{children}</Stack>
+          </CardBody>
+        </Card>
       </PageSection>
     </Page>
   );
@@ -190,7 +240,7 @@ export function LoadError({ onRetry }: { onRetry: () => void }) {
 
 export function NotFound({ page }: { page: ActorFields }) {
   return (
-    <AppPage page={page}>
+    <AppPage page={page} layout="form">
       <EmptyState titleText={t('notFound')} headingLevel="h1" icon={ExclamationCircleIcon}>
         <EmptyStateBody>{t('notFoundBody')}</EmptyStateBody>
       </EmptyState>
@@ -200,7 +250,7 @@ export function NotFound({ page }: { page: ActorFields }) {
 
 export function LinkUnavailable({ page }: { page: ActorFields }) {
   return (
-    <AppPage page={page}>
+    <AppPage page={page} layout="form">
       <EmptyState titleText={t('linkUnavailable')} headingLevel="h1" icon={ExclamationCircleIcon} />
     </AppPage>
   );
@@ -220,7 +270,7 @@ export function Denied({
         ? t('memberDenied')
         : t('platformDenied');
   return (
-    <AppPage page={page}>
+    <AppPage page={page} layout="form">
       <EmptyState titleText={t('accessNeeded')} headingLevel="h1" icon={LockIcon}>
         <EmptyStateBody>{body}</EmptyStateBody>
       </EmptyState>
@@ -351,7 +401,7 @@ export function DataTable({
 }) {
   const span = columns.length;
   return (
-    <Table aria-label={label} variant="compact">
+    <Table aria-label={label}>
       <Thead>
         <Tr>
           {columns.map((column) => (
@@ -387,7 +437,7 @@ export function DataTable({
 export function FilterToolbar({ children }: { children: ReactNode }) {
   return (
     <Toolbar>
-      <ToolbarContent>{children}</ToolbarContent>
+      <ToolbarContent alignItems="baseline">{children}</ToolbarContent>
     </Toolbar>
   );
 }

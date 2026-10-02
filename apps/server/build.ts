@@ -10,7 +10,6 @@ const outfile = join(serverDir, 'dist', 'identity-server');
 const docker = process.argv.includes('--docker');
 const target = compileTarget(docker);
 
-const openapi = join(repoRoot, 'apps/api/api/v1/openapi.yaml');
 const indexHtml = join(repoRoot, 'apps/client/index.html');
 const migrations = join(repoRoot, 'packages/migrations/migrations');
 const clientEntry = join(repoRoot, 'apps/client/src/main.tsx');
@@ -20,7 +19,6 @@ mkdirSync(join(embedded, 'assets'), { recursive: true });
 mkdirSync(join(embedded, 'migrations'), { recursive: true });
 mkdirSync(join(serverDir, 'dist'), { recursive: true });
 
-cpSync(openapi, join(embedded, 'openapi.yaml'));
 cpSync(indexHtml, join(embedded, 'index.html'));
 for (const name of readdirSync(migrations)) {
   if (name.endsWith('.sql')) cpSync(join(migrations, name), join(embedded, 'migrations', name));

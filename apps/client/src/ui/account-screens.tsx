@@ -41,7 +41,7 @@ export function LinksScreen({ page }: { page: PageOf<'links'> }) {
 
 export function LinkConfirmScreen({ page }: { page: PageOf<'link-confirm'> }) {
   return (
-    <AppPage page={page}>
+    <AppPage page={page} layout="form">
       <PageTitle>{t('confirmLinkTitle')}</PageTitle>
       <Grid hasGutter>
         <GridItem md={6}>
@@ -89,7 +89,7 @@ export function LinkConfirmScreen({ page }: { page: PageOf<'link-confirm'> }) {
 
 export function UnlinkConfirmScreen({ page }: { page: PageOf<'unlink-confirm'> }) {
   return (
-    <AppPage page={page}>
+    <AppPage page={page} layout="form">
       <PageTitle>{t('confirmUnlinkTitle')}</PageTitle>
       <Details
         label={t('confirmUnlinkTitle')}

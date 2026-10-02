@@ -4,9 +4,9 @@
   "private": true,
   "license": "ISC",
   "dependencies": {
-    "@di-framework/config": "link:@di-framework/config",
-    "@di-framework/core": "link:@di-framework/core",
+    "@di-framework/config": "^6.0.3",
+    "@di-framework/core": "^6.0.3",
     "@di-framework/identity-migrations": "workspace:*",
-    "@di-framework/repo": "link:@di-framework/repo"
+    "@di-framework/repo": "^6.0.3"
   }
 }

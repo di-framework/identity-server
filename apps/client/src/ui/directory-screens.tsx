@@ -113,7 +113,7 @@ export function InviteScreen({ page }: { page: PageOf<'invite'> }) {
   const [role, setRole] = useState('member');
   const organizations = [{ value: '', label: t('none') }, ...page.organizations.map(orgOption)];
   return (
-    <AppPage page={page}>
+    <AppPage page={page} layout="form">
       <PageTitle>{t('inviteTitle')}</PageTitle>
       <PostForm action="/admin/users/invite" csrf={page.csrf}>
         <ErrorAlert error={page.error} />
@@ -290,7 +290,7 @@ export function CreateOrganizationScreen({ page }: { page: PageOf<'create-organi
   const [slug, setSlug] = useState('');
   const [name, setName] = useState('');
   return (
-    <AppPage page={page}>
+    <AppPage page={page} layout="form">
       <PageTitle>{t('createOrganizationTitle')}</PageTitle>
       <PostForm action="/admin/organizations/create" csrf={page.csrf}>
         <ErrorAlert error={page.error} />

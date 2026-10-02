@@ -1,0 +1,11 @@
+{
+  "version": "1",
+  "generatedFiles": [
+    "apps/api/src/generated/account/v1/contracts.ts",
+    "apps/api/src/generated/account/v1/http.ts",
+    "apps/api/src/generated/admin/v1/contracts.ts",
+    "apps/api/src/generated/admin/v1/http.ts",
+    "apps/api/src/generated/organizations/v1/contracts.ts",
+    "apps/api/src/generated/organizations/v1/http.ts"
+  ]
+}
