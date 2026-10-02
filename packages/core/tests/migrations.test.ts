@@ -1,14 +1,8 @@
 import { expect, test } from 'bun:test';
 import { applyMigrations, loadMigrations } from '@di-framework/identity-migrations';
 import { User, UserRepository } from '../src/directory/infrastructure/user-repository.ts';
-import {
-  localPostgresUrl,
-  openPostgresDatabase,
-  PostgresAdapter,
-  toPostgresParams,
-} from '../src/shared/infrastructure/postgres.ts';
-
-const migrateTestDatabase = 'identity_migrate_test';
+import { PostgresAdapter, toPostgresParams } from '../src/shared/infrastructure/postgres.ts';
+import { withThrowawayDatabase } from './support/database.ts';
 
 test('rewrites repo placeholders to postgres bindings', () => {
   expect(toPostgresParams('SELECT * FROM t WHERE id = ? AND binding = ?', ['a', 'b'])).toEqual({
@@ -38,15 +32,7 @@ test('discovers the reused Flyway migrations in version order', async () => {
 });
 
 test('applies the reused migrations and reads a user through UserRepository', async () => {
-  const admin = await openPostgresDatabase(localPostgresUrl);
-  await admin.exec(`DROP DATABASE IF EXISTS ${migrateTestDatabase} WITH (FORCE)`);
-  await admin.exec(`CREATE DATABASE ${migrateTestDatabase}`);
-  await admin.close?.();
-
-  const db = await openPostgresDatabase(
-    localPostgresUrl.replace(/\/identity$/, `/${migrateTestDatabase}`),
-  );
-  try {
+  await withThrowawayDatabase('identity_migrate_test', async (db) => {
     const applied = await applyMigrations(db);
     expect(applied.pending).toEqual([]);
     expect(applied.applied.map((record) => record.version)).toEqual([
@@ -91,10 +77,5 @@ test('applies the reused migrations and reads a user through UserRepository', as
       expect((await tx.findById(id))?.login).toBe('ada');
     });
     expect((await adapter.findAll()).some((user) => user.id === id)).toBe(true);
-  } finally {
-    await db.close?.();
-    const cleanup = await openPostgresDatabase(localPostgresUrl);
-    await cleanup.exec(`DROP DATABASE IF EXISTS ${migrateTestDatabase} WITH (FORCE)`);
-    await cleanup.close?.();
-  }
+  });
 }, 30_000);
