@@ -25,4 +25,5 @@ export interface AuditRepository {
   append(entry: AuditWrite): Promise<void>;
   idempotentTarget(action: string, key: string): Promise<string | undefined>;
   list(): Promise<AuditEntry[]>;
+  find(id: string): Promise<AuditEntry | undefined>;
 }

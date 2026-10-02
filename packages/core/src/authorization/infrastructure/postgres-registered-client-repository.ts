@@ -77,6 +77,16 @@ export class PostgresRegisteredClientRepository implements RegisteredClientRepos
     return row ? this.client(row) : undefined;
   }
 
+  async list(organizationSlug?: string): Promise<RegisteredClient[]> {
+    const rows =
+      organizationSlug === undefined
+        ? await this.db.query<Row>(`${SELECT} WHERE l.client_id IS NOT NULL ORDER BY c.client_id`)
+        : await this.db.query<Row>(`${SELECT} WHERE l.organization_slug = ? ORDER BY c.client_id`, [
+            organizationSlug,
+          ]);
+    return rows.map((row) => this.client(row));
+  }
+
   async findById(id: string): Promise<RegisteredClient | undefined> {
     const row = await this.db.one<Row>(`${SELECT} WHERE c.id = ?`, [id]);
     return row ? this.client(row) : undefined;

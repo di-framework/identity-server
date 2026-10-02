@@ -4,6 +4,7 @@
   "private": true,
   "license": "ISC",
   "dependencies": {
+    "@di-framework/authz": "^6.0.3",
     "@di-framework/config": "^6.0.3",
     "@di-framework/core": "^6.0.3",
     "@di-framework/identity-migrations": "workspace:*",

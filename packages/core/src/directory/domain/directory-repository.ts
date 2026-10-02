@@ -1,4 +1,10 @@
-import type { DirectoryMember, Membership, Organization, UserAccount } from './models.ts';
+import type {
+  DirectoryMember,
+  Membership,
+  MembershipDetail,
+  Organization,
+  UserAccount,
+} from './models.ts';
 
 export interface NewUser {
   id: string;
@@ -59,4 +65,15 @@ export interface DirectoryRepository {
   upsertMembership(organizationId: string, userId: string, role: string): Promise<void>;
   deleteMembership(slug: string, userId: string): Promise<boolean>;
   listMembers(slug: string, afterId: string | undefined, limit: number): Promise<DirectoryMember[]>;
+  findOrganizationById(id: string): Promise<Organization | undefined>;
+  archiveOrganization(slug: string, at: number): Promise<void>;
+  /** Every membership of a user, ordered by organization slug (`findAllForUser`). */
+  membershipsForUser(userId: string): Promise<MembershipDetail[]>;
+  /** Every membership of an organization, ordered by user login (`findAllForOrganization`). */
+  membershipsForOrganization(slug: string): Promise<MembershipDetail[]>;
+  /** Every membership, ordered by slug then login (`findAllWithDetails`). */
+  allMemberships(): Promise<MembershipDetail[]>;
+  /** Owners of an organization, in any user status (`countByOrganizationSlugAndRole`). */
+  countOwners(slug: string): Promise<number>;
+  countActivePlatformAdmins(): Promise<number>;
 }
