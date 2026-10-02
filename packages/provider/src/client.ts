@@ -52,7 +52,9 @@ export function retrying(base: HttpFetch, options: RetryOptions = {}): HttpFetch
   const attempts = options.attempts ?? 3;
   const delayMs = options.delayMs ?? 100;
   const timeoutMs = options.timeoutMs ?? 15_000;
-  const sleep = options.sleep ?? ((ms: number) => Bun.sleep(ms));
+  // Pulumi runs dynamic providers in its Node language host, where `Bun` does not exist.
+  const sleep =
+    options.sleep ?? ((ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms)));
   return async (request) => {
     const retryable =
       request.method === 'GET' ||

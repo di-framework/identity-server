@@ -35,9 +35,13 @@ type Args<T> = { [K in keyof T]: pulumi.Input<T[K]> };
 
 /**
  * A dynamic resource whose inputs include the connection and its own URN, which the provider
- * sends as the `Idempotency-Key`, as the Go provider does with the engine-supplied URN.
+ * sends as the `Idempotency-Key`, as the Go provider does with the engine-supplied URN. The URN
+ * travels as `idempotencyKey` because Pulumi strips the reserved `urn` and `id` inputs.
+ *
+ * Pulumi creates an output property only for keys present in the registered properties, so each
+ * provider-computed output (`computed`) is registered as `undefined` unless the caller set it.
  */
-function resource<Outputs>(type: string, provider: object) {
+function resource<Outputs>(type: string, provider: object, computed: string[] = []) {
   return class extends pulumi.dynamic.Resource {
     constructor(
       name: string,
@@ -45,10 +49,11 @@ function resource<Outputs>(type: string, provider: object) {
       opts: pulumi.CustomResourceOptions = {},
     ) {
       const urn = pulumi.createUrn(name, `pulumi-nodejs:dynamic/${MODULE}:${type}`, opts.parent);
+      const placeholders = Object.fromEntries(computed.map((key) => [key, undefined]));
       super(
         provider as pulumi.dynamic.ResourceProvider,
         name,
-        { ...args, connection: connection(), urn },
+        { ...placeholders, ...args, connection: connection(), idempotencyKey: urn },
         {
           ...opts,
           additionalSecretOutputs: [
@@ -71,6 +76,7 @@ function resource<Outputs>(type: string, provider: object) {
 export const Organization = resource<{ slug: string; name: string; organizationId: string }>(
   'Organization',
   providers.organization,
+  ['organizationId'],
 );
 export const User = resource<{
   login: string;
@@ -78,7 +84,7 @@ export const User = resource<{
   displayName: string;
   userId: string;
   status: string;
-}>('User', providers.user);
+}>('User', providers.user, ['userId', 'status']);
 export const Membership = resource<{ organizationSlug: string; userId: string; role: string }>(
   'Membership',
   providers.membership,
@@ -91,7 +97,7 @@ export const OAuthClient = resource<{
   browser: boolean;
   secretRotationVersion: string;
   clientSecret: string;
-}>('OAuthClient', providers.oauthClient);
+}>('OAuthClient', providers.oauthClient, ['clientSecret']);
 export const Bootstrap = resource<Record<string, string>>('Bootstrap', providers.bootstrap);
 
 /** `gas:index:audit`. */

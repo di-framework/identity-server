@@ -38,8 +38,11 @@ export interface Connection {
   provisionerClientSecret: string;
 }
 
-/** Every resource carries the connection and, for mutations, its URN as the Idempotency-Key. */
+/**
+ * Every resource carries the connection and, for mutations, its URN as the Idempotency-Key. The
+ * input is not named `urn`: Pulumi reserves `id` and `urn` and never sends them to a provider.
+ */
 export interface ResourceInputs {
   connection: Connection;
-  urn?: string;
+  idempotencyKey?: string;
 }

@@ -82,8 +82,21 @@ export interface AuditItem {
 
 /** `mutationKey`: the resource URN, required for every mutation. */
 function key(inputs: ResourceInputs): string {
-  if (!inputs.urn) throw new ProviderError('Pulumi resource URN is required for mutations');
-  return inputs.urn;
+  if (!inputs.idempotencyKey) {
+    throw new ProviderError('Pulumi resource URN is required for mutations');
+  }
+  return inputs.idempotencyKey;
+}
+
+/**
+ * A new, non-empty `secretRotationVersion` rotates the secret. Clearing it is not a rotation: the
+ * server refuses an empty version, and the current secret stays valid.
+ */
+function rotates(olds: OAuthClientInputs, news: OAuthClientInputs): boolean {
+  return (
+    Boolean(news.secretRotationVersion) &&
+    (olds.secretRotationVersion ?? '') !== news.secretRotationVersion
+  );
 }
 
 function diff(changes: Array<[changed: boolean, property: string, replace: boolean]>): DiffResult {
@@ -300,11 +313,7 @@ export function gasProviders(transport?: HttpFetch, retry?: RetryOptions) {
         [!sameSet(olds.redirectUris, news.redirectUris), 'redirectUris', false],
         [!sameSet(olds.scopes, news.scopes), 'scopes', false],
         [Boolean(olds.browser) !== Boolean(news.browser), 'browser', false],
-        [
-          (olds.secretRotationVersion ?? '') !== (news.secretRotationVersion ?? ''),
-          'secretRotationVersion',
-          false,
-        ],
+        [rotates(olds, news), 'secretRotationVersion', false],
       ]);
     },
     async create(inputs) {
@@ -367,12 +376,12 @@ export function gasProviders(transport?: HttpFetch, retry?: RetryOptions) {
         if (response.status !== 200)
           throw unexpectedStatus('update OAuth client metadata', response);
       }
-      if ((olds.secretRotationVersion ?? '') !== (news.secretRotationVersion ?? '')) {
+      if (rotates(olds, news)) {
         const { response, data } = await client.POST(
           '/api/admin/oauth-clients/{clientId}/rotate-secret',
           {
             params: { path: { clientId: id }, header: { 'Idempotency-Key': key(news) } },
-            body: { version: news.secretRotationVersion ?? '' },
+            body: { version: news.secretRotationVersion as string },
           },
         );
         if (response.status !== 200 || !data?.client_secret) {

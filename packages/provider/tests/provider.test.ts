@@ -37,7 +37,7 @@ describe('resources against the admin API', () => {
   test('organization lifecycle with URN idempotency', async () => {
     const slug = `gas-${tag()}`;
     const urn = `urn:pulumi:dev::proj::pulumi-nodejs:dynamic/gas:Organization::${slug}`;
-    const inputs = { connection, urn, slug, name: 'Gas Org' };
+    const inputs = { connection, idempotencyKey: urn, slug, name: 'Gas Org' };
     const created = await gas.organization.create(inputs);
     const organizationId = created.outs.organizationId;
     expect(created).toMatchObject({
@@ -77,12 +77,12 @@ describe('resources against the admin API', () => {
       organizationId,
     });
     await expect(
-      gas.organization.create({ ...inputs, urn: `${urn}-other`, name: 'Clash' }),
+      gas.organization.create({ ...inputs, idempotencyKey: `${urn}-other`, name: 'Clash' }),
     ).rejects.toThrow('create organization: invalid state transition (Conflict)');
     await gas.organization.delete(slug, updated.outs);
     await gas.organization.delete(slug, updated.outs);
     expect(await gas.organization.read(slug, updated.outs)).toEqual({});
-    await expect(gas.organization.create({ ...inputs, urn: undefined })).rejects.toThrow(
+    await expect(gas.organization.create({ ...inputs, idempotencyKey: undefined })).rejects.toThrow(
       'Pulumi resource URN is required for mutations',
     );
   });
@@ -91,7 +91,7 @@ describe('resources against the admin API', () => {
     const t = tag();
     const userInputs = {
       connection,
-      urn: `urn:user:${t}`,
+      idempotencyKey: `urn:user:${t}`,
       login: `gas-${t}`,
       email: `gas-${t}@example.com`,
       displayName: 'Gas User',
@@ -120,10 +120,10 @@ describe('resources against the admin API', () => {
     expect(renamed.outs.displayName).toBe('Renamed');
 
     const slug = `gas-m-${t}`;
-    await gas.organization.create({ connection, urn: `urn:org:${t}`, slug, name: 'M' });
+    await gas.organization.create({ connection, idempotencyKey: `urn:org:${t}`, slug, name: 'M' });
     const memberInputs = {
       connection,
-      urn: `urn:member:${t}`,
+      idempotencyKey: `urn:member:${t}`,
       organizationSlug: slug,
       userId: user.id,
       role: 'member',
@@ -176,7 +176,7 @@ describe('resources against the admin API', () => {
 
     const clientInputs = {
       connection,
-      urn: `urn:client:${t}`,
+      idempotencyKey: `urn:client:${t}`,
       clientId: `gas-client-${t}`,
       organizationSlug: slug,
       scopes: ['openid'],
@@ -222,12 +222,21 @@ describe('resources against the admin API', () => {
     expect(rotated.outs.clientSecret).not.toBe(client.outs.clientSecret);
     const unchanged = await gas.oauthClient.update(client.id, rotated.outs, rotated.outs);
     expect(unchanged.outs.clientSecret).toBe(rotated.outs.clientSecret);
+    // Clearing the version is not a rotation: no diff, and an update keeps the secret.
+    const cleared = { ...rotated.outs, secretRotationVersion: undefined };
+    expect(await gas.oauthClient.diff(client.id, rotated.outs, cleared)).toEqual({
+      changes: false,
+      replaces: [],
+    });
+    expect((await gas.oauthClient.update(client.id, rotated.outs, cleared)).outs.clientSecret).toBe(
+      rotated.outs.clientSecret,
+    );
     await gas.oauthClient.delete(client.id, rotated.outs);
     expect(await gas.oauthClient.read(client.id, rotated.outs)).toEqual({});
     expect(await gas.oauthClient.read('missing', rotated.outs)).toEqual({});
     const minimal = await gas.oauthClient.create({
       connection,
-      urn: `urn:min:${t}`,
+      idempotencyKey: `urn:min:${t}`,
       clientId: `gas-min-${t}`,
     });
     expect(minimal.id).toBe(`gas-min-${t}`);
@@ -308,7 +317,7 @@ describe('client behavior', () => {
     provisionerClientId: 'p',
     provisionerClientSecret: 's',
   };
-  const outs = { connection: stubConnection, urn: 'urn:x' };
+  const outs = { connection: stubConnection, idempotencyKey: 'urn:x' };
 
   test('every unexpected status surfaces with the operation name', async () => {
     const failing = fast(

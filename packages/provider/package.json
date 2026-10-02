@@ -6,7 +6,8 @@
   "main": "./src/pulumi.ts",
   "dependencies": {
     "@pulumi/pulumi": "^3.267.0",
-    "openapi-fetch": "^0.17.0"
+    "openapi-fetch": "^0.17.0",
+    "typescript": "~5.9.3"
   },
   "devDependencies": {
     "@di-framework/repo": "^6.0.3"

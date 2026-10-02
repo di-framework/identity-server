@@ -34,6 +34,9 @@ Behavior matches `pulumi-provider-gas`:
 - Client secrets are write-only on the server: an imported client has no `clientSecret` until
   `secretRotationVersion` changes.
 
-Dynamic providers run in Pulumi's Node language host. The resource logic in `src/resources.ts`
+Dynamic providers run in Pulumi's Node language host. Pulumi serializes the provider with the
+TypeScript compiler API, which TypeScript 7 no longer exposes, so this package depends on
+TypeScript 5.9 for the SDK while the workspace typechecks with TypeScript 7. The URN reaches the
+provider as the `idempotencyKey` input because Pulumi does not pass its reserved `urn` input. The resource logic in `src/resources.ts`
 is tested under `bun test` against the in-process server; `src/pulumi.ts` needs the Pulumi
 engine and is not loaded by the tests.
