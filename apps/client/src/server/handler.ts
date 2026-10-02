@@ -1,6 +1,8 @@
 import { existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
-import { createSession, findSession, type Store } from '../domain/model.ts';
+import type { IdentityClient } from '../api/client.ts';
+import { applyDirectory } from '../api/directory.ts';
+import { createSession, findSession, type Outcome, type Store } from '../domain/model.ts';
 import { submit, view } from '../domain/service.ts';
 import { clearCookie, readCookie, writeCookie } from './cookies.ts';
 
@@ -14,7 +16,11 @@ export function indexDocument(moduleUrl: string = import.meta.url): URL {
   return new URL('embedded/index.html', moduleUrl);
 }
 
-export async function handle(request: Request, store: Store): Promise<Response> {
+export async function handle(
+  request: Request,
+  store: Store,
+  directory?: IdentityClient,
+): Promise<Response> {
   if (request.method !== 'GET' && request.method !== 'POST') {
     return new Response(null, { status: 405 });
   }
@@ -27,10 +33,27 @@ export async function handle(request: Request, store: Store): Promise<Response> 
   const form =
     request.method === 'POST' ? new URLSearchParams(await request.text()) : new URLSearchParams();
   const wantsJson = (request.headers.get('accept') ?? '').includes('application/json');
-  const outcome =
-    request.method === 'POST'
-      ? submit(store, session, emailToken, url, form)
-      : view(store, session, emailToken, url, wantsJson);
+  const viewed =
+    request.method === 'GET' ? view(store, session, emailToken, url, wantsJson) : undefined;
+  const baseline: Outcome = viewed ?? { type: 'page', session };
+  let outcome = baseline;
+  if (directory) {
+    const next = await applyDirectory(directory, {
+      method: request.method,
+      url,
+      store,
+      session,
+      form,
+      outcome: baseline,
+      revealSecrets: wantsJson,
+    });
+    outcome =
+      request.method === 'POST' && next === baseline
+        ? submit(store, session, emailToken, url, form)
+        : next;
+  } else if (request.method === 'POST') {
+    outcome = submit(store, session, emailToken, url, form);
+  }
   const headers = new Headers();
   if (outcome.session === null) {
     headers.append('set-cookie', clearCookie(SESSION));

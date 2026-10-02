@@ -14,6 +14,7 @@
     "../../apps/api/src/**/*.ts",
     "../../apps/client/src/domain/**/*.ts",
     "../../apps/client/src/server/**/*.ts",
+    "../../apps/client/src/api/**/*.ts",
     "../../packages/core/src/**/*.ts",
     "../../packages/migrations/src/**/*.ts"
   ]

@@ -20,11 +20,13 @@ const assets = Bun.isStandaloneExecutable
 const store = createStore(systemClock());
 const port = Number(process.env.PORT ?? 4180);
 const server = Bun.serve({
+  // TODO: This should be configurable via @di-framework/config
   hostname: '0.0.0.0',
   port,
   fetch: (request) => routeRequest(request, store, assets),
 });
 
+// TODO: This should be configurable via @di-framework/config
 console.log(`identity http://0.0.0.0:${server.port}`);
 
 async function buildClientAssets(): Promise<URL> {

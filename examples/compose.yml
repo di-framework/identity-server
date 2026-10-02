@@ -26,26 +26,3 @@ services:
         condition: service_healthy
     ports:
       - "4180:4180"
-
-  app:
-    build:
-      context: ./app
-      dockerfile: Dockerfile
-    environment:
-      PORT: "3000"
-      AUTH_SECRET: example-only-secret-not-for-production-use
-      AUTH_ISSUER: http://app:3000
-    ports:
-      - "3000:3000"
-
-  verify:
-    build:
-      context: .
-      dockerfile: verify.Dockerfile
-    environment:
-      IDENTITY_URL: http://identity:4180
-      APP_URL: http://app:3000
-    depends_on:
-      - identity
-      - app
-    restart: "no"

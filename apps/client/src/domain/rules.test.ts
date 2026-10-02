@@ -761,8 +761,11 @@ describe('identity client HTTP', () => {
     const { store } = world();
     const html = await handle(new Request('http://localhost/login'), store);
     expect(html.headers.get('content-type')).toContain('text/html');
-    expect(html.headers.get('set-cookie')).toContain('identity_session');
     const cookie = html.headers.get('set-cookie') ?? '';
+    expect(cookie).toContain('identity_session');
+    expect(cookie).toContain('HttpOnly');
+    expect(cookie).toContain('Path=/');
+    expect(cookie).toContain('SameSite=Lax');
     const json = await handle(
       new Request('http://localhost/login', { headers: { accept: 'application/json', cookie } }),
       store,

@@ -1,6 +1,18 @@
 import { controlPlane } from '../../api/src/control-plane.ts';
+import { createIdentityClient } from '../../client/src/api/client.ts';
 import type { Store } from '../../client/src/domain/model.ts';
 import { handle } from '../../client/src/server/handler.ts';
+
+const directory = createIdentityClient({
+  // TODO: This should be configurable via @di-framework/config
+  baseUrl: 'http://identity.local',
+  fetch: apiFetch as typeof fetch,
+});
+
+function apiFetch(input: string | URL | Request, init?: RequestInit): Promise<Response> {
+  const request = input instanceof Request ? input : new Request(String(input), init);
+  return controlPlane.fetch(request);
+}
 
 const ASSET_NAME = /^[A-Za-z0-9._-]+$/;
 
@@ -8,7 +20,7 @@ export async function routeRequest(request: Request, store: Store, assets: URL):
   const { pathname } = new URL(request.url);
   if (pathname.startsWith('/api/')) return controlPlane.fetch(request);
   if (pathname.startsWith('/assets/')) return asset(pathname.slice('/assets/'.length), assets);
-  return handle(request, store);
+  return handle(request, store, directory);
 }
 
 async function asset(name: string, assets: URL): Promise<Response> {

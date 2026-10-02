@@ -1,37 +1,37 @@
-# Example auth stack
+# Example
 
-`examples/compose.yml` runs four processes:
+`examples/compose.yml` runs the identity server and its database.
 
 | Service | Role |
 | --- | --- |
 | `postgres` | Database for the identity JSON API |
 | `identity` | Native `@di-framework/identity-server` image |
-| `app` | Small application using `@di-framework/auth` |
-| `verify` | Checks the running stack, then exits |
 
-Build the Linux executables first. The Dockerfiles only copy binaries that are already on disk.
+Build the Linux executable first. The Dockerfile copies a binary that is already on disk.
 
 ```bash
 bun apps/server/build.ts --docker
-bun examples/app/build.ts --docker
-podman compose -f examples/compose.yml up --build --abort-on-container-exit --exit-code-from verify
+podman compose -f examples/compose.yml up --build
 ```
 
-`AUTH_SECRET` in the compose file is an example value. Replace it before any shared or production deployment. It must be at least 32 characters.
+The identity server listens on port 4180. Browser screens for the directory, audit log, and linked identities call the JSON API through a client generated from the OpenAPI document (`openapi-typescript` and `openapi-fetch`). That API reads and writes Postgres. Sign-in, passwordless links, and consent stay in the server process. Routes under `/api/` do not authenticate callers.
 
-The example app mounts `@di-framework/auth` at `/auth` and protects `GET /me`. Passwords must be at least 15 characters. Session cookies use the `__Host-` prefix: `Secure`, `HttpOnly`, `Path=/`, `SameSite=Lax`, and no `Domain`.
+The example application in `examples/app` uses `@di-framework/auth`. Run it on the host so the issuer host is the host the browser uses:
 
-`examples/verify.ts` waits until both servers answer, then checks:
+```bash
+AUTH_SECRET=example-only-secret-not-for-production-use bun examples/app/src/main.ts
+```
 
-- The identity sign-in cookie is `HttpOnly`, `Path=/`, and `SameSite=Lax`.
-- A sign-in POST without the CSRF token does not create a session.
-- A sign-in POST with the token does, and that session can open the user list.
-- The example app rejects a short password and does not echo the password.
-- Registration sets a `__Host-sid` cookie with the attributes above.
-- `/me` is 401 without a session and 401 with a forged cookie.
-- A wrong password returns "Invalid credentials" and does not set a session cookie.
-- Logout expires the cookie and the old session no longer opens `/me`.
+`AUTH_SECRET` must be at least 32 characters. The value above is an example. Replace it before any shared or production deployment. `AUTH_ISSUER` defaults to `http://127.0.0.1:3000`.
 
-The identity JSON API under `/api/` is the control plane. This service does not authenticate those routes. The example checks that the browser sign-in and the example app session behave as described. It does not add an authorization layer to `/api/`.
+The app mounts `@di-framework/auth` at `/auth` and protects `GET /me`. Passwords must be at least 15 characters. Session cookies use the `__Host-` prefix: `Secure`, `HttpOnly`, `Path=/`, `SameSite=Lax`, and no `Domain`.
 
-The browser screens keep their own in-memory directory inside the identity process. The JSON API reads and writes Postgres.
+`examples/app/src/journey.test.ts` walks that journey. A short password is rejected and is not echoed. Registration sets the session cookie. `/me` rejects a missing or forged cookie. A wrong password returns "Invalid credentials" and does not set a session. Logout revokes the session. An unexpected failure returns "Internal Server Error" and leaves the internal message in the log. `bun test` runs the journey.
+
+A Linux binary of the example app is optional and is separate from the compose file:
+
+```bash
+bun examples/app/build.ts --docker
+```
+
+`examples/app/Dockerfile` copies that binary.
