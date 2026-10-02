@@ -32,7 +32,7 @@ Auth-server already has two surfaces that disagree with each other. The JSON con
 | JSON control-plane routes | Match. Admin, directory, and account link operations persist to Postgres behind the auth server's authentication. |
 | HTML admin and account pages | Match. Every page runs on Postgres. |
 | OAuth 2 / OIDC authorization server | Match. Authorization code with PKCE and consent, refresh rotation with replay detection, client credentials, introspection, revocation, UserInfo, JWKS, and discovery. |
-| Schema | Match. `V1`–`V10` are auth-server's tables and every one has a reader and writer. `V11` adds `browser_sessions`, which auth-server keeps in the servlet session. |
+| Schema | Match. `V1`–`V10` are auth-server's tables and every one has a reader and writer. `V11` adds `browser_sessions`, which auth-server keeps in the servlet session. `V12` unwraps JSON metadata that earlier writers stored as string scalars. |
 | Deployment companions | Match. Bootstrap, `/health`, `/ready`, and the `gas` provider (TypeScript, `packages/provider`). |
 
 ## JSON control plane
@@ -107,6 +107,7 @@ Auth-server renders these with kotlinx.html. This repository renders PatternFly 
 | `identity_link_flows` | Yes, through `LinkFlowService` (start writes it, callback deletes it first). Pending links stay in process memory, as auth-server's `stagePendingLink` does. |
 | `oauth2_authorization`, `oauth2_authorization_consent`, `oauth_refresh_token_history` | Yes, through `PostgresAuthorizationRepository`. Only `client_credentials` writes `oauth2_authorization` so far. Token columns hold SHA-256 hashes; `attributes` and `*_metadata` hold this repository's JSON. |
 | `identity_security_notifications` | Yes, through `SecurityNotificationService`. |
+| `V12__normalize_jsonb_metadata` (this repository only) | Data only. Rewrites `auth_audit_records` before/after metadata and `browser_sessions.attributes` stored as JSON string scalars into objects. |
 | `browser_sessions` (`V11`, this repository only) | Yes, through `SessionService`. Auth-server keeps the same state in the servlet session; the table holds the SHA-256 of the cookie value, the user, the CSRF token, the last authentication time, and session attributes. |
 
 ## Operations outside the request path
@@ -121,7 +122,7 @@ Auth-server renders these with kotlinx.html. This repository renders PatternFly 
 | External identity providers | Allowlist of issuer, endpoints, client id, and optional secret. Callback failures use a generic message. Audit correlation values are hashes. | `IdentityProviders` (configured entries plus the google, github, gitlab, and okta defaults, HTTPS or loopback endpoints) and `HttpIdentityProviderClient` (PKCE exchange, RS256 ID token checked for issuer, audience, expiry, nonce, and fresh `auth_time`). The callback URI is built from `AUTH_PUBLIC_ORIGIN` instead of the request's host and port | Match |
 | Pulumi `gas` provider | Organizations, users, memberships, OAuth clients, and audit reads through the admin API, with `Idempotency-Key` set to the resource URN. Each request runs discovery and a client-credentials token request; idempotent requests retry three times on 408/429/5xx; delete treats 404 and 410 as success; preview makes no calls (`pulumi-provider-gas/main.go`, `provider_support.go`) | `packages/provider` is a TypeScript dynamic Pulumi provider with the same resources (Bootstrap, Organization, User, Membership, OAuthClient), audit function, discovery and token per request, retries, error messages, replace/update rules, and URN `Idempotency-Key` (computed with `pulumi.createUrn`, because dynamic providers are not handed the URN). Resource logic is tested against the in-process server; the Pulumi wrapper itself needs the engine | Match |
 | Listen address, port, public origin | `PORT`, `ISSUER_URL`, and `AUTH_PUBLIC_ORIGIN` (falls back to the issuer), injected by Fly and Pulumi. No listen-address setting (`application.yml:2,34,42`) | `loadIdentitySettings` reads the same names; `apps/server` listens on `PORT`. `IDENTITY_SERVER__HOST` sets the listen address, which auth-server does not have | Match |
-| Native image | Jib image of the Spring process | `apps/server/build.ts` compiles one Bun binary with the pages, the authorization server, the API, the client assets, and the migrations (`V1`–`V11`); `apps/server/Dockerfile` runs it. Verified by booting the binary against a fresh database with bootstrap settings | Match |
+| Native image | Jib image of the Spring process | `apps/server/build.ts` compiles one Bun binary with the pages, the authorization server, the API, the client assets, and the migrations (`V1`–`V12`); `apps/server/Dockerfile` runs it. Verified by booting the binary against a fresh database with bootstrap settings | Match |
 
 ## Identity notes that are not parity items
 
@@ -138,6 +139,11 @@ These `TODO.md` lines are about this repository's own wiring. Completing them do
 | Generated JSON routes reject a body-less POST without `Content-Type` (415) | `@di-framework/codegen` 6.0.3 route parsing. Spring accepts such a POST; `unlink/prepare` callers should send `Content-Type: application/json`. |
 | Browser forms and session cookie | The session cookie is `identity_session`, not `JSESSIONID`. The admin and account pages are a PatternFly application that loads JSON page models; the routes, form fields, statuses, and redirects match the kotlinx.html pages. |
 | HTML client registration secret delivery | Deliberate. Auth-server puts the new plain secret in the redirect URL; this repository reveals it once in the page model. |
+| Owner audit scoping | Deliberate. Auth-server shows an owner any record whose target or metadata contains an owned slug as a substring, so the owner of slug `a` reads nearly every record. This repository uses the organization a record's action names: the slug target of organization actions, the `{slug}:` or `{slug}/` prefix of membership and client actions, and `orgSlug` on invites. |
+| Privileged client scopes | Deliberate. Auth-server lets an organization owner register or edit a client with `admin:read`, `admin:write`, or `directory:read`, which reach every tenant through the JSON API. This repository refuses those scopes unless the actor is a platform administrator (an owner may keep scopes already granted). HTML client edits also keep omitted fields instead of clearing them. |
+| Concurrency of last-owner, last-admin, and passwordless checks | Deliberate. Membership changes lock the organization row; user archive locks the platform-admin set and owned organizations; passwordless issuance takes a lock on the email and purpose. Auth-server checks and writes without these locks. JSON user invites are mailed after the account commits. |
+| Inactive users and fresh authentication on `/oauth2/authorize` | Deliberate. A session whose user is no longer active gets `access_denied`, and code and refresh exchanges for such a user fail with `invalid_grant` and delete the authorization. `prompt=login` and `max_age` force a new sign-in; `prompt=none` answers `login_required`. |
+| External ID token `iss` | Deliberate. The claim is canonicalized (trailing slash, default port) before it is compared with the configured provider issuer, so providers such as Auth0 that send a trailing slash can link. |
 
 ## Updating this document
 
