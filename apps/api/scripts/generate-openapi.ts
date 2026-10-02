@@ -3,6 +3,7 @@ import { dirname, resolve } from 'node:path';
 import { generateOpenAPI } from '@di-framework/http';
 import { YAML } from 'bun';
 import { requiredScope } from '../src/guards/bearer-guard.ts';
+import { schemas } from '../src/schemas.ts';
 import '../src/generated/account/v1/http.ts';
 import '../src/generated/admin/v1/http.ts';
 import '../src/generated/organizations/v1/http.ts';
@@ -29,6 +30,12 @@ export function writeOpenApiSpec(path = openApiSpecFile): string {
   }
   const withComponents = document as { components?: Record<string, unknown> };
   withComponents.components = { ...withComponents.components };
+  // Endpoint schemas reference these by `#/components/schemas/<name>`; publish them so the
+  // document is self-contained (`openapi-typescript` refuses dangling references).
+  withComponents.components.schemas = {
+    ...(withComponents.components.schemas as Record<string, unknown> | undefined),
+    ...schemas,
+  };
   withComponents.components.securitySchemes = {
     oauth2: {
       type: 'oauth2',
