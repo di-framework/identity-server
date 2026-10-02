@@ -29,7 +29,7 @@ Auth-server already has two surfaces that disagree with each other. The JSON con
 
 | Area | Status |
 | --- | --- |
-| JSON control-plane routes | Partial. The same operations persist to Postgres behind the same token scopes. User create does not mail the invite, and account link routes are not bound to a session. |
+| JSON control-plane routes | Partial. Admin and directory operations match. Account link routes are not bound to a session yet. |
 | HTML admin and account pages | Local. PatternFly screens cover the page inventory. Sessions, passwords, passwordless tokens, consent, and link start/callback live in memory. |
 | OAuth 2 / OIDC authorization server | Missing. |
 | Schema | The Flyway scripts `V1`–`V10` match auth-server's tables. Several of those tables have no TypeScript reader or writer. |
@@ -43,7 +43,7 @@ Authentication on every auth-server `/api/admin/**` call is an opaque access tok
 
 | Operation | Auth-server | This repository | Status |
 | --- | --- | --- | --- |
-| `GET/POST /api/admin/users`, `GET/PATCH/DELETE /api/admin/users/{userId}` | Scope-gated. Create yields `pending` and mails a passwordless message with purpose `invite`. Delete archives, and returns 409 when a non-archived user has any membership. The JSON API has no last-admin or last-owner block (`ApiController.kt:175-238`). User payload is id, login, email, display name, email verified, status. | Same payload, archive-on-delete, membership 409, and scopes. Create does not send the invite mail. | Partial |
+| `GET/POST /api/admin/users`, `GET/PATCH/DELETE /api/admin/users/{userId}` | Scope-gated. Create yields `pending` and mails a passwordless message with purpose `invite`. Delete archives, and returns 409 when a non-archived user has any membership. The JSON API has no last-admin or last-owner block (`ApiController.kt:175-238`). User payload is id, login, email, display name, email verified, status. | Same payload, archive-on-delete, membership 409, scopes, and the `invite` mail on create (not on an idempotent replay). | Match |
 | System role on the user JSON payload | Omitted. `system_role` is stored and shown on the HTML user pages. | Omitted. The column exists in `V6` and is not mapped on `UserAccount`. | Match |
 | `GET/POST /api/admin/organizations`, `GET/PATCH/DELETE /api/admin/organizations/{slug}` | Scope-gated. Delete is a hard delete and returns 409 when the organization has a membership or an active client. The JSON organization has no archive field. Blank names are rejected on update. | Same delete rule, payload, and scopes. | Match |
 | Organization archive | HTML only (`archived_at`). The JSON API does not archive. | HTML screens filter active and archived organizations. The API hard-deletes. | Split |
@@ -103,10 +103,11 @@ Auth-server renders these with kotlinx.html. This repository renders PatternFly 
 | `auth_audit_records` | Yes. |
 | `oauth2_registered_client`, `oauth_client_lifecycle` | Yes. Admin registration writes both rows in one transaction, with client and token settings. |
 | `identity_links`, `identity_unlink_confirmations` | Yes, for list, prepare, and unlink. |
-| `email_challenges` | No. |
+| `email_challenges` | Yes, through `PasswordlessService`: issue (rate-limited per email and purpose), consume under a row lock, and delivery-failure consumption. |
 | `identity_link_flows` | No. Pending links are in memory on the auth-server HTML path as well (`stagePendingLink`). The flow-state table is the persisted start/callback record. |
 | `oauth2_authorization`, `oauth2_authorization_consent`, `oauth_refresh_token_history` | Yes, through `PostgresAuthorizationRepository`. Only `client_credentials` writes `oauth2_authorization` so far. Token columns hold SHA-256 hashes; `attributes` and `*_metadata` hold this repository's JSON. |
 | `identity_security_notifications` | No. |
+| `browser_sessions` (`V11`, this repository only) | Yes, through `SessionService`. Auth-server keeps the same state in the servlet session; the table holds the SHA-256 of the cookie value, the user, the CSRF token, the last authentication time, and session attributes. |
 
 ## Operations outside the request path
 
@@ -115,7 +116,7 @@ Auth-server renders these with kotlinx.html. This repository renders PatternFly 
 | `GET /health` | `{ "ok": true }` | `apps/api/src/operations/health.ts` returns the same body. | Match |
 | `GET /ready` | 200 when every check passes, otherwise 503. Body keys in order: `database` (connection valid within 2 s), `signing_key` (always true; the key is validated at startup), `smtp` (host and from address configured), `bootstrap` (reconciler finished), `ok` (`WebController.kt:51-64`). | `Readiness` runs the same four checks in the same key order with a 2-second database probe, and `/ready` answers 200 or 503. | Match |
 | Bootstrap | First owner (active platform admin), optional viewer, organization, and the `access` browser client, `directory` client, and provisioner client from encrypted configuration. Provisioner scopes are `admin:read`, `admin:write`, and `directory:read`. Secrets are re-hashed on every start. No audit rows (`BootstrapReconciler.kt:57-209`). | `BootstrapReconciler` runs at startup with the same required settings, messages, create rules, repair rules, and client registrations, in one transaction. `apps/server` exits on failure. | Match |
-| SMTP | Passwordless mail and the security-notification worker | Absent | Missing |
+| SMTP | Passwordless mail and the security-notification worker | `SmtpMailSender` (EHLO, STARTTLS when offered, implicit TLS, AUTH PLAIN or LOGIN, certificate verification on) sends passwordless and invite mail with the auth server's subject and body. No notification worker yet, and the browser pages still use the in-memory store | Partial |
 | Security notifications | Link and unlink enqueue one outbox row per event, keyed `sha256(action\|userId\|issuer\|subject)`. Delivery goes to a verified contact on an active account. Failures retry with backoff `min(30s·2^min(attempts−1,7), 1h)` and no attempt limit. The message omits tokens and claims. | Table unused | Missing |
 | External identity providers | Allowlist of issuer, endpoints, client id, and optional secret. Callback failures use a generic message. Audit correlation values are hashes. | No provider client | Missing |
 | Pulumi `gas` provider | Organizations, users, memberships, OAuth clients, and audit reads through the admin API, with `Idempotency-Key` set to the resource URN. Each request runs discovery and a client-credentials token request; idempotent requests retry three times on 408/429/5xx; delete treats 404 and 410 as success; preview makes no calls (`pulumi-provider-gas/main.go`, `provider_support.go`) | Absent | Missing |

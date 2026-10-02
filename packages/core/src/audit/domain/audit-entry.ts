@@ -13,7 +13,8 @@ export class AuditEntry {
 
 export interface AuditWrite {
   action: string;
-  actor: string;
+  /** Principal name, or null for system actions such as passwordless delivery. */
+  actor: string | null;
   target: string | null;
   correlationId: string | null;
   before?: unknown;

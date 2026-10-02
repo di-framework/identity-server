@@ -1,4 +1,5 @@
 import { Component, Container } from '@di-framework/core/decorators';
+import { PasswordlessService } from '../../account/application/passwordless-service.ts';
 import type { AuditRepository } from '../../audit/domain/audit-entry.ts';
 import type { OAuthRepository } from '../../oauth/domain/oauth-client.ts';
 import { JsonBody } from '../../shared/application/json-body.ts';
@@ -26,6 +27,7 @@ export class DirectoryService {
     @Component(OAUTH) private readonly oauth: OAuthRepository,
     @Component(CursorCodec) private readonly cursors: CursorCodec,
     @Component(IDENTITY_SETTINGS) private readonly settings: IdentitySettings,
+    @Component(PasswordlessService) private readonly passwordless: PasswordlessService,
   ) {}
 
   async listUsers(): Promise<ServiceResult<ReturnType<DirectoryService['user']>[]>> {
@@ -54,6 +56,9 @@ export class DirectoryService {
         if (replay) return replay;
         const id = crypto.randomUUID();
         await this.directory.insertUser({ id, login, email, displayName });
+        await this.passwordless.invite(
+          new UserAccount(id, login, email, displayName, false, 'pending', null),
+        );
         await this.audit.append({
           action: 'admin.user_created',
           actor: command.actor,
