@@ -244,6 +244,12 @@ describe('identity client screens', () => {
         error: 'invalid-org',
         organizations: [{ id: 'o_acme', slug: 'acme', name: 'Acme' }],
       },
+      {
+        page: 'register-client',
+        ...actor,
+        error: 'scope-not-allowed',
+        organizations: [{ id: 'o_acme', slug: 'acme', name: 'Acme' }],
+      },
       { page: 'register-client', ...actor, error: null, organizations: [] },
       {
         page: 'client',

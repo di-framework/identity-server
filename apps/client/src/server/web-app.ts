@@ -68,6 +68,7 @@ interface Context {
   user: UserAccount | undefined;
   cookies: string[];
   cookieHeader: string | null;
+  accept: string;
 }
 
 const page = (body: PageBody, status = 200): Result => ({ kind: 'page', page: body, status });
@@ -125,6 +126,7 @@ export class WebApp {
       user,
       cookies,
       cookieHeader,
+      accept: request.headers.get('accept') ?? '',
     };
     let result: Result;
     try {
@@ -382,11 +384,10 @@ export class WebApp {
         grantTypes: f.get('grantTypes') || null,
         scopes: f.get('scopes') || null,
       });
-      if (result.kind === 'error')
-        return page(
-          { page: 'register-client', organizations, error: 'invalid-org' },
-          result.status,
-        );
+      if (result.kind === 'error') {
+        const error = result.title === 'Scope Not Allowed' ? 'scope-not-allowed' : 'invalid-org';
+        return page({ page: 'register-client', organizations, error }, result.status);
+      }
       return this.revealThenRedirect(c, result, 'newSecret');
     }
     const clientAction = /^\/admin\/oauth-clients\/([^/]+)\/(edit|rotate-secret|revoke)$/.exec(
@@ -814,13 +815,22 @@ export class WebApp {
   // ---- helpers ------------------------------------------------------------------------------
 
   /** Unauthenticated access: remember the page and send the browser to the login form. */
+  /**
+   * Saves the requested page for after sign-in, as Spring's request cache does: only for HTML
+   * navigations, never for JSON page-model fetches or the browser's own favicon request, which
+   * would otherwise replace the page the user asked for.
+   */
   private async loginRequired(c: Context): Promise<Result> {
     if (c.method === 'GET') {
-      c.active = await this.sessions.setAttribute(
-        c.active,
-        SESSION_ATTRIBUTES.savedRequest,
-        `${c.url.pathname}${c.url.search}`,
-      );
+      const navigation =
+        !c.accept.includes('application/json') && !/\/favicon\.[^/]*$/.test(c.url.pathname);
+      if (navigation) {
+        c.active = await this.sessions.setAttribute(
+          c.active,
+          SESSION_ATTRIBUTES.savedRequest,
+          `${c.url.pathname}${c.url.search}`,
+        );
+      }
       return { kind: 'page', page: { page: 'unauthenticated' }, status: 401 };
     }
     return redirect('/login');

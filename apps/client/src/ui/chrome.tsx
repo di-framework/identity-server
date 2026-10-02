@@ -70,6 +70,7 @@ const errorText: Record<FormErrorName, MessageKey> = {
   required: 'required',
   short: 'passwordShort',
   'invalid-org': 'invalidOrg',
+  'scope-not-allowed': 'scopeNotAllowed',
   'user-not-found': 'userNotFound',
   'archived-user': 'archivedUser',
   'already-member': 'alreadyMember',

@@ -183,6 +183,9 @@ describe('shell and transport', () => {
     expect(html.headers.get('location')).toBe('/login');
     expect(await browser.page('/admin/users', 401)).toMatchObject({ page: 'unauthenticated' });
     await browser.send('GET', '/admin/users?q=owner');
+    // The browser's own favicon request and JSON page-model fetches do not replace it.
+    expect((await browser.send('GET', '/favicon.ico')).status).toBe(302);
+    await browser.page('/admin/organizations', 401);
     await browser.page('/login');
     const login = await browser.post('/login', { username: 'ADMIN', password: PASSWORD });
     expect(login.headers.get('location')).toBe('/admin/users?q=owner');
@@ -556,10 +559,29 @@ describe('admin pages', () => {
           clientName: 'Portal 2',
           redirectUris: '',
           grantTypes: 'client_credentials',
-          scopes: 'admin:read',
+          scopes: 'openid',
         })
       ).headers.get('location'),
     ).toBe(`/admin/oauth-clients/${id}?updated=1`);
+    // Owners cannot grant the scopes the admin and directory APIs accept.
+    const escalated = await owner.post(`/admin/oauth-clients/${id}/edit`, {
+      clientName: 'Portal 2',
+      grantTypes: 'client_credentials',
+      scopes: 'admin:read',
+    });
+    expect(escalated.status).toBe(400);
+    expect(await owner.embedded(escalated)).toMatchObject({
+      page: 'error',
+      title: 'Scope Not Allowed',
+    });
+    const privileged = await owner.post('/admin/oauth-clients/register', {
+      orgSlug: 'acme',
+      clientName: 'Escalate',
+      grantTypes: 'client_credentials',
+      scopes: 'admin:write',
+    });
+    expect(privileged.status).toBe(400);
+    expect(await owner.embedded(privileged)).toMatchObject({ error: 'scope-not-allowed' });
     expect(await owner.page(`/admin/oauth-clients/${id}?updated=1`)).toMatchObject({
       banner: 'metadata-updated',
       client: { name: 'Portal 2' },

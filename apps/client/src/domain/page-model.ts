@@ -32,6 +32,7 @@ export type FormErrorName =
   | 'required'
   | 'short'
   | 'invalid-org'
+  | 'scope-not-allowed'
   | 'user-not-found'
   | 'archived-user'
   | 'already-member'

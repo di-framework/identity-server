@@ -58,6 +58,7 @@ const messages = {
   nameRequired: 'A client name is required.',
   conflict: 'That login or email is already in use.',
   invalidOrg: 'Invalid or archived organization.',
+  scopeNotAllowed: 'Only platform administrators can grant admin or directory scopes.',
   sendInvite: 'Send invite',
   user: 'User',
   emailVerified: 'Email verified',
