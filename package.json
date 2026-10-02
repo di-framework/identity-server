@@ -12,10 +12,11 @@
     "postinstall": "git config core.hooksPath .githooks",
     "generate:types": "bun packages/codegen/scripts/generate-oas-types.ts",
     "test": "bun test",
-    "typecheck": "bun x tsc --noEmit",
+    "typecheck": "bun x tsc --noEmit && bun x tsc --noEmit -p apps/client/tsconfig.json",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
-    "format": "biome format --write ."
+    "format": "biome format --write .",
+    "client": "bun apps/client/src/server/main.ts"
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.14",

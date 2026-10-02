@@ -1,4 +1,5 @@
 [test]
+preload = ["./apps/client/src/ui/dom.ts"]
 coverage = true
 coverageSkipTestFiles = true
 # Line coverage is required for every file the tests load.
