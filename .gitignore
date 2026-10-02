@@ -34,6 +34,6 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 .DS_Store
 
 # OpenAPI specifications are generated locally
-api/**/openapi.yaml
-api/**/openapi.yml
-api/**/openapi.json
+**/openapi.yaml
+**/openapi.yml
+**/openapi.json

@@ -3,22 +3,50 @@
   "configVersion": 1,
   "workspaces": {
     "": {
-      "name": "di-framework-identity",
-      "dependencies": {
-        "@di-framework/config": "link:@di-framework/config",
-        "@di-framework/core": "link:@di-framework/core",
-        "@di-framework/http": "link:@di-framework/http",
-        "@di-framework/repo": "link:@di-framework/repo",
-      },
+      "name": "@di-framework/identity",
       "devDependencies": {
         "@biomejs/biome": "^2.5.14",
         "@di-framework/cli": "link:@di-framework/cli",
         "@types/bun": "latest",
-        "oas": "^38.6.0",
-        "oas-normalize": "^18.0.2",
       },
       "peerDependencies": {
         "typescript": "^7",
+      },
+    },
+    "apps/api": {
+      "name": "@di-framework/identity-server",
+      "dependencies": {
+        "@di-framework/core": "link:@di-framework/core",
+        "@di-framework/http": "link:@di-framework/http",
+        "@di-framework/identity": "workspace:*",
+        "@di-framework/identity-codegen": "workspace:*",
+        "@di-framework/identity-migrations": "workspace:*",
+        "@di-framework/repo": "link:@di-framework/repo",
+      },
+    },
+    "apps/client": {
+      "name": "@di-framework/identity-client",
+    },
+    "packages/codegen": {
+      "name": "@di-framework/identity-codegen",
+      "devDependencies": {
+        "oas": "^38.6.0",
+        "oas-normalize": "^18.0.2",
+      },
+    },
+    "packages/core": {
+      "name": "@di-framework/identity",
+      "dependencies": {
+        "@di-framework/config": "link:@di-framework/config",
+        "@di-framework/core": "link:@di-framework/core",
+        "@di-framework/identity-migrations": "workspace:*",
+        "@di-framework/repo": "link:@di-framework/repo",
+      },
+    },
+    "packages/migrations": {
+      "name": "@di-framework/identity-migrations",
+      "dependencies": {
+        "@di-framework/repo": "link:@di-framework/repo",
       },
     },
   },
@@ -56,6 +84,16 @@
     "@di-framework/core": ["@di-framework/core@link:@di-framework/core", {}],
 
     "@di-framework/http": ["@di-framework/http@link:@di-framework/http", {}],
+
+    "@di-framework/identity": ["@di-framework/identity@workspace:packages/core"],
+
+    "@di-framework/identity-client": ["@di-framework/identity-client@workspace:apps/client"],
+
+    "@di-framework/identity-codegen": ["@di-framework/identity-codegen@workspace:packages/codegen"],
+
+    "@di-framework/identity-migrations": ["@di-framework/identity-migrations@workspace:packages/migrations"],
+
+    "@di-framework/identity-server": ["@di-framework/identity-server@workspace:apps/api"],
 
     "@di-framework/repo": ["@di-framework/repo@link:@di-framework/repo", {}],
 

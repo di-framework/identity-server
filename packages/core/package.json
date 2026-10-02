@@ -1,0 +1,12 @@
+{
+  "name": "@di-framework/identity",
+  "type": "module",
+  "private": true,
+  "license": "ISC",
+  "dependencies": {
+    "@di-framework/config": "link:@di-framework/config",
+    "@di-framework/core": "link:@di-framework/core",
+    "@di-framework/identity-migrations": "workspace:*",
+    "@di-framework/repo": "link:@di-framework/repo"
+  }
+}

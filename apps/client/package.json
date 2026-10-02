@@ -1,0 +1,6 @@
+{
+  "name": "@di-framework/identity-client",
+  "type": "module",
+  "private": true,
+  "license": "ISC"
+}

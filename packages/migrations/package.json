@@ -1,0 +1,12 @@
+{
+  "name": "@di-framework/identity-migrations",
+  "type": "module",
+  "private": true,
+  "license": "ISC",
+  "exports": {
+    ".": "./src/migrations.ts"
+  },
+  "dependencies": {
+    "@di-framework/repo": "link:@di-framework/repo"
+  }
+}

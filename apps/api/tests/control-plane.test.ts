@@ -1,19 +1,15 @@
 import { afterAll, expect, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { useContainer } from '@di-framework/core/container';
-import type { SqlDatabase } from '@di-framework/repo';
-import { IdentityModule } from '../src/identity/composition.ts';
-import {
-  ControlPlaneController,
-  controlPlane,
-  IdentityServer,
-} from '../src/identity/http/control-plane.ts';
-import { applyMigrations } from '../src/identity/shared/infrastructure/migrations.ts';
+import { IdentityModule } from '@di-framework/identity/src/composition.ts';
 import {
   localPostgresUrl,
   openPostgresDatabase,
-} from '../src/identity/shared/infrastructure/postgres.ts';
-import { PostgresGateway } from '../src/identity/shared/infrastructure/postgres-gateway.ts';
+} from '@di-framework/identity/src/shared/infrastructure/postgres.ts';
+import { PostgresGateway } from '@di-framework/identity/src/shared/infrastructure/postgres-gateway.ts';
+import { applyMigrations } from '@di-framework/identity-migrations';
+import type { SqlDatabase } from '@di-framework/repo';
+import { ControlPlaneController, controlPlane, IdentityServer } from '../src/control-plane.ts';
 
 const databaseName = 'identity_control_test';
 let database: SqlDatabase | undefined;

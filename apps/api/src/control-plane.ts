@@ -2,13 +2,13 @@ import { resolve } from 'node:path';
 import { useContainer } from '@di-framework/core/container';
 import { Component, Container } from '@di-framework/core/decorators';
 import { Controller, Endpoint, HttpRouter, json } from '@di-framework/http';
-import { loadOpenApi } from '../../codegen/contract.ts';
-import { AuditService } from '../audit/application/audit-service.ts';
-import '../composition.ts';
-import { DirectoryService } from '../directory/application/directory-service.ts';
-import { LinkService } from '../linking/application/link-service.ts';
-import { OAuthService } from '../oauth/application/oauth-service.ts';
-import type { ServiceResult } from '../shared/domain/service-result.ts';
+import { AuditService } from '@di-framework/identity/src/audit/application/audit-service.ts';
+import { loadOpenApi } from '@di-framework/identity-codegen';
+import '@di-framework/identity/src/composition.ts';
+import { DirectoryService } from '@di-framework/identity/src/directory/application/directory-service.ts';
+import { LinkService } from '@di-framework/identity/src/linking/application/link-service.ts';
+import { OAuthService } from '@di-framework/identity/src/oauth/application/oauth-service.ts';
+import type { ServiceResult } from '@di-framework/identity/src/shared/domain/service-result.ts';
 
 const METHODS = ['get', 'post', 'put', 'patch', 'delete'] as const;
 type Method = (typeof METHODS)[number];
@@ -78,9 +78,7 @@ export class OpenApiCatalog {
   readonly operations: ControlOperation[];
 
   constructor() {
-    this.spec = loadOpenApi(
-      resolve(import.meta.dir, '../../../api/v1/openapi.yaml'),
-    ) as SpecDocument;
+    this.spec = loadOpenApi(resolve(import.meta.dir, '../api/v1/openapi.yaml')) as SpecDocument;
     this.operations = this.collect();
   }
 

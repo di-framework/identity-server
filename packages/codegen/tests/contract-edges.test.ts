@@ -10,7 +10,7 @@ import {
   manifestIdentityForPath,
   type PlannedManifest,
   projectSurfaces,
-} from '../src/codegen/contract.ts';
+} from '../src/contract.ts';
 
 const itemDoc = {
   paths: {

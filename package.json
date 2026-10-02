@@ -1,29 +1,26 @@
 {
-  "name": "di-framework-identity",
+  "name": "@di-framework/identity",
   "module": "index.ts",
   "type": "module",
   "private": true,
+  "license": "ISC",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
   "scripts": {
     "postinstall": "git config core.hooksPath .githooks",
-    "generate:types": "bun scripts/generate-oas-types.ts",
+    "generate:types": "bun packages/codegen/scripts/generate-oas-types.ts",
     "test": "bun test",
     "typecheck": "bun x tsc --noEmit",
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "format": "biome format --write ."
   },
-  "dependencies": {
-    "@di-framework/config": "link:@di-framework/config",
-    "@di-framework/core": "link:@di-framework/core",
-    "@di-framework/http": "link:@di-framework/http",
-    "@di-framework/repo": "link:@di-framework/repo"
-  },
   "devDependencies": {
     "@biomejs/biome": "^2.5.14",
     "@di-framework/cli": "link:@di-framework/cli",
-    "@types/bun": "latest",
-    "oas": "^38.6.0",
-    "oas-normalize": "^18.0.2"
+    "@types/bun": "latest"
   },
   "peerDependencies": {
     "typescript": "^7"

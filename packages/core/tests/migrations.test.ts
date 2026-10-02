@@ -1,15 +1,12 @@
 import { expect, test } from 'bun:test';
-import { User, UserRepository } from '../src/identity/directory/infrastructure/user-repository.ts';
-import {
-  applyMigrations,
-  loadMigrations,
-} from '../src/identity/shared/infrastructure/migrations.ts';
+import { applyMigrations, loadMigrations } from '@di-framework/identity-migrations';
+import { User, UserRepository } from '../src/directory/infrastructure/user-repository.ts';
 import {
   localPostgresUrl,
   openPostgresDatabase,
   PostgresAdapter,
   toPostgresParams,
-} from '../src/identity/shared/infrastructure/postgres.ts';
+} from '../src/shared/infrastructure/postgres.ts';
 
 const migrateTestDatabase = 'identity_migrate_test';
 

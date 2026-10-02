@@ -1,4 +1,4 @@
-import type { PlannedManifest } from '../codegen/contract.ts';
+import type { PlannedManifest } from '../contract.ts';
 import { type UserResponse, usersResponseSchema } from './openapi.types.ts';
 
 const users: UserResponse[] = [];

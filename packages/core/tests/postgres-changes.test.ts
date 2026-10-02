@@ -5,11 +5,8 @@ import {
   DatabaseSettings,
   loadDatabaseConfig,
   localPostgresUrl,
-} from '../src/identity/shared/infrastructure/database-config.ts';
-import {
-  PostgresChanges,
-  toPostgresParams,
-} from '../src/identity/shared/infrastructure/postgres.ts';
+} from '../src/shared/infrastructure/database-config.ts';
+import { PostgresChanges, toPostgresParams } from '../src/shared/infrastructure/postgres.ts';
 
 test('maps postgres results and rewrites placeholders', () => {
   expect(PostgresChanges.from(null)).toEqual({});

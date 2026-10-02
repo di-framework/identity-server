@@ -1,0 +1,14 @@
+{
+  "name": "@di-framework/identity-server",
+  "type": "module",
+  "private": true,
+  "license": "ISC",
+  "dependencies": {
+    "@di-framework/identity-codegen": "workspace:*",
+    "@di-framework/identity-migrations": "workspace:*",
+    "@di-framework/identity": "workspace:*",
+    "@di-framework/core": "link:@di-framework/core",
+    "@di-framework/http": "link:@di-framework/http",
+    "@di-framework/repo": "link:@di-framework/repo"
+  }
+}

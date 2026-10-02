@@ -1,0 +1,13 @@
+{
+  "name": "@di-framework/identity-codegen",
+  "type": "module",
+  "private": true,
+  "license": "ISC",
+  "exports": {
+    ".": "./src/contract.ts"
+  },
+  "devDependencies": {
+    "oas": "^38.6.0",
+    "oas-normalize": "^18.0.2"
+  }
+}

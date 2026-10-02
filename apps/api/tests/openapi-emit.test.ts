@@ -4,19 +4,21 @@ import { resolve } from 'node:path';
 import { useContainer } from '@di-framework/core/container';
 import { generateOpenAPIDocument } from '@di-framework/http';
 import { YAML } from 'bun';
-import { OpenApiCatalog } from '../src/identity/http/control-plane.ts';
+import { OpenApiCatalog } from '../src/control-plane.ts';
+
+const apiRoot = resolve(import.meta.dir, '..');
 
 const METHODS = ['get', 'post', 'put', 'patch', 'delete'] as const;
 
 test('emitted OpenAPI matches the JSON control plane', async () => {
-  const source = YAML.parse(readFileSync(resolve('api/v1/openapi.yaml'), 'utf8')) as {
+  const source = YAML.parse(readFileSync(resolve(apiRoot, 'api/v1/openapi.yaml'), 'utf8')) as {
     info: { title: string; version: string; description: string };
     paths: Record<string, Record<string, Record<string, unknown>>>;
     components: { schemas: Record<string, unknown> };
   };
   const catalog = useContainer().resolve(OpenApiCatalog);
   const { document } = await generateOpenAPIDocument({
-    controllerModules: [resolve('src/identity/http/control-plane.ts')],
+    controllerModules: [resolve(apiRoot, 'src/control-plane.ts')],
     configuration: {
       title: source.info.title,
       version: source.info.version,
