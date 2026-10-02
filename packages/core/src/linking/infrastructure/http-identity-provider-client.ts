@@ -1,5 +1,6 @@
 import { Component, Container } from '@di-framework/core/decorators';
 import type { Clock } from '../../shared/domain/clock.ts';
+import { IssuerCanonicalizer } from '../../shared/domain/issuer.ts';
 import { CLOCK } from '../../shared/domain/tokens.ts';
 import { Hashing } from '../../shared/infrastructure/crypto/hashing.ts';
 import { verifyJws } from '../../shared/infrastructure/crypto/signing-keys.ts';
@@ -39,6 +40,8 @@ export class HttpIdentityProviderClient implements IdentityProviderClient {
     @Component(CLOCK) private readonly clock: Clock,
     private readonly http: HttpFetch = (url, init) => fetch(url, init),
   ) {}
+
+  private readonly issuers = new IssuerCanonicalizer();
 
   async exchange(
     provider: ResolvedProvider,
@@ -83,13 +86,23 @@ export class HttpIdentityProviderClient implements IdentityProviderClient {
     };
   }
 
+  private canonical(issuer: string): string | undefined {
+    try {
+      return this.issuers.canonicalize(issuer);
+    } catch {
+      return undefined;
+    }
+  }
+
   private validate(
     provider: ResolvedProvider,
     flow: LinkFlow,
     claims: Record<string, unknown>,
   ): void {
     const now = this.clock.now();
-    if (claims.iss !== provider.issuer)
+    // `provider.issuer` is canonical, so compare the claim in the same form: a provider whose
+    // `iss` has a trailing slash or a default port (Auth0 tenants, for example) still matches.
+    if (typeof claims.iss !== 'string' || this.canonical(claims.iss) !== provider.issuer)
       throw new Error('External identity token issuer is invalid');
     if (typeof claims.exp !== 'number' || claims.exp * 1000 + SKEW_MS <= now) {
       throw new Error('External identity token has expired');

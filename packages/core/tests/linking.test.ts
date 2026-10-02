@@ -474,6 +474,8 @@ describe('provider client', () => {
       [{ noIdToken: true }, 'signed identity token'],
       [{ foreignKey: true }, 'Invalid token signature'],
       [{ claims: { iss: 'https://evil.example' } }, 'issuer is invalid'],
+      [{ claims: { iss: 'not a url' } }, 'issuer is invalid'],
+      [{ claims: { iss: 42 } }, 'issuer is invalid'],
       [{ claims: { exp: Math.floor(clock.now() / 1000) - 120 } }, 'expired'],
       [{ claims: { exp: 'soon' } }, 'expired'],
       [{ claims: { nbf: Math.floor(clock.now() / 1000) + 600 } }, 'not yet valid'],
@@ -491,6 +493,9 @@ describe('provider client', () => {
       claims: { aud: ['x', 'identity-test-client'], nbf: Math.floor(clock.now() / 1000) },
     };
     expect((await run()).subject).toBe(idp.subject);
+    // A trailing slash in `iss` (as Auth0 issues) still matches the canonical provider issuer.
+    idp.behaviour = { claims: { iss: `${idp.issuer}/` } };
+    expect((await run()).issuer).toBe(`${idp.issuer}/`);
     idp.behaviour = {};
   });
 });
