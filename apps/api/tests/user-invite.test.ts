@@ -1,8 +1,8 @@
 import { beforeAll, expect, test } from 'bun:test';
-import { bearerFor } from '@di-framework/identity/tests/support/clients.ts';
 import { useContainer } from '@di-framework/core/container';
 import type { MailMessage } from '@di-framework/identity/src/mail/domain/mail.ts';
 import { MAIL } from '@di-framework/identity/src/shared/domain/tokens.ts';
+import { bearerFor } from '@di-framework/identity/tests/support/clients.ts';
 import {
   databaseUrl,
   testDatabaseName,
