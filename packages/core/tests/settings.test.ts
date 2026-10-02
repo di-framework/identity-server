@@ -198,3 +198,21 @@ test('the module registers, exposes, and connects from settings', async () => {
   }
   expect(testDatabaseName).toBe('identity_test');
 });
+
+test('the notification worker starts only when the scheduler is enabled', () => {
+  const original = IdentityModule.settings();
+  try {
+    IdentityModule.configure(
+      loadIdentitySettings({ GSIO_IDENTITY_NOTIFICATION_SCHEDULER_ENABLED: 'false' }),
+    );
+    expect(IdentityModule.startNotificationWorker()).toBeUndefined();
+    IdentityModule.configure(
+      loadIdentitySettings({ GSIO_IDENTITY_NOTIFICATION_DELAY_MS: '60000' }),
+    );
+    const worker = IdentityModule.startNotificationWorker();
+    expect(worker).toBeDefined();
+    worker?.stop();
+  } finally {
+    IdentityModule.configure(original);
+  }
+});

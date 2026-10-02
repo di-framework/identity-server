@@ -1,7 +1,7 @@
 import { Container } from '@di-framework/core/decorators';
 import { IdentityError } from './identity-error.ts';
 
-/** Canonical issuer URIs for identity links. */
+/** Canonical issuer URIs for identity links (`IdentityLinkService.canonicalizeIssuer`). */
 @Container()
 export class IssuerCanonicalizer {
   canonicalize(raw: string): string {
@@ -16,10 +16,11 @@ export class IssuerCanonicalizer {
     if (url.protocol !== 'http:' && url.protocol !== 'https:') {
       throw new IdentityError(400, 'Issuer URI scheme must be http or https');
     }
-    if (url.search || url.hash) {
+    if (!url.hostname) throw new IdentityError(400, 'Issuer URI must contain a host');
+    if (url.search || url.hash || trimmed.endsWith('?') || trimmed.includes('#')) {
       throw new IdentityError(400, 'Issuer URI must not contain a query or fragment');
     }
-    const port = url.port ? `:${url.port}` : '';
+    const port = url.port && url.port !== '80' && url.port !== '443' ? `:${url.port}` : '';
     const path = url.pathname === '/' ? '' : url.pathname.replace(/\/+$/, '');
     return `${url.protocol}//${url.hostname}${port}${path}`;
   }

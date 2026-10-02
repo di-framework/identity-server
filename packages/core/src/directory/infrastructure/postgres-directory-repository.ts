@@ -99,6 +99,14 @@ export class PostgresDirectoryRepository implements DirectoryRepository {
     );
   }
 
+  async lockUser(id: string): Promise<UserAccount | undefined> {
+    const row = await this.db.one<UserRow>(
+      `SELECT ${USER_COLUMNS} FROM users WHERE id = ? FOR UPDATE`,
+      [id],
+    );
+    return row ? this.user(row) : undefined;
+  }
+
   async findUserByEmailOrLogin(email: string, login: string): Promise<UserAccount | undefined> {
     const row = await this.db.one<UserRow>(
       `SELECT ${USER_COLUMNS} FROM users
