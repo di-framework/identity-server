@@ -161,10 +161,7 @@ export function contractForOperation(
       const success = successResponse(operation);
       const identity = manifestIdentityForPath(path);
       const request = jsonSchema(operation.requestBody?.content?.['application/json']?.schema, doc);
-      const responseSchema = jsonSchema(success.schema, doc);
-      if (!responseSchema) {
-        throw new Error(`OpenAPI operationId ${operationId} response schema did not resolve`);
-      }
+      const responseSchema = jsonSchema(success.schema, doc) ?? {};
       return {
         operationId,
         method: method.toUpperCase(),

@@ -1,0 +1,11 @@
+[test]
+coverage = true
+coverageSkipTestFiles = true
+# Line coverage is required for every file the tests load.
+# functions = 0 keeps an omitted function threshold from failing the run.
+coverageThreshold = { lines = 1, functions = 0 }
+coveragePathIgnorePatterns = [
+  "**/node_modules/**",
+  "**/di-framework/packages/**",
+  "**/T/identity-*/**",
+]

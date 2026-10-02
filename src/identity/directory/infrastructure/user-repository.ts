@@ -1,5 +1,7 @@
+import { Component } from '@di-framework/core/decorators';
 import { EntityRepository, Id, Model, Repository, type SqlDatabase } from '@di-framework/repo';
-import { PostgresAdapter } from './postgres.ts';
+import { IDENTITY_DATABASE } from '../../shared/domain/tokens.ts';
+import { PostgresAdapter } from '../../shared/infrastructure/postgres.ts';
 
 @Model()
 export class User {
@@ -19,7 +21,7 @@ export class User {
 
 @Repository()
 export class UserRepository extends EntityRepository<User, string> {
-  constructor(database: SqlDatabase) {
+  constructor(@Component(IDENTITY_DATABASE) database: SqlDatabase) {
     super(new PostgresAdapter<User, string>(database, { table: 'users' }));
   }
 }

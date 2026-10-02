@@ -7,13 +7,9 @@ import {
   type StorageAdapter,
 } from '@di-framework/repo';
 import { type ReservedSQL, SQL } from 'bun';
+import { loadDatabaseConfig, localPostgresUrl } from './database-config.ts';
 
-/** Local `podman compose` database. Matches `compose.yml`. */
-export const localPostgresUrl = 'postgres://identity:identity@127.0.0.1:5432/identity';
-
-export function resolvePostgresUrl(env: NodeJS.ProcessEnv = process.env): string {
-  return env.DATABASE_URL ?? localPostgresUrl;
-}
+export { localPostgresUrl };
 
 /**
  * Rewrites `@di-framework/repo` `?` placeholders to Postgres `$1` bindings.
@@ -32,14 +28,17 @@ export function toPostgresParams(
   return { text, params };
 }
 
-function affected(result: unknown): { changes?: number } {
-  if (result === null || result === undefined || typeof result !== 'object') return {};
-  const record = result as { changes?: unknown; count?: unknown; rowCount?: unknown };
-  for (const value of [record.changes, record.count, record.rowCount]) {
-    if (typeof value === 'number') return { changes: value };
-    if (typeof value === 'bigint') return { changes: Number(value) };
+/** Maps a Bun Postgres result onto the change count `@di-framework/repo` stores. */
+export class PostgresChanges {
+  static from(result: unknown): { changes?: number } {
+    if (result === null || result === undefined || typeof result !== 'object') return {};
+    const record = result as { changes?: unknown; count?: unknown; rowCount?: unknown };
+    for (const value of [record.changes, record.count, record.rowCount]) {
+      if (typeof value === 'number') return { changes: value };
+      if (typeof value === 'bigint') return { changes: Number(value) };
+    }
+    return {};
   }
-  return {};
 }
 
 /**
@@ -47,14 +46,14 @@ function affected(result: unknown): { changes?: number } {
  * `MigrationRunner` brackets each migration in BEGIN/COMMIT on that session.
  */
 export async function openPostgresDatabase(
-  url: string = resolvePostgresUrl(),
+  url: string = loadDatabaseConfig().url,
 ): Promise<SqlDatabase> {
   const pool = new SQL({ url, adapter: 'postgres', max: 1 });
   const reserved: ReservedSQL = await pool.reserve();
   const driver: SqlDriver = {
     async run(sql, params) {
       const bound = toPostgresParams(sql, params);
-      return affected(await reserved.unsafe(bound.text, [...bound.params]));
+      return PostgresChanges.from(await reserved.unsafe(bound.text, [...bound.params]));
     },
     async query(sql, params) {
       const bound = toPostgresParams(sql, params);

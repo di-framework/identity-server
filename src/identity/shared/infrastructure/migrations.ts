@@ -11,7 +11,7 @@ import {
  * Flyway SQL reused from the auth server.
  * Discovery matches the repo CLI: `discoverManifestMigrations` over `./migrations`.
  */
-export const migrationsDirectory = resolve(import.meta.dir, '../../migrations');
+export const migrationsDirectory = resolve(import.meta.dir, '../../../../migrations');
 
 export function loadMigrations(directory = migrationsDirectory): Promise<MigrationDefinition[]> {
   return discoverManifestMigrations({

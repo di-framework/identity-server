@@ -1,0 +1,35 @@
+import type { DirectoryMember, Membership, Organization, UserAccount } from './models.ts';
+
+export interface NewUser {
+  id: string;
+  login: string;
+  email: string;
+  displayName: string;
+}
+
+export interface NewOrganization {
+  id: string;
+  slug: string;
+  name: string;
+}
+
+/** Directory port. Application services depend on this, not on Postgres. */
+export interface DirectoryRepository {
+  transaction<T>(fn: () => Promise<T>): Promise<T>;
+  listUsers(): Promise<UserAccount[]>;
+  findUser(id: string): Promise<UserAccount | undefined>;
+  insertUser(user: NewUser): Promise<void>;
+  updateDisplayName(id: string, displayName: string): Promise<void>;
+  archiveUser(id: string): Promise<void>;
+  countMembershipsForUser(id: string): Promise<number>;
+  listOrganizations(): Promise<Organization[]>;
+  findOrganization(slug: string): Promise<Organization | undefined>;
+  insertOrganization(organization: NewOrganization): Promise<void>;
+  updateOrganizationName(slug: string, name: string): Promise<void>;
+  deleteOrganization(slug: string): Promise<void>;
+  countMembershipsForSlug(slug: string): Promise<number>;
+  findMembership(slug: string, userId: string): Promise<Membership | undefined>;
+  upsertMembership(organizationId: string, userId: string, role: string): Promise<void>;
+  deleteMembership(slug: string, userId: string): Promise<boolean>;
+  listMembers(slug: string, afterId: string | undefined, limit: number): Promise<DirectoryMember[]>;
+}

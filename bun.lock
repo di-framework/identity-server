@@ -5,6 +5,9 @@
     "": {
       "name": "di-framework-identity",
       "dependencies": {
+        "@di-framework/config": "link:@di-framework/config",
+        "@di-framework/core": "link:@di-framework/core",
+        "@di-framework/http": "link:@di-framework/http",
         "@di-framework/repo": "link:@di-framework/repo",
       },
       "devDependencies": {
@@ -47,6 +50,12 @@
     "@biomejs/cli-win32-x64": ["@biomejs/cli-win32-x64@2.5.15", "", { "os": "win32", "cpu": "x64" }, "sha512-yAzh4UqEImV6Hcy0zjUqNfJAsUhoD64FBQCdTG8Md/Z2wQeVP/ZmJ3XRYAs1g8J9fjTFyl2fCtc5FB5til47+g=="],
 
     "@di-framework/cli": ["@di-framework/cli@link:@di-framework/cli", { "bin": { "di-framework": "./main.ts" } }],
+
+    "@di-framework/config": ["@di-framework/config@link:@di-framework/config", {}],
+
+    "@di-framework/core": ["@di-framework/core@link:@di-framework/core", {}],
+
+    "@di-framework/http": ["@di-framework/http@link:@di-framework/http", {}],
 
     "@di-framework/repo": ["@di-framework/repo@link:@di-framework/repo", {}],
 

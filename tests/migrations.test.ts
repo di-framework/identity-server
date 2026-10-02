@@ -1,7 +1,15 @@
 import { expect, test } from 'bun:test';
-import { applyMigrations, loadMigrations } from '../src/db/migrations.ts';
-import { localPostgresUrl, openPostgresDatabase, toPostgresParams } from '../src/db/postgres.ts';
-import { User, UserRepository } from '../src/db/user-repository.ts';
+import { User, UserRepository } from '../src/identity/directory/infrastructure/user-repository.ts';
+import {
+  applyMigrations,
+  loadMigrations,
+} from '../src/identity/shared/infrastructure/migrations.ts';
+import {
+  localPostgresUrl,
+  openPostgresDatabase,
+  PostgresAdapter,
+  toPostgresParams,
+} from '../src/identity/shared/infrastructure/postgres.ts';
 
 const migrateTestDatabase = 'identity_migrate_test';
 
@@ -80,6 +88,12 @@ test('applies the reused migrations and reads a user through UserRepository', as
     expect(found?.display_name).toBe('Ada');
     expect(found?.email_verified).toBe(true);
     expect(found?.status).toBe('active');
+
+    const adapter = new PostgresAdapter<User, string>(db, { table: 'users' });
+    await adapter.transaction(async (tx) => {
+      expect((await tx.findById(id))?.login).toBe('ada');
+    });
+    expect((await adapter.findAll()).some((user) => user.id === id)).toBe(true);
   } finally {
     await db.close?.();
     const cleanup = await openPostgresDatabase(localPostgresUrl);
