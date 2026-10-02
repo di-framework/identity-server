@@ -16,6 +16,12 @@ interface Row {
 export class PostgresChallengeRepository implements ChallengeRepository {
   constructor(@Component(PostgresGateway) private readonly db: PostgresGateway) {}
 
+  async lockIssuance(email: string, purpose: ChallengePurpose): Promise<void> {
+    await this.db.query(`SELECT pg_advisory_xact_lock(hashtextextended(?, 0))::text AS locked`, [
+      `email_challenges ${purpose} ${email}`,
+    ]);
+  }
+
   countSince(email: string, purpose: ChallengePurpose, since: number): Promise<number> {
     return this.db.count(
       `SELECT count(*)::int AS count FROM email_challenges

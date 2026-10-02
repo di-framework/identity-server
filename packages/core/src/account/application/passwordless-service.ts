@@ -18,6 +18,11 @@ import type { ChallengePurpose, ChallengeRepository } from '../domain/challenge.
 export const CHALLENGE_TTL_MS = 15 * 60 * 1000;
 export const CHALLENGE_INTERVAL_MS = 60 * 1000;
 
+/** Sends a staged sign-in link. Run it after the transaction that staged it commits. */
+export type Delivery = () => Promise<void>;
+
+const NOTHING: Delivery = async () => {};
+
 export interface ConsumedChallenge {
   user: UserAccount;
   purpose: ChallengePurpose;
@@ -42,12 +47,16 @@ export class PasswordlessService {
   async requestSignIn(email: string): Promise<void> {
     const user = await this.directory.findUserByEmail(email);
     if (!user) return;
-    if (user.status === 'pending') await this.issue(user, 'activation');
-    else if (user.status === 'active') await this.issue(user, 'sign_in');
+    if (user.status === 'pending') await (await this.stage(user, 'activation'))();
+    else if (user.status === 'active') await (await this.stage(user, 'sign_in'))();
   }
 
-  invite(user: UserAccount): Promise<void> {
-    return this.issue(user, 'invite');
+  /**
+   * Stages an `invite` challenge in the caller's transaction and returns its delivery, so the
+   * mail goes out only after the new account commits and no connection is held over SMTP.
+   */
+  invite(user: UserAccount): Promise<Delivery> {
+    return this.stage(user, 'invite');
   }
 
   /** Consumes a challenge under a row lock, then activates the user and verifies the email. */
@@ -73,25 +82,38 @@ export class PasswordlessService {
     });
   }
 
-  private async issue(user: UserAccount, purpose: ChallengePurpose): Promise<void> {
+  /**
+   * Inserts a challenge unless one was issued for this email and purpose in the last minute. The
+   * check and insert run under a transaction-scoped lock on the email and purpose, so concurrent
+   * requests issue at most one challenge.
+   */
+  private stage(user: UserAccount, purpose: ChallengePurpose): Promise<Delivery> {
     const email = user.email;
-    if (!email) return;
-    const now = this.clock.now();
-    if ((await this.challenges.countSince(email, purpose, now - CHALLENGE_INTERVAL_MS)) > 0) return;
-    const token = Hashing.token();
-    const id = crypto.randomUUID();
-    await this.challenges.insert(
-      {
-        id,
-        userId: user.id,
-        email,
-        tokenHash: Hashing.sha256Hex(token),
-        purpose,
-        expiresAt: now + CHALLENGE_TTL_MS,
-        consumedAt: null,
-      },
-      now,
-    );
+    if (!email) return Promise.resolve(NOTHING);
+    return this.directory.transaction(async () => {
+      await this.challenges.lockIssuance(email, purpose);
+      const now = this.clock.now();
+      if ((await this.challenges.countSince(email, purpose, now - CHALLENGE_INTERVAL_MS)) > 0)
+        return NOTHING;
+      const token = Hashing.token();
+      const id = crypto.randomUUID();
+      await this.challenges.insert(
+        {
+          id,
+          userId: user.id,
+          email,
+          tokenHash: Hashing.sha256Hex(token),
+          purpose,
+          expiresAt: now + CHALLENGE_TTL_MS,
+          consumedAt: null,
+        },
+        now,
+      );
+      return () => this.deliver(user.id, email, id, token);
+    });
+  }
+
+  private async deliver(userId: string, email: string, id: string, token: string): Promise<void> {
     try {
       await this.mail.send({
         to: email,
@@ -103,7 +125,7 @@ export class PasswordlessService {
       await this.audit.append({
         action: 'passwordless.delivery_failed',
         actor: null,
-        target: user.id,
+        target: userId,
         correlationId: null,
       });
     }

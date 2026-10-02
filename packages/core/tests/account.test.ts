@@ -212,17 +212,27 @@ describe('passwordless', () => {
     await passwordless.requestSignIn(active.email);
     await passwordless.requestSignIn(active.email);
     expect(mail.to(active.email)).toHaveLength(1);
-    await passwordless.invite((await directory().findUser(active.id)) as never);
+    await (await passwordless.invite((await directory().findUser(active.id)) as never))();
     expect(mail.to(active.email)).toHaveLength(2);
     clock.advance(61_000);
     await passwordless.requestSignIn(active.email);
     expect(mail.to(active.email)).toHaveLength(3);
 
     const noEmail = await person('pending', { email: null });
-    await passwordless.invite((await directory().findUser(noEmail.id)) as never);
+    await (await passwordless.invite((await directory().findUser(noEmail.id)) as never))();
     expect(
       await database.query(`SELECT 1 FROM email_challenges WHERE user_id = ?`, [noEmail.id]),
     ).toEqual([]);
+  });
+
+  test('concurrent requests for one email and purpose issue a single challenge', async () => {
+    const { passwordless } = service();
+    const active = await person('active');
+    await Promise.all(Array.from({ length: 8 }, () => passwordless.requestSignIn(active.email)));
+    expect(mail.to(active.email)).toHaveLength(1);
+    expect(
+      await database.query(`SELECT 1 FROM email_challenges WHERE email = ?`, [active.email]),
+    ).toHaveLength(1);
   });
 
   test('a delivery failure consumes the challenge and audits passwordless.delivery_failed', async () => {

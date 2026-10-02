@@ -12,6 +12,8 @@ export interface EmailChallenge {
 }
 
 export interface ChallengeRepository {
+  /** Serializes issuance for one email and purpose until the current transaction ends. */
+  lockIssuance(email: string, purpose: ChallengePurpose): Promise<void>;
   countSince(email: string, purpose: ChallengePurpose, since: number): Promise<number>;
   insert(challenge: EmailChallenge, now: number): Promise<void>;
   /** Finds by token hash with `FOR UPDATE`; call inside a transaction. */
