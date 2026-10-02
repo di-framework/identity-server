@@ -425,7 +425,7 @@ describe('authorization persistence', () => {
       scopes: ['openid'],
       requireProofKey: true,
       requireAuthorizationConsent: true,
-      organizationSlug: 'acme',
+      organizationSlug: 'endpoint-test-org',
     });
     const found = await repository.find(client.clientId);
     expect(found).toMatchObject({
@@ -436,7 +436,7 @@ describe('authorization persistence', () => {
       redirectUris: ['https://a.example/cb'],
       scopes: ['openid'],
       settings: { requireProofKey: true, requireAuthorizationConsent: true },
-      organizationSlug: 'acme',
+      organizationSlug: 'endpoint-test-org',
       revokedAt: null,
     });
     expect((await repository.findById(found?.id ?? ''))?.clientId).toBe(client.clientId);
@@ -480,9 +480,9 @@ describe('authorization persistence', () => {
       requireProofKey: false,
       requireAuthorizationConsent: false,
     });
-    await repository.ensureLifecycle(orphan, 'acme');
+    await repository.ensureLifecycle(orphan, 'endpoint-test-org');
     await repository.ensureLifecycle(orphan, 'other');
-    expect((await repository.find(orphan))?.organizationSlug).toBe('acme');
+    expect((await repository.find(orphan))?.organizationSlug).toBe('endpoint-test-org');
 
     await database.run(
       `INSERT INTO oauth2_authorization (id, registered_client_id, principal_name, authorization_grant_type)
