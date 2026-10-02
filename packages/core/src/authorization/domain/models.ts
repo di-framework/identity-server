@@ -62,6 +62,8 @@ export interface AuthorizationRepository {
   findById(id: string): Promise<Authorization | undefined>;
   /** Finds by token hash. `lock` takes `FOR UPDATE` inside the caller's transaction. */
   findByToken(kind: TokenKind, hash: string, lock?: boolean): Promise<Authorization | undefined>;
+  /** Pending authorization waiting for consent, by the SHA-256 of its consent `state`. */
+  findByState(hash: string): Promise<Authorization | undefined>;
   delete(id: string): Promise<void>;
   /** Deletes every authorization (and so every token) for a principal. */
   deleteByPrincipal(principalName: string): Promise<number>;

@@ -1,5 +1,6 @@
 import { beforeAll, describe, expect, test } from 'bun:test';
 import { useContainer } from '@di-framework/core/container';
+import { UserClaims } from '@di-framework/identity/src/authorization/application/claims.ts';
 import type { ClientAuthenticator } from '@di-framework/identity/src/authorization/application/client-authenticator.ts';
 import { Introspector } from '@di-framework/identity/src/authorization/application/introspector.ts';
 import { ServerMetadata } from '@di-framework/identity/src/authorization/application/server-metadata.ts';
@@ -134,6 +135,7 @@ describe('discovery and keys', () => {
       useContainer().resolve(TokenService),
       useContainer().resolve(Introspector),
       useContainer().resolve(ServerMetadata),
+      useContainer().resolve(UserClaims),
     );
     const response = await failing.fetch(formRequest('/oauth2/token', {}));
     expect(response.status).toBe(500);

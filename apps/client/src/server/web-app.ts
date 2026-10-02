@@ -12,6 +12,7 @@ import { MembershipAdminService } from '@di-framework/identity/src/admin/applica
 import { OrganizationAdminService } from '@di-framework/identity/src/admin/application/organization-admin.ts';
 import { UserAdminService } from '@di-framework/identity/src/admin/application/user-admin.ts';
 import { PLATFORM_ONLY } from '@di-framework/identity/src/admin/domain/admin-access-policy.ts';
+import { AuthorizeService } from '@di-framework/identity/src/authorization/application/authorize-service.ts';
 import type { RegisteredClient } from '@di-framework/identity/src/authorization/domain/models.ts';
 import type { DirectoryRepository } from '@di-framework/identity/src/directory/domain/directory-repository.ts';
 import type {
@@ -181,6 +182,7 @@ export class WebApp {
         : this.requestLink(c);
     }
     if (path === '/passwordless/confirm') return get ? this.stageLink(c) : this.consumeLink(c);
+    if (path === '/oauth2/authorize') return this.authorize(c, get);
     return undefined;
   }
 
@@ -248,6 +250,32 @@ export class WebApp {
     );
     if (result === 'short') return page({ page: 'password', error: 'short' }, 400);
     return redirect('/account/password?updated=1');
+  }
+
+  /** `GET/POST /oauth2/authorize`: validate, sign in, ask for consent, then redirect with a code. */
+  private async authorize(c: Context, get: boolean): Promise<Result> {
+    const user = c.user
+      ? {
+          userId: c.user.id,
+          authenticatedAt: c.active.session.lastAuthenticatedAt ?? Date.now(),
+        }
+      : undefined;
+    const service = this.container.resolve(AuthorizeService);
+    const result = get
+      ? await service.authorize(c.url.searchParams, user)
+      : await service.consent(c.form, user);
+    if (result.kind === 'error') {
+      return page({ page: 'error', title: 'Bad Request', message: result.message }, 400);
+    }
+    if (result.kind === 'redirect') return redirect(result.location, get ? 302 : 303);
+    if (get) {
+      c.active = await this.sessions.setAttribute(
+        c.active,
+        SESSION_ATTRIBUTES.savedRequest,
+        `${c.url.pathname}${c.url.search}`,
+      );
+    }
+    return redirect('/login', get ? 302 : 303);
   }
 
   /** `GET /oauth2/consent` (`WebController.consent`): the client is not named. */
