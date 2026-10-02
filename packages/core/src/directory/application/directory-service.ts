@@ -5,7 +5,8 @@ import { JsonBody } from '../../shared/application/json-body.ts';
 import { CursorCodec } from '../../shared/domain/cursor.ts';
 import { IdentityError } from '../../shared/domain/identity-error.ts';
 import { ServiceResult } from '../../shared/domain/service-result.ts';
-import { AUDIT, DIRECTORY, OAUTH } from '../../shared/domain/tokens.ts';
+import { AUDIT, DIRECTORY, IDENTITY_SETTINGS, OAUTH } from '../../shared/domain/tokens.ts';
+import type { IdentitySettings } from '../../shared/infrastructure/identity-settings.ts';
 import type { DirectoryRepository } from '../domain/directory-repository.ts';
 import { UserAccount } from '../domain/models.ts';
 
@@ -19,13 +20,12 @@ const ROLES = new Set(['member', 'owner']);
 
 @Container()
 export class DirectoryService {
-  private readonly issuer = 'https://issuer.example';
-
   constructor(
     @Component(DIRECTORY) private readonly directory: DirectoryRepository,
     @Component(AUDIT) private readonly audit: AuditRepository,
     @Component(OAUTH) private readonly oauth: OAuthRepository,
     @Component(CursorCodec) private readonly cursors: CursorCodec,
+    @Component(IDENTITY_SETTINGS) private readonly settings: IdentitySettings,
   ) {}
 
   async listUsers(): Promise<ServiceResult<ReturnType<DirectoryService['user']>[]>> {
@@ -258,7 +258,7 @@ export class DirectoryService {
     const next = last && rows.length > pageSize ? this.cursors.encode(last.id) : null;
     return new ServiceResult(200, {
       items: page.map((member) => ({
-        issuer: this.issuer,
+        issuer: this.settings.issuer,
         subject: member.id,
         login: member.login,
         display_name: member.displayName,

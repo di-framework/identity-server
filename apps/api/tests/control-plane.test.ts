@@ -1,14 +1,35 @@
-import { expect, spyOn, test } from 'bun:test';
+import { afterAll, beforeAll, expect, spyOn, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { useContainer } from '@di-framework/core/container';
 import { PostgresGateway } from '@di-framework/identity/src/shared/infrastructure/postgres-gateway.ts';
-import { useTestDatabase } from '@di-framework/identity/tests/support/database.ts';
+import {
+  bearerFor,
+  formRequest,
+  registerClient,
+} from '@di-framework/identity/tests/support/clients.ts';
+import { useIsolatedDatabase } from '@di-framework/identity/tests/support/database.ts';
+import type { SqlDatabase } from '@di-framework/repo';
 import { ControlPlaneController, controlPlane, IdentityServer } from '../src/control-plane.ts';
 import { ControlPlaneHandlers } from '../src/handlers.ts';
 
 test('unknown paths are not control-plane routes', async () => {
   const response = await controlPlane.fetch(new Request('https://identity.test/login'));
   expect(response.status).toBe(404);
+});
+
+let isolated: Awaited<ReturnType<typeof useIsolatedDatabase>>;
+let adminToken = '';
+
+beforeAll(async () => {
+  isolated = await useIsolatedDatabase('identity_control_test');
+  adminToken = await bearerFor(
+    (request) => controlPlane.fetch(request),
+    ['admin:read', 'admin:write', 'directory:read'],
+  );
+});
+
+afterAll(async () => {
+  await isolated.release();
 });
 
 test('reports a server error with no body when an operation throws', async () => {
@@ -30,7 +51,7 @@ test('reports a server error with no body when an operation throws', async () =>
 });
 
 test('serves the JSON control plane through application services', async () => {
-  const database = await useTestDatabase();
+  const database: SqlDatabase = isolated.database;
 
   const gateway = useContainer().resolve(PostgresGateway);
   expect(gateway.isUnique(null)).toBe(false);
@@ -40,7 +61,9 @@ test('serves the JSON control plane through application services', async () => {
   expect(gateway.isUnique({ message: 'other' })).toBe(false);
 
   const server = useContainer().resolve(IdentityServer).start();
-  const served = await fetch(`http://127.0.0.1:${server.port}/api/admin/users`);
+  const served = await fetch(`http://127.0.0.1:${server.port}/api/admin/users`, {
+    headers: { authorization: `Bearer ${adminToken}` },
+  });
   expect(served.status).toBe(200);
   await server.stop(true);
 
@@ -59,8 +82,20 @@ test('serves the JSON control plane through application services', async () => {
     ).status,
   ).toBe(400);
 
+  const adaAdmin = await registerClient({ clientId: 'ada-admin', scopes: ['admin:write'] });
+  const adaToken = (await (
+    await controlPlane.fetch(
+      formRequest(
+        '/oauth2/token',
+        { grant_type: 'client_credentials', scope: 'admin:write' },
+        {
+          authorization: adaAdmin.basic,
+        },
+      ),
+    )
+  ).json()) as { access_token: string };
   const created = await call('POST', '/api/admin/users', {
-    headers: { 'x-actor-id': 'ada-admin' },
+    headers: { authorization: `Bearer ${adaToken.access_token}`, 'x-actor-id': 'spoofed' },
     body: { login: '  Ada  ', email: 'ada@example.com', displayName: 'Ada Lovelace' },
   });
   expect(created.status).toBe(201);
@@ -291,7 +326,7 @@ test('serves the JSON control plane through application services', async () => {
   ).items.find((item) => item.subject === bea.id);
   expect(pictured).toMatchObject({
     picture: 'https://example.com/bea.png',
-    issuer: 'https://issuer.example',
+    issuer: 'https://identity.test',
   });
 
   expect((await call('DELETE', `/api/admin/organizations/acme/members/${ada.id}`)).status).toBe(
@@ -756,6 +791,7 @@ async function call(
   init?: { body?: unknown; headers?: Record<string, string> },
 ): Promise<{ status: number; body: unknown }> {
   const headers = new Headers(init?.headers);
+  if (!headers.has('authorization')) headers.set('authorization', `Bearer ${adminToken}`);
   let body: string | undefined;
   if (init && 'body' in init) {
     headers.set('content-type', 'application/json');

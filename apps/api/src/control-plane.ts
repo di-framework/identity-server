@@ -8,6 +8,8 @@ import { LinkService } from '@di-framework/identity/src/linking/application/link
 import { OAuthService } from '@di-framework/identity/src/oauth/application/oauth-service.ts';
 import type { ServiceResult } from '@di-framework/identity/src/shared/domain/service-result.ts';
 import { AuthorizationEndpoints } from './authorization/endpoints.ts';
+import { BearerGuard, requiredScope } from './guards/bearer-guard.ts';
+import { RequestContext } from './guards/request-context.ts';
 
 export interface RouteRequest {
   headers: { get(name: string): string | null };
@@ -42,8 +44,9 @@ export class RequestValues {
     return content as Record<string, unknown>;
   }
 
+  /** Principal name of the authenticated caller, as the auth server's `authentication.name`. */
   actor(): string {
-    return this.header('x-actor-id') ?? 'system';
+    return RequestContext.current()?.principalName ?? 'system';
   }
 }
 
@@ -252,6 +255,7 @@ export class ControlPlaneController {
 export class ControlPlaneRouter {
   constructor(
     @Component(AuthorizationEndpoints) private readonly authorization: AuthorizationEndpoints,
+    @Component(BearerGuard) private readonly bearer: BearerGuard,
   ) {}
 
   /** Paths this router owns: the JSON API plus the session-free OAuth 2 endpoints. */
@@ -262,6 +266,16 @@ export class ControlPlaneRouter {
   async fetch(request: Request): Promise<Response> {
     const { pathname } = new URL(request.url);
     if (this.authorization.handles(pathname)) return this.authorization.fetch(request);
+    const scope = requiredScope(request.method, pathname);
+    if (scope) {
+      const caller = await this.bearer.authorize(request, scope);
+      if (caller instanceof Response) return caller;
+      return RequestContext.run(caller, () => this.route(pathname, request));
+    }
+    return this.route(pathname, request);
+  }
+
+  private async route(pathname: string, request: Request): Promise<Response> {
     if (pathname.startsWith('/api/admin')) {
       const { routes } = await import('./generated/admin/v1/http.ts');
       return routes.fetch(request);

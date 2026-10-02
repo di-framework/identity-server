@@ -1,8 +1,10 @@
 import { expect, test } from 'bun:test';
 import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { generateOpenAPI } from '@di-framework/http';
 import { YAML } from 'bun';
+import { writeOpenApiSpec } from '../scripts/generate-openapi.ts';
 import { Users } from '../src/contracts/api.schemas.ts';
 import '../src/generated/account/v1/http.ts';
 import '../src/generated/admin/v1/http.ts';
@@ -21,20 +23,20 @@ test('the generated OpenAPI document lists users from the endpoint metadata', ()
   };
   expect(responses?.['200']?.content?.['application/json']?.schema).toEqual(Users.jsonSchema);
 
-  const document = generateOpenAPI({
-    title: 'Identity Auth Control Plane API',
-    version: 'v1',
-    description: 'API for managing organizations, users, and OIDC clients.',
+  const fresh = writeOpenApiSpec(join(tmpdir(), `identity-openapi-${process.pid}.yaml`));
+  expect(readFileSync(fresh, 'utf8')).toBe(readFileSync(specPath, 'utf8'));
+  expect(source.paths['/api/admin/users']?.post).toMatchObject({
+    security: [{ oauth2: ['admin:write'] }],
   });
-  for (const methods of Object.values(document.paths)) {
-    for (const operation of Object.values(methods)) {
-      const operationId = operation.operationId;
-      if (typeof operationId === 'string') {
-        (operation as { operationId: string }).operationId = operationId.slice(
-          operationId.lastIndexOf('.') + 1,
-        );
-      }
-    }
-  }
-  expect(JSON.parse(JSON.stringify(document.paths))).toEqual(source.paths);
+  expect(users).toMatchObject({ security: [{ oauth2: ['admin:read'] }] });
+  expect(source.paths['/api/v1/organizations/{slug}/members']?.get).toMatchObject({
+    security: [{ oauth2: ['directory:read'] }],
+  });
+  expect(source.paths['/api/v1/account/identity-links']?.get).not.toHaveProperty('security');
+  const schemes = (source as { components?: { securitySchemes?: Record<string, unknown> } })
+    .components?.securitySchemes;
+  expect(schemes?.oauth2).toMatchObject({ type: 'oauth2' });
+  expect(Object.keys(generateOpenAPI({ title: 't', version: 'v1' }).paths)).toEqual(
+    Object.keys(source.paths),
+  );
 });

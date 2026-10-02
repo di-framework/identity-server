@@ -19,9 +19,14 @@ test('serves the JSON API, browser pages, and assets from one router', async () 
     store,
     assets,
   );
-  expect(api.status).toBe(200);
-  expect(api.headers.get('content-type')).toContain('application/json');
-  expect(Array.isArray(await api.json())).toBe(true);
+  expect(api.status).toBe(401);
+  expect(api.headers.get('www-authenticate')).toBe('Bearer');
+  const discovery = await routeRequest(
+    new Request('https://identity.test/.well-known/openid-configuration'),
+    store,
+    assets,
+  );
+  expect(((await discovery.json()) as { issuer: string }).issuer).toBe('https://identity.test');
 
   const page = await routeRequest(new Request('https://identity.test/login'), store, assets);
   expect(page.headers.get('content-type')).toContain('text/html');
