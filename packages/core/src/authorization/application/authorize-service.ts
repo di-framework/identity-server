@@ -69,19 +69,18 @@ export class AuthorizeService {
     const prompt = (params.get('prompt') ?? '').split(' ').filter(Boolean);
     const maxAge = params.get('max_age');
     if (maxAge !== null && !/^\d+$/.test(maxAge)) return fail('invalid_request');
-    if (!user) return prompt.includes('none') ? fail('login_required') : login(params);
+    // The sign-in a login redirect leads to is fresh by definition, so the resumed request drops
+    // `prompt` and `max_age` (otherwise `max_age=0` would ask for a second sign-in).
+    const fresh = new URLSearchParams(params);
+    fresh.delete('prompt');
+    fresh.delete('max_age');
+    if (!user) return prompt.includes('none') ? fail('login_required') : login(fresh);
     if (!user.active) return fail('access_denied');
     // OpenID Connect `prompt=login` and `max_age` ask for a sign-in newer than the session's.
     const stale =
       prompt.includes('login') ||
       (maxAge !== null && this.clock.now() - user.authenticatedAt > Number(maxAge) * 1000);
-    if (stale) {
-      if (prompt.includes('none')) return fail('login_required');
-      const fresh = new URLSearchParams(params);
-      fresh.delete('prompt');
-      fresh.delete('max_age');
-      return login(fresh);
-    }
+    if (stale) return prompt.includes('none') ? fail('login_required') : login(fresh);
 
     const attributes = {
       redirect_uri: redirectUri,

@@ -597,6 +597,21 @@ describe('authorization code flow', () => {
     expect(
       errorOf(await anonymous.send('GET', `/oauth2/authorize?${params({ prompt: 'none' })}`)),
     ).toBe('login_required');
+    // Signing in from a max_age=0 request is fresh, so the resumed request does not ask again.
+    expect(
+      (await anonymous.send('GET', `/oauth2/authorize?${params({ max_age: '0' })}`)).headers.get(
+        'location',
+      ),
+    ).toBe('/login');
+    const resumed = await anonymous.signIn(login, PASSWORD);
+    expect(resumed.headers.get('location')).toBe(`/oauth2/authorize?${params({})}`);
+    expect(
+      codeFrom(
+        (await anonymous.send('GET', resumed.headers.get('location') ?? '')).headers.get(
+          'location',
+        ),
+      ),
+    ).toBeTruthy();
   });
 
   test('archived users get no codes, no consent, and no tokens from codes or refresh', async () => {
@@ -640,6 +655,13 @@ describe('authorization code flow', () => {
     expect(secondConsent.pathname).toBe('/oauth2/consent');
     await browser.page(`${secondConsent.pathname}${secondConsent.search}`);
 
+    const replays = async () =>
+      (
+        await database.query(
+          `SELECT 1 FROM auth_audit_records WHERE action = 'oauth.refresh_reuse_detected'`,
+        )
+      ).length;
+    const replaysBefore = await replays();
     await directory.updateAccount(userId, { status: 'archived' });
     try {
       const refused = await browser.send('GET', authorizeUrl(app).url);
@@ -678,5 +700,7 @@ describe('authorization code flow', () => {
         refresh_token: first.body.refresh_token ?? '',
       }),
     ).toEqual({ status: 400, body: { error: 'invalid_grant' } });
+    // A token refused for an inactive user is not a rotated-out token, so it is no replay.
+    expect(await replays()).toBe(replaysBefore);
   });
 });

@@ -169,6 +169,8 @@ export class TokenService {
           Hashing.equal(Hashing.pkceChallenge(verifier ?? ''), attributes.code_challenge)
         : !client.settings.requireProofKey && !verifier;
       if (!pkce) return new OAuthError('invalid_grant');
+      const inactive = await this.refuseInactive(authorization);
+      if (inactive) return inactive;
       return this.tokens(
         client,
         { ...authorization, code: { ...code, invalidated: true } },
@@ -194,6 +196,9 @@ export class TokenService {
       ) {
         return new OAuthError('invalid_grant');
       }
+      // Before the rotation is remembered: a refused token must not later look like a replay.
+      const inactive = await this.refuseInactive(authorization);
+      if (inactive) return inactive;
       const scopes = form.get('scope')
         ? this.requestedScopes(authorization.authorizedScopes, form.get('scope'))
         : authorization.authorizedScopes;
@@ -226,20 +231,24 @@ export class TokenService {
   }
 
   /**
-   * New access token, a rotated refresh token, and an ID token when `openid` was granted. Only an
-   * active user gets tokens: for anyone else the authorization (and so its token family) is
-   * deleted and the grant refused.
+   * Only an active user gets tokens: for anyone else the authorization (and so its token family)
+   * is deleted and the grant refused.
    */
+  private async refuseInactive(authorization: Authorization): Promise<OAuthError | undefined> {
+    if ((await this.directory.findUser(authorization.principalName))?.status === 'active') {
+      return undefined;
+    }
+    await this.authorizations.delete(authorization.id);
+    return new OAuthError('invalid_grant');
+  }
+
+  /** New access token, a rotated refresh token, and an ID token when `openid` was granted. */
   private async tokens(
     client: RegisteredClient,
     authorization: Authorization,
     scopes: string[],
     attributes: { nonce?: string | null; auth_time?: number },
-  ): Promise<TokenResponse | OAuthError> {
-    if ((await this.directory.findUser(authorization.principalName))?.status !== 'active') {
-      await this.authorizations.delete(authorization.id);
-      return new OAuthError('invalid_grant');
-    }
+  ): Promise<TokenResponse> {
     const access = this.issue(TOKEN_SETTINGS.accessTokenTtlSeconds);
     const refresh = client.grantTypes.includes('refresh_token')
       ? this.issue(TOKEN_SETTINGS.refreshTokenTtlSeconds)
