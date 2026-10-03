@@ -10,6 +10,12 @@ export interface RsaPrivateJwk {
   n: string;
   e: string;
   d: string;
+  /** CRT parameters; signing uses them when all five are present. */
+  p?: string;
+  q?: string;
+  dp?: string;
+  dq?: string;
+  qi?: string;
 }
 
 export interface RsaPublicJwk {
@@ -17,12 +23,54 @@ export interface RsaPublicJwk {
   e: string;
 }
 
-/** RSASSA-PKCS1-v1_5 with SHA-256. Works where `node:crypto` `sign` is unavailable. */
+type NativeCrypto = Pick<typeof import('node:crypto'), 'createPrivateKey' | 'sign'>;
+
+/**
+ * An RS256 signer for one key. Bun and Node sign with their native RSA (OpenSSL), which is
+ * constant-time. The wasmCloud guest has no native RSA, so it falls back to `rs256Sign`.
+ * `node:crypto` is looked up at runtime because the guest's shim does not export it.
+ */
+export function rs256Signer(
+  jwk: RsaPrivateJwk,
+  native: NativeCrypto | null = nativeCrypto(),
+): (message: Uint8Array) => Uint8Array {
+  if (native) {
+    try {
+      const key = native.createPrivateKey({ key: { kty: 'RSA', ...jwk } as never, format: 'jwk' });
+      return (message) => new Uint8Array(native.sign('sha256', message, key));
+    } catch {
+      // A JWK the native importer refuses (no CRT parameters, for one) signs portably.
+    }
+  }
+  return (message) => rs256Sign(message, jwk);
+}
+
+function nativeCrypto(): NativeCrypto | null {
+  const runtime = globalThis as { process?: { getBuiltinModule?: (id: string) => unknown } };
+  const crypto = runtime.process?.getBuiltinModule?.('node:crypto') as Partial<NativeCrypto>;
+  const usable =
+    typeof crypto?.createPrivateKey === 'function' && typeof crypto.sign === 'function';
+  return usable ? (crypto as NativeCrypto) : null;
+}
+
+/**
+ * RSASSA-PKCS1-v1_5 with SHA-256 on BigInt, for runtimes without native RSA.
+ *
+ * BigInt arithmetic is not constant-time, so the private operation runs on a blinded input
+ * (m·rᵉ, then ·r⁻¹), which decorrelates its timing from the message. It uses CRT when the
+ * JWK carries p, q, dp, dq and qi, and checks the result against the public exponent so a
+ * faulty CRT step never releases a signature.
+ */
 export function rs256Sign(message: Uint8Array, jwk: RsaPrivateJwk): Uint8Array {
-  const modulus = decode(jwk.n);
-  const encoded = pkcs1(sha256(message), modulus.length);
-  const signature = modPow(os2ip(encoded), os2ip(decode(jwk.d)), os2ip(modulus));
-  return i2osp(signature, modulus.length);
+  const length = decode(jwk.n).length;
+  const n = os2ip(decode(jwk.n));
+  const e = os2ip(decode(jwk.e));
+  const m = os2ip(pkcs1(sha256(message), length));
+  const r = blindingFactor(n, length);
+  const blinded = (m * modPow(r, e, n)) % n;
+  const signature = (privateOperation(blinded, jwk, n) * modInverse(r, n)) % n;
+  if (modPow(signature, e, n) !== m) throw new Error('RSA signature failed its check');
+  return i2osp(signature, length);
 }
 
 export function rs256Verify(
@@ -42,6 +90,44 @@ export function rs256Verify(
   } catch {
     return false;
   }
+}
+
+function privateOperation(c: bigint, jwk: RsaPrivateJwk, n: bigint): bigint {
+  const { p, q, dp, dq, qi } = jwk;
+  if (!(p && q && dp && dq && qi)) return modPow(c, os2ip(decode(jwk.d)), n);
+  const [P, Q] = [os2ip(decode(p)), os2ip(decode(q))];
+  const m1 = modPow(c % P, os2ip(decode(dp)), P);
+  const m2 = modPow(c % Q, os2ip(decode(dq)), Q);
+  const h = (((os2ip(decode(qi)) * (m1 - m2)) % P) + P) % P;
+  return m2 + h * Q;
+}
+
+/** A random r in [2, n) coprime to n. */
+function blindingFactor(n: bigint, length: number): bigint {
+  const bytes = new Uint8Array(length);
+  let r: bigint;
+  do {
+    crypto.getRandomValues(bytes);
+    r = os2ip(bytes) % n;
+  } while (r < 2n || gcd(r, n) !== 1n);
+  return r;
+}
+
+function gcd(a: bigint, b: bigint): bigint {
+  let [x, y] = [a, b];
+  while (y !== 0n) [x, y] = [y, x % y];
+  return x;
+}
+
+function modInverse(a: bigint, n: bigint): bigint {
+  let [oldR, r] = [a % n, n];
+  let [oldS, s] = [1n, 0n];
+  while (r !== 0n) {
+    const quotient = oldR / r;
+    [oldR, r] = [r, oldR - quotient * r];
+    [oldS, s] = [s, oldS - quotient * s];
+  }
+  return ((oldS % n) + n) % n;
 }
 
 function sha256(message: Uint8Array): Uint8Array {

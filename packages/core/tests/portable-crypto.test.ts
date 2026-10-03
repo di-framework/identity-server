@@ -8,7 +8,7 @@ import {
 import { decodeBase64Url, encodeBase64Url } from '../src/shared/infrastructure/crypto/base64url.ts';
 import { mlDsaVerify } from '../src/shared/infrastructure/crypto/mldsa.ts';
 import { hashPassword, verifyPassword } from '../src/shared/infrastructure/crypto/passwords.ts';
-import { rs256Sign, rs256Verify } from '../src/shared/infrastructure/crypto/rsa.ts';
+import { rs256Sign, rs256Signer, rs256Verify } from '../src/shared/infrastructure/crypto/rsa.ts';
 import { SigningKeys, verifyJws } from '../src/shared/infrastructure/crypto/signing-keys.ts';
 import { akpPrivateJwk, publicOf, rsaPrivateJwk } from './support/keys.ts';
 
@@ -108,6 +108,34 @@ test('RS256 and ML-DSA signatures verify with node:crypto', () => {
   ).toBe(true);
   expect(mlDsaVerify(message, new Uint8Array([1]), new Uint8Array(8))).toBe(false);
   expect(verifyJws(token, keys.jwks().keys, ['ML-DSA-65']).sub).toBe('u');
+});
+
+test('RS256 signs natively when it can, else portably with blinding and CRT', () => {
+  const rsa = rsaPrivateJwk('rsa-crt');
+  const jwk = {
+    n: String(rsa.n),
+    e: String(rsa.e),
+    d: String(rsa.d),
+    p: String(rsa.p),
+    q: String(rsa.q),
+    dp: String(rsa.dp),
+    dq: String(rsa.dq),
+    qi: String(rsa.qi),
+  };
+  const message = new Uint8Array(Buffer.from('header.payload'));
+  // PKCS#1 v1.5 is deterministic, so every path must produce OpenSSL's exact signature.
+  const expected = new Uint8Array(
+    sign('sha256', message, createPrivateKey({ key: rsa as never, format: 'jwk' })),
+  );
+  expect(rs256Signer(jwk)(message)).toEqual(expected);
+  // The guest has no native RSA: blinded CRT, unblinded back to the same signature.
+  expect(rs256Signer(jwk, null)(message)).toEqual(expected);
+  // Without CRT parameters the native importer refuses the key, and signing stays portable.
+  expect(rs256Signer({ n: jwk.n, e: jwk.e, d: jwk.d })(message)).toEqual(expected);
+  // A faulty CRT step fails the public-exponent check instead of releasing a signature.
+  expect(() => rs256Sign(message, { ...jwk, dp: jwk.dq })).toThrow(
+    'RSA signature failed its check',
+  );
 });
 
 test('base64url matches node and rejects bad input', () => {

@@ -1,6 +1,6 @@
 import { decodeBase64Url, encodeBase64Url } from './base64url.ts';
 import { mlDsaKeygen, mlDsaSign, mlDsaVerify } from './mldsa.ts';
-import { rs256Sign, rs256Verify } from './rsa.ts';
+import { type RsaPrivateJwk, rs256Signer, rs256Verify } from './rsa.ts';
 
 export type SigningAlgorithm = 'RS256' | 'ML-DSA-65';
 
@@ -80,7 +80,7 @@ export class SigningKeys {
     const data = new Uint8Array(Buffer.from(input));
     const signature =
       this.material.kind === 'rsa'
-        ? rs256Sign(data, this.material)
+        ? this.material.sign(data)
         : mlDsaSign(data, this.material.secretKey);
     return `${input}.${encodeBase64Url(signature)}`;
   }
@@ -99,12 +99,13 @@ export class SigningKeys {
   }
 
   private static rsaMaterial(jwk: Record<string, unknown>): RsaMaterial {
-    const n = component(jwk.n);
-    const e = component(jwk.e);
-    const d = component(jwk.d);
-    const material = { kind: 'rsa' as const, n, e, d };
+    const key: RsaPrivateJwk = { n: component(jwk.n), e: component(jwk.e), d: component(jwk.d) };
+    for (const name of ['p', 'q', 'dp', 'dq', 'qi'] as const) {
+      if (typeof jwk[name] === 'string') key[name] = jwk[name];
+    }
+    const material = { kind: 'rsa' as const, n: key.n, e: key.e, sign: rs256Signer(key) };
     const probe = new Uint8Array([1]);
-    if (!rs256Verify(probe, rs256Sign(probe, material), material)) {
+    if (!rs256Verify(probe, material.sign(probe), material)) {
       throw new SigningKeyError('Active private JWK is malformed or its public key does not match');
     }
     return material;
@@ -264,7 +265,7 @@ interface RsaMaterial {
   kind: 'rsa';
   n: string;
   e: string;
-  d: string;
+  sign: (message: Uint8Array) => Uint8Array;
 }
 
 interface AkpMaterial {
