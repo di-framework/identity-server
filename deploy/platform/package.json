@@ -1,15 +1,17 @@
 {
-  "name": "di-framework-wasmcloud-platform",
+  "name": "identity-platform",
   "private": true,
   "main": "index.ts",
   "dependencies": {
-    "@pulumi/command": "1.2.1",
     "@pulumi/kubernetes": "4.34.0",
     "@pulumi/pulumi": "3.261.0",
+    "@pulumi/random": "4.21.2",
+    "@pulumi/tls": "5.6.1",
     "typescript": "5.9.3",
-    "@di-framework/platform": "6.0.5"
+    "yaml": "2.9.1"
   },
   "devDependencies": {
+    "@types/bun": "1.4.2",
     "@types/node": "22.18.0"
   },
   "scripts": {

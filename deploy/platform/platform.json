@@ -1,0 +1,4 @@
+{
+  "tenants": [{ "name": "identity" }],
+  "users": [{ "name": "developer", "memberships": [{ "tenant": "identity", "role": "developer" }] }]
+}

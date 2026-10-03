@@ -28,7 +28,7 @@ client
 
 `apps/guest` is the component. `apps/guest/src/app.ts` resolves the Postgres and config bindings, loads embedded assets, and forwards every request to `handle()` in `apps/guest/src/runtime.ts`. That function applies schema, loads settings, prepares signing keys and bootstrap, then calls the same `routeRequest` path as `apps/server/src/serve.ts`.
 
-Deployment topology is `di-framework.deploy.toml`. Target `identity` uses `deploy/platform/.kubeconfig-dev-identity`, tenant `identity`, and `IDENTITY_REGISTRY_PUSH` for the registry push URL.
+Deployment topology is `di-framework.deploy.toml`. Target `identity` uses tenant `identity`. The `deploy/platform` Pulumi program supplies its kubeconfig, context, and registry when it deploys; see `deploy/platform/README.md`.
 
 ## 1. Database adapter
 
@@ -121,14 +121,12 @@ These live in `cli-extensions` (`@di-framework/cli-plugin-platform`) and are bun
 
 ## 8. Deploy
 
-From the identity-server repo, with the dev kubeconfig:
-
 ```bash
-export KUBECONFIG="deploy/platform/.kubeconfig-dev"
-di-framework platform deploy identity --target identity
+cd deploy/platform
+pulumi up
 ```
 
-That builds `apps/guest/dist/identity.wasm`, pushes it to `IDENTITY_REGISTRY_PUSH`, and updates `WorkloadDeployment/identity` in `di-tenant-identity`. No second Postgres service is created. Egress is limited to the hosts in `allowedIpNameLookups`.
+The program creates the di-framework-kube instance and platform, then the component registry. It then runs `di-framework platform deploy identity --target identity` whenever the guest's sources change, with the registry port-forwarded for the push. That builds `apps/guest/dist/identity.wasm`, pushes it to `IDENTITY_REGISTRY_PUSH`, and updates `WorkloadDeployment/identity` in `di-tenant-identity`. No second Postgres service is created. Egress is limited to the hosts in `allowedIpNameLookups`.
 
 The deploy warns that the component imports `wasi:tls` when the tenant host is stock `ghcr.io/wasmcloud/wash:2.8.0`. That image is a default-features build, so its host world has no `wasi:tls/client@0.3.0-draft`. Plaintext SMTP still works. TLS needs the host built from `platform/platform/tenant-host` in the platform repo: `cargo build --features wasi-tls` on wasmCloud `v2.8.0`, which also applies the postgres invocation-lease patch. Tag it `di-framework/wash:2.8.0-wasi-tls`, push it where the node can pull it, and set stack config `tenantHostImage` (and `tenantHostImagePullPolicy`) to that reference. `createPlatform` otherwise defaults to `ghcr.io/wasmcloud/wash:2.8.0`. Nothing publishes the TLS image yet; a GHCR release needs maintainer approval.
 
