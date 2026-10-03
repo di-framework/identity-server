@@ -1,5 +1,6 @@
 import { expect, test } from 'bun:test';
 import { useContainer } from '@di-framework/core/container';
+import { pgScalar } from '@di-framework/repo/postgres';
 import { SQL } from 'bun';
 import { BootstrapReconciler } from '../../../packages/core/src/bootstrap/application/bootstrap-reconciler.ts';
 import { Readiness } from '../../../packages/core/src/bootstrap/application/readiness.ts';
@@ -13,7 +14,6 @@ import {
 } from '../../../packages/core/tests/support/database.ts';
 import { rsaPrivateJwk } from '../../../packages/core/tests/support/keys.ts';
 import type { IdentityDatabase } from './bindings.ts';
-import { pgScalar } from './pg.ts';
 import { handle, resetGuest } from './runtime.ts';
 
 const textCell = (val: string) => ({ tag: 'text' as const, val });

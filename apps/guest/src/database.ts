@@ -1,7 +1,7 @@
 import { createSqlDatabase, type SqlDatabase } from '@di-framework/repo';
-import { toPostgresParams } from '../../../packages/core/src/shared/infrastructure/postgres.ts';
+import { postgresError, readRows } from '@di-framework/repo/postgres';
 import type { IdentityDatabase } from './bindings.ts';
-import { pgValue, postgresError, readRows } from './pg.ts';
+import { bindParams } from './pg.ts';
 
 /**
  * `SqlDatabase` over the wasmCloud Postgres binding. `createSqlDatabase` serializes statements
@@ -47,9 +47,9 @@ async function statements(
   sql: string,
   params: unknown[] = [],
 ): Promise<Record<string, unknown>[]> {
-  const bound = toPostgresParams(sql, params);
+  const bound = bindParams(sql, params);
   try {
-    return await readRows(await database.query(bound.text, bound.params.map(pgValue)));
+    return await readRows(await database.query(bound.text, bound.params));
   } catch (error) {
     throw coded(error);
   }

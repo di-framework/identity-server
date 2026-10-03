@@ -1,6 +1,6 @@
 import { Config, OutgoingHttp, Postgres, WasmCloudBinding } from '@di-framework/bindings';
 import { Container } from '@di-framework/core/decorators';
-import { assertBatch, type PgText, postgresError, readRows } from './pg.ts';
+import { assertBatch, type PgText, postgresError, readRows } from '@di-framework/repo/postgres';
 
 @WasmCloudBinding('identity-database', {
   serviceName: 'directory',
