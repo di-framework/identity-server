@@ -2,3 +2,14 @@
 set -e
 bun typecheck
 bun x biome check --staged --write --files-ignore-unknown=true --no-errors-on-unmatched
+
+# Semgrep scans only the staged files. It is a separate install (see README), so the hook
+# warns and continues when it is missing rather than blocking every commit.
+if command -v semgrep >/dev/null 2>&1; then
+  staged=$(git diff --cached --name-only --diff-filter=ACMR)
+  if [ -n "$staged" ]; then
+    printf '%s\n' "$staged" | tr '\n' '\0' | xargs -0 bun run semgrep
+  fi
+else
+  echo "warning: semgrep is not installed (brew install semgrep, or pipx install semgrep); skipping the scan" >&2
+fi
