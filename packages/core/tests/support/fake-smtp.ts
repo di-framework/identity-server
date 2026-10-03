@@ -49,6 +49,8 @@ export interface FakeSmtpOptions {
   silent?: boolean;
   /** Close instead of answering QUIT. */
   dropOnQuit?: boolean;
+  /** Plaintext sent right after the STARTTLS `220`, as an on-path attacker would inject. */
+  injectAfterStartTls?: string;
 }
 
 interface Connection {
@@ -154,7 +156,7 @@ export class FakeSmtpServer {
         return undefined;
       }
       case 'STARTTLS': {
-        socket.write('220 go ahead\r\n');
+        socket.write(`220 go ahead\r\n${this.options.injectAfterStartTls ?? ''}`);
         const server = this;
         this.upgraded = true;
         state.replaced = true;

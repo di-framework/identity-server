@@ -185,6 +185,9 @@ class SmtpSession {
   private async upgrade(): Promise<void> {
     const tls = await loadSmtpTls();
     this.unwatch(this.active);
+    // Bytes after the 220 arrived in plaintext; read as TLS replies they would let anyone on
+    // the path forge the post-upgrade EHLO (STARTTLS response injection).
+    if (this.buffer !== '') throw new SmtpError('SMTP server sent data before TLS');
     const secure = await new Promise<Socket>((resolve, reject) => {
       let settled = false;
       const socket = tls.connect({

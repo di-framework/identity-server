@@ -110,6 +110,12 @@ describe('SMTP client', () => {
     }).send(message);
     expect(insecure.messages).toHaveLength(1);
 
+    const injected = server({ starttls: true, injectAfterStartTls: '250-AUTH PLAIN\r\n' });
+    await expect(
+      sender(injected.port, { starttls: true, tls: { ca: testCertificate().cert } }).send(message),
+    ).rejects.toThrow('SMTP server sent data before TLS');
+    expect(injected.messages).toHaveLength(0);
+
     const notOffered = server();
     await sender(notOffered.port, { starttls: true }).send(message);
     expect(notOffered.upgraded).toBe(false);
