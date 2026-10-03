@@ -331,4 +331,13 @@ export class IdentityServer {
   }
 }
 
-export const controlPlane = useContainer().resolve(ControlPlaneRouter);
+/**
+ * In-process router, resolved on first use so that importing the API (for example to emit the
+ * OpenAPI document) does not load signing keys or connect anything.
+ */
+export const controlPlane = {
+  fetch: (request: Request): Promise<Response> =>
+    useContainer().resolve(ControlPlaneRouter).fetch(request),
+  handles: (pathname: string): boolean =>
+    useContainer().resolve(ControlPlaneRouter).handles(pathname),
+};
