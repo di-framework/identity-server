@@ -91,7 +91,10 @@ function bridge(reserved: SQL, options: { splitTransactions?: boolean } = {}): I
   } as unknown as IdentityDatabase;
 }
 
-function guestConfig(scheduler: boolean): Array<[string, string]> {
+function guestConfig(
+  scheduler: boolean,
+  redirects = 'http://localhost:3000/callback',
+): Array<[string, string]> {
   return [
     ['ISSUER_URL', 'http://identity.identity.localhost'],
     ['AUTH_PUBLIC_ORIGIN', 'http://identity.identity.localhost'],
@@ -116,7 +119,7 @@ function guestConfig(scheduler: boolean): Array<[string, string]> {
     ['AUTH_ACCESS_CLIENT_SECRET', 'access-secret'],
     ['AUTH_DIRECTORY_CLIENT_SECRET', 'directory-secret'],
     ['AUTH_PROVISIONER_CLIENT_SECRET', 'provisioner-secret'],
-    ['AUTH_ACCESS_REDIRECT_URIS', 'http://localhost:3000/callback'],
+    ['AUTH_ACCESS_REDIRECT_URIS', redirects],
     ['GSIO_IDENTITY_NOTIFICATION_SCHEDULER_ENABLED', scheduler ? 'true' : 'false'],
   ];
 }
@@ -216,6 +219,23 @@ test('the guest boots on one connection and serves the Bun routes', async () => 
           shell,
         });
         expect(drained.status).toBe(200);
+
+        // Same secrets, new redirect URI: the stored fingerprint must not skip reconcile.
+        resetGuest();
+        fresh();
+        const redirected = await handle(new Request('https://identity.test/health'), {
+          database: bridge(reserved),
+          config: {
+            getAll: () => guestConfig(false, 'http://localhost:3000/callback,https://app.test/cb'),
+          },
+          assets,
+          shell,
+        });
+        expect(redirected.status).toBe(200);
+        const [access] = await reserved.unsafe(
+          `SELECT redirect_uris FROM oauth2_registered_client WHERE client_id = 'access'`,
+        );
+        expect(access.redirect_uris).toBe('http://localhost:3000/callback,https://app.test/cb');
       } finally {
         resetGuest();
         IdentityModule.bind();

@@ -76,13 +76,13 @@ async function boot(runtime: GuestRuntime): Promise<void> {
   }
 }
 
+/**
+ * Every input `BootstrapReconciler.reconcile` applies: people, organization, client IDs,
+ * secrets, and redirect URIs. A change to any of them must run reconcile again.
+ */
 function bootstrapFingerprint(settings: IdentitySettings): string {
-  const { owner, viewer } = settings.bootstrap;
-  const { access, directory, provisioner } = settings.clients;
   return Hashing.sha256Hex(
-    [owner.password, viewer.password, access.secret, directory.secret, provisioner.secret].join(
-      '\0',
-    ),
+    JSON.stringify({ bootstrap: settings.bootstrap, clients: settings.clients }),
   );
 }
 
