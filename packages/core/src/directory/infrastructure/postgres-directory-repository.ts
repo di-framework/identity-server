@@ -1,7 +1,9 @@
 import { Component, Container } from '@di-framework/core/decorators';
 import { PostgresGateway, Timestamps } from '../../shared/infrastructure/postgres-gateway.ts';
 import type {
+  AccountChanges,
   DirectoryRepository,
+  NewAccount,
   NewOrganization,
   NewUser,
 } from '../domain/directory-repository.ts';
@@ -15,6 +17,8 @@ interface UserRow {
   email_verified: boolean;
   status: string;
   password_hash: string | null;
+  system_role: string;
+  avatar_url: string | null;
 }
 
 interface OrganizationRow {
@@ -34,6 +38,9 @@ interface MemberRow {
   role: string;
 }
 
+const USER_COLUMNS = `id::text AS id, login, email, display_name, email_verified, status,
+  password_hash, system_role, avatar_url`;
+
 @Container()
 export class PostgresDirectoryRepository implements DirectoryRepository {
   constructor(@Component(PostgresGateway) private readonly db: PostgresGateway) {}
@@ -43,19 +50,12 @@ export class PostgresDirectoryRepository implements DirectoryRepository {
   }
 
   async listUsers(): Promise<UserAccount[]> {
-    const rows = await this.db.query<UserRow>(
-      `SELECT id::text AS id, login, email, display_name, email_verified, status, password_hash
-       FROM users ORDER BY id`,
-    );
+    const rows = await this.db.query<UserRow>(`SELECT ${USER_COLUMNS} FROM users ORDER BY id`);
     return rows.map((row) => this.user(row));
   }
 
   async findUser(id: string): Promise<UserAccount | undefined> {
-    const row = await this.db.one<UserRow>(
-      `SELECT id::text AS id, login, email, display_name, email_verified, status, password_hash
-       FROM users WHERE id = ?`,
-      [id],
-    );
+    const row = await this.db.one<UserRow>(`SELECT ${USER_COLUMNS} FROM users WHERE id = ?`, [id]);
     return row ? this.user(row) : undefined;
   }
 
@@ -72,6 +72,56 @@ export class PostgresDirectoryRepository implements DirectoryRepository {
         user.displayName,
       ],
     );
+  }
+
+  async findUserByEmailOrLogin(email: string, login: string): Promise<UserAccount | undefined> {
+    const row = await this.db.one<UserRow>(
+      `SELECT ${USER_COLUMNS} FROM users
+       WHERE normalized_email = ? OR normalized_login = ?
+       ORDER BY created_at, id LIMIT 1`,
+      [email.trim().toLowerCase(), login.trim().toLowerCase()],
+    );
+    return row ? this.user(row) : undefined;
+  }
+
+  insertAccount(account: NewAccount): Promise<void> {
+    return this.db.write(
+      `INSERT INTO users (id, login, normalized_login, email, normalized_email, password_hash,
+         display_name, email_verified, system_role, status)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        account.id,
+        account.login,
+        account.login.toLowerCase(),
+        account.email,
+        account.email?.toLowerCase() ?? null,
+        account.passwordHash,
+        account.displayName,
+        account.emailVerified,
+        account.systemRole,
+        account.status,
+      ],
+    );
+  }
+
+  async updateAccount(id: string, changes: AccountChanges): Promise<void> {
+    const sets: string[] = [];
+    const params: unknown[] = [];
+    for (const [column, value] of [
+      ['password_hash', changes.passwordHash],
+      ['system_role', changes.systemRole],
+      ['status', changes.status],
+      ['email_verified', changes.emailVerified],
+    ] as const) {
+      if (value === undefined) continue;
+      sets.push(`${column} = ?`);
+      params.push(value);
+    }
+    if (sets.length === 0) return;
+    await this.db.write(`UPDATE users SET ${sets.join(', ')}, updated_at = now() WHERE id = ?`, [
+      ...params,
+      id,
+    ]);
   }
 
   updateDisplayName(id: string, displayName: string): Promise<void> {
@@ -196,6 +246,8 @@ export class PostgresDirectoryRepository implements DirectoryRepository {
       row.email_verified === true,
       String(row.status),
       row.password_hash == null ? null : String(row.password_hash),
+      String(row.system_role),
+      row.avatar_url == null ? null : String(row.avatar_url),
     );
   }
 

@@ -33,7 +33,7 @@ Auth-server already has two surfaces that disagree with each other. The JSON con
 | HTML admin and account pages | Local. PatternFly screens cover the page inventory. Sessions, passwords, passwordless tokens, consent, and link start/callback live in memory. |
 | OAuth 2 / OIDC authorization server | Missing. |
 | Schema | The Flyway scripts `V1`–`V10` match auth-server's tables. Several of those tables have no TypeScript reader or writer. |
-| Deployment companions | Missing. Bootstrap, encrypted Pulumi inputs, and the `gas` provider are not in this repository. |
+| Deployment companions | Partial. Bootstrap, `/health`, and `/ready` match. The `gas` provider is not in this repository. |
 
 ## JSON control plane
 
@@ -112,9 +112,9 @@ Auth-server renders these with kotlinx.html. This repository renders PatternFly 
 
 | Capability | Auth-server | This repository | Status |
 | --- | --- | --- | --- |
-| `GET /health` | `{ "ok": true }` | Example app only. The identity server does not expose it. | Missing |
-| `GET /ready` | 200 when every check passes, otherwise 503. Body keys in order: `database` (connection valid within 2 s), `signing_key` (always true; the key is validated at startup), `smtp` (host and from address configured), `bootstrap` (reconciler finished), `ok` (`WebController.kt:51-64`). | Absent | Missing |
-| Bootstrap | First owner (active platform admin), optional viewer, organization, and the `access` browser client, `directory` client, and provisioner client from encrypted configuration. Provisioner scopes are `admin:read`, `admin:write`, and `directory:read`. Secrets are re-hashed on every start. No audit rows (`BootstrapReconciler.kt:57-209`). | Absent | Missing |
+| `GET /health` | `{ "ok": true }` | `apps/api/src/operations/health.ts` returns the same body. | Match |
+| `GET /ready` | 200 when every check passes, otherwise 503. Body keys in order: `database` (connection valid within 2 s), `signing_key` (always true; the key is validated at startup), `smtp` (host and from address configured), `bootstrap` (reconciler finished), `ok` (`WebController.kt:51-64`). | `Readiness` runs the same four checks in the same key order with a 2-second database probe, and `/ready` answers 200 or 503. | Match |
+| Bootstrap | First owner (active platform admin), optional viewer, organization, and the `access` browser client, `directory` client, and provisioner client from encrypted configuration. Provisioner scopes are `admin:read`, `admin:write`, and `directory:read`. Secrets are re-hashed on every start. No audit rows (`BootstrapReconciler.kt:57-209`). | `BootstrapReconciler` runs at startup with the same required settings, messages, create rules, repair rules, and client registrations, in one transaction. `apps/server` exits on failure. | Match |
 | SMTP | Passwordless mail and the security-notification worker | Absent | Missing |
 | Security notifications | Link and unlink enqueue one outbox row per event, keyed `sha256(action\|userId\|issuer\|subject)`. Delivery goes to a verified contact on an active account. Failures retry with backoff `min(30s·2^min(attempts−1,7), 1h)` and no attempt limit. The message omits tokens and claims. | Table unused | Missing |
 | External identity providers | Allowlist of issuer, endpoints, client id, and optional secret. Callback failures use a generic message. Audit correlation values are hashes. | No provider client | Missing |

@@ -19,5 +19,17 @@ services:
       timeout: 3s
       retries: 20
 
+  # Local SMTP sink for passwordless and security-notification mail (UI on 8025).
+  mailpit:
+    image: docker.io/axllent/mailpit:v1.21
+    pull_policy: missing
+    restart: unless-stopped
+    ports:
+      - "1025:1025"
+      - "8025:8025"
+    environment:
+      MP_SMTP_AUTH_ACCEPT_ANY: "1"
+      MP_SMTP_AUTH_ALLOW_INSECURE: "1"
+
 volumes:
   identity-postgres:

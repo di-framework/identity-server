@@ -3,6 +3,7 @@ import type { SqlDatabase } from '@di-framework/repo';
 import { PostgresAuditRepository } from './audit/infrastructure/postgres-audit-repository.ts';
 import { PostgresAuthorizationRepository } from './authorization/infrastructure/postgres-authorization-repository.ts';
 import { PostgresRegisteredClientRepository } from './authorization/infrastructure/postgres-registered-client-repository.ts';
+import { BootstrapReconciler } from './bootstrap/application/bootstrap-reconciler.ts';
 import { PostgresDirectoryRepository } from './directory/infrastructure/postgres-directory-repository.ts';
 import { PostgresLinkRepository } from './linking/infrastructure/postgres-link-repository.ts';
 import { PostgresOAuthRepository } from './oauth/infrastructure/postgres-oauth-repository.ts';
@@ -65,6 +66,16 @@ export class IdentityModule {
     const database = await openPostgresDatabase(configuredDatabaseUrl(env), { max });
     IdentityModule.connect(database);
     return database;
+  }
+
+  /**
+   * Startup checks that fail closed, as the auth server does: load and validate the signing
+   * keys, then reconcile bootstrap state.
+   */
+  static async prepare(): Promise<void> {
+    const container = useContainer();
+    container.resolve(SIGNING_KEYS);
+    await container.resolve(BootstrapReconciler).reconcile();
   }
 
   /** Binds a port token to an adapter class. Exposed so other modules can add ports. */

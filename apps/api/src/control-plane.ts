@@ -10,6 +10,7 @@ import type { ServiceResult } from '@di-framework/identity/src/shared/domain/ser
 import { AuthorizationEndpoints } from './authorization/endpoints.ts';
 import { BearerGuard, requiredScope } from './guards/bearer-guard.ts';
 import { RequestContext } from './guards/request-context.ts';
+import { OperationsEndpoints } from './operations/health.ts';
 
 export interface RouteRequest {
   headers: { get(name: string): string | null };
@@ -256,16 +257,22 @@ export class ControlPlaneRouter {
   constructor(
     @Component(AuthorizationEndpoints) private readonly authorization: AuthorizationEndpoints,
     @Component(BearerGuard) private readonly bearer: BearerGuard,
+    @Component(OperationsEndpoints) private readonly operations: OperationsEndpoints,
   ) {}
 
-  /** Paths this router owns: the JSON API plus the session-free OAuth 2 endpoints. */
+  /** Paths this router owns: the JSON API, session-free OAuth 2 endpoints, health, readiness. */
   handles(pathname: string): boolean {
-    return pathname.startsWith('/api/') || this.authorization.handles(pathname);
+    return (
+      pathname.startsWith('/api/') ||
+      this.authorization.handles(pathname) ||
+      this.operations.handles(pathname)
+    );
   }
 
   async fetch(request: Request): Promise<Response> {
     const { pathname } = new URL(request.url);
     if (this.authorization.handles(pathname)) return this.authorization.fetch(request);
+    if (this.operations.handles(pathname)) return this.operations.fetch(request);
     const scope = requiredScope(request.method, pathname);
     if (scope) {
       const caller = await this.bearer.authorize(request, scope);

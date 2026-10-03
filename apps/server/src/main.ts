@@ -1,22 +1,28 @@
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { useContainer } from '@di-framework/core/container';
 import { IdentityModule } from '@di-framework/identity/src/composition.ts';
-import { SIGNING_KEYS } from '@di-framework/identity/src/shared/domain/tokens.ts';
 import { applyMigrations } from '@di-framework/identity-migrations';
 import { systemClock } from '../../client/src/domain/clock.ts';
 import { createStore } from '../../client/src/domain/model.ts';
 import { routeRequest } from './serve.ts';
 
 const settings = IdentityModule.settings();
-// Fail closed: a missing or invalid AUTH_ACTIVE_PRIVATE_JWK stops startup.
-useContainer().resolve(SIGNING_KEYS);
 const database = await IdentityModule.connectFromConfig();
 const embeddedRoot = join(import.meta.dir, 'embedded');
 await applyMigrations(
   database,
   Bun.isStandaloneExecutable ? join(embeddedRoot, 'migrations') : undefined,
 );
+
+// Fail closed, as the auth server does: invalid signing keys or bootstrap settings stop startup.
+try {
+  await IdentityModule.prepare();
+} catch (error) {
+  console.error(
+    `identity startup failed: ${error instanceof Error ? error.message : 'unknown error'}`,
+  );
+  process.exit(1);
+}
 
 const assets = Bun.isStandaloneExecutable
   ? new URL('embedded/assets/', pathToFileURL(`${import.meta.dir}/`))
