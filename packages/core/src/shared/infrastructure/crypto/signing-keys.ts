@@ -1,4 +1,6 @@
-import { createPrivateKey, createPublicKey, type KeyObject, sign, verify } from 'node:crypto';
+import { decodeBase64Url, encodeBase64Url } from './base64url.ts';
+import { mlDsaKeygen, mlDsaSign, mlDsaVerify } from './mldsa.ts';
+import { rs256Sign, rs256Verify } from './rsa.ts';
 
 export type SigningAlgorithm = 'RS256' | 'ML-DSA-65';
 
@@ -27,7 +29,7 @@ export class SigningKeys {
   private constructor(
     readonly algorithm: SigningAlgorithm,
     readonly kid: string,
-    private readonly privateKey: KeyObject,
+    private readonly material: RsaMaterial | AkpMaterial,
     private readonly activePublic: PublicJwk,
     private readonly previous: PublicJwk[],
   ) {}
@@ -55,12 +57,12 @@ export class SigningKeys {
     } else {
       SigningKeys.checkAkp(jwk, true);
     }
-    const privateKey = SigningKeys.importPrivate(jwk);
-    const activePublic = SigningKeys.publicOf(createPublicKey(privateKey), kid, algorithm);
+    const material = SigningKeys.importPrivate(jwk, algorithm);
+    const activePublic = SigningKeys.publicOf(jwk, kid, algorithm);
     return new SigningKeys(
       algorithm,
       kid,
-      privateKey,
+      material,
       activePublic,
       SigningKeys.parsePrevious(input.previousPublicSet),
     );
@@ -75,20 +77,47 @@ export class SigningKeys {
   sign(claims: Record<string, unknown>): string {
     const header = { alg: this.algorithm, kid: this.kid, typ: 'JWT' };
     const input = `${encode(header)}.${encode(claims)}`;
-    const signature = sign(
-      this.algorithm === 'RS256' ? 'sha256' : null,
-      Buffer.from(input),
-      this.privateKey,
-    );
-    return `${input}.${signature.toString('base64url')}`;
+    const data = new Uint8Array(Buffer.from(input));
+    const signature =
+      this.material.kind === 'rsa'
+        ? rs256Sign(data, this.material)
+        : mlDsaSign(data, this.material.secretKey);
+    return `${input}.${encodeBase64Url(signature)}`;
   }
 
-  private static importPrivate(jwk: Record<string, unknown>): KeyObject {
+  private static importPrivate(
+    jwk: Record<string, unknown>,
+    algorithm: SigningAlgorithm,
+  ): RsaMaterial | AkpMaterial {
     try {
-      return createPrivateKey({ key: jwk as never, format: 'jwk' });
-    } catch {
+      if (algorithm === 'RS256') return SigningKeys.rsaMaterial(jwk);
+      return SigningKeys.akpMaterial(jwk);
+    } catch (error) {
+      if (error instanceof SigningKeyError) throw error;
       throw new SigningKeyError('Active private JWK is malformed or its public key does not match');
     }
+  }
+
+  private static rsaMaterial(jwk: Record<string, unknown>): RsaMaterial {
+    const n = component(jwk.n);
+    const e = component(jwk.e);
+    const d = component(jwk.d);
+    const material = { kind: 'rsa' as const, n, e, d };
+    const probe = new Uint8Array([1]);
+    if (!rs256Verify(probe, rs256Sign(probe, material), material)) {
+      throw new SigningKeyError('Active private JWK is malformed or its public key does not match');
+    }
+    return material;
+  }
+
+  private static akpMaterial(jwk: Record<string, unknown>): AkpMaterial {
+    const seed = decodeBase64Url(component(jwk.priv));
+    const published = decodeBase64Url(component(jwk.pub));
+    const keys = mlDsaKeygen(seed);
+    if (keys.publicKey.length !== published.length || !equalBytes(keys.publicKey, published)) {
+      throw new SigningKeyError('Active private JWK is malformed or its public key does not match');
+    }
+    return { kind: 'akp', secretKey: keys.secretKey, publicKey: published };
   }
 
   private static checkAkp(jwk: Record<string, unknown>, requirePrivate: boolean): void {
@@ -134,16 +163,19 @@ export class SigningKeys {
     throw new SigningKeyError('Previous public JWK must be RSA or AKP');
   }
 
-  private static publicOf(key: KeyObject, kid: string, algorithm: SigningAlgorithm): PublicJwk {
-    const exported = key.export({ format: 'jwk' }) as Record<string, unknown>;
+  private static publicOf(
+    jwk: Record<string, unknown>,
+    kid: string,
+    algorithm: SigningAlgorithm,
+  ): PublicJwk {
     if (algorithm === 'RS256') {
-      return { kty: 'RSA', e: exported.e, n: exported.n, kid, alg: 'RS256', use: 'sig' };
+      return { kty: 'RSA', e: jwk.e, n: jwk.n, kid, alg: 'RS256', use: 'sig' };
     }
     return {
       kty: 'AKP',
       alg: 'ML-DSA-65',
       kid,
-      pub: exported.pub,
+      pub: jwk.pub,
       use: 'sig',
       key_ops: ['verify'],
     };
@@ -178,26 +210,34 @@ export function verifyJws(
   const candidates = keys.filter(
     (key) => (header.kid === undefined || key.kid === header.kid) && kty(alg) === key.kty,
   );
-  const data = Buffer.from(`${encodedHeader}.${encodedClaims}`);
-  const signature = Buffer.from(encodedSignature, 'base64url');
+  const data = new Uint8Array(Buffer.from(`${encodedHeader}.${encodedClaims}`));
+  let signature: Uint8Array;
+  try {
+    signature = decodeBase64Url(encodedSignature);
+  } catch {
+    throw new Error('Invalid token signature');
+  }
   for (const key of candidates) {
-    const publicKey = importPublic(key);
-    if (publicKey && verify(alg === 'RS256' ? 'sha256' : null, data, publicKey, signature)) {
-      return decodeJson(encodedClaims);
-    }
+    if (signatureMatches(alg, data, signature, key)) return decodeJson(encodedClaims);
   }
   throw new Error('Invalid token signature');
 }
 
-function importPublic(key: Record<string, unknown>): KeyObject | undefined {
+function signatureMatches(
+  algorithm: SigningAlgorithm,
+  data: Uint8Array,
+  signature: Uint8Array,
+  key: Record<string, unknown>,
+): boolean {
+  if (algorithm === 'RS256') {
+    if (typeof key.n !== 'string' || typeof key.e !== 'string') return false;
+    return rs256Verify(data, signature, { n: key.n, e: key.e });
+  }
+  if (typeof key.pub !== 'string') return false;
   try {
-    const material =
-      key.kty === 'RSA'
-        ? { kty: 'RSA', n: key.n, e: key.e }
-        : { kty: 'AKP', alg: key.alg, pub: key.pub };
-    return createPublicKey({ key: material as never, format: 'jwk' });
+    return mlDsaVerify(data, signature, decodeBase64Url(key.pub));
   } catch {
-    return undefined;
+    return false;
   }
 }
 
@@ -206,18 +246,46 @@ function kty(alg: SigningAlgorithm): string {
 }
 
 function encode(value: unknown): string {
-  return Buffer.from(JSON.stringify(value)).toString('base64url');
+  return encodeBase64Url(new TextEncoder().encode(JSON.stringify(value)));
 }
 
 function decodeJson(segment: string): Record<string, unknown> {
-  const parsed: unknown = JSON.parse(Buffer.from(segment, 'base64url').toString('utf8'));
+  const parsed: unknown = JSON.parse(new TextDecoder().decode(decodeBase64Url(segment)));
   if (typeof parsed !== 'object' || parsed === null) throw new Error('Malformed token');
   return parsed as Record<string, unknown>;
 }
 
 function decodedLength(value: unknown): number {
   if (typeof value !== 'string' || !/^[A-Za-z0-9_-]+$/.test(value)) return -1;
-  return Buffer.from(value, 'base64url').length;
+  return decodeBase64Url(value).length;
+}
+
+interface RsaMaterial {
+  kind: 'rsa';
+  n: string;
+  e: string;
+  d: string;
+}
+
+interface AkpMaterial {
+  kind: 'akp';
+  secretKey: Uint8Array;
+  publicKey: Uint8Array;
+}
+
+function component(value: unknown): string {
+  if (typeof value !== 'string' || value.length === 0) {
+    throw new SigningKeyError('Active private JWK is malformed or its public key does not match');
+  }
+  return value;
+}
+
+function equalBytes(left: Uint8Array, right: Uint8Array): boolean {
+  if (left.length !== right.length) return false;
+  let diff = 0;
+  for (let index = 0; index < left.length; index += 1)
+    diff |= (left[index] ?? 0) ^ (right[index] ?? 0);
+  return diff === 0;
 }
 
 function strip(value: Record<string, unknown> & { kty: string }): PublicJwk {

@@ -1,0 +1,8 @@
+name: di-framework-wasmcloud-identity-server-b36cba8af7
+runtime:
+  name: nodejs
+  options:
+    typescript: true
+description: Baremetal wasmCloud platform (k0s over SSH) on @di-framework/platform 6.0.5. Application resources are owned by the DI Framework CLI.
+backend:
+  url: file://./.pulumi-state

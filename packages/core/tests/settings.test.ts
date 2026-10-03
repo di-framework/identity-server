@@ -4,6 +4,7 @@ import { IdentityModule } from '../src/composition.ts';
 import { IDENTITY_SETTINGS, SIGNING_KEYS } from '../src/shared/domain/tokens.ts';
 import type { SigningKeys } from '../src/shared/infrastructure/crypto/signing-keys.ts';
 import { loadIdentitySettings } from '../src/shared/infrastructure/identity-settings.ts';
+import { withContainer } from './support/container-lock.ts';
 import { databaseUrl, testDatabaseName } from './support/database.ts';
 
 test('defaults match the auth server application.yml', () => {
@@ -170,49 +171,53 @@ test('rejects malformed numbers and provider documents', () => {
 });
 
 test('the module registers, exposes, and connects from settings', async () => {
-  const container = useContainer();
-  expect(container.resolve<SigningKeys>(SIGNING_KEYS).kid).toBe('test-active');
-  const original = IdentityModule.settings();
-  try {
-    const custom = loadIdentitySettings({ ISSUER_URL: 'https://custom.example' });
-    IdentityModule.configure(custom);
-    expect(IdentityModule.settings().issuer).toBe('https://custom.example');
-    expect(container.resolve<object>(IDENTITY_SETTINGS)).toBe(custom);
-  } finally {
-    IdentityModule.configure(original);
-  }
-  const fromEnv = await IdentityModule.connectFromConfig({
-    DATABASE_URL: databaseUrl('postgres'),
-    IDENTITY_DATABASE__POOL_MAX: '1',
+  await withContainer(async () => {
+    const container = useContainer();
+    expect(container.resolve<SigningKeys>(SIGNING_KEYS).kid).toBe('test-active');
+    const original = IdentityModule.settings();
+    try {
+      const custom = loadIdentitySettings({ ISSUER_URL: 'https://custom.example' });
+      IdentityModule.configure(custom);
+      expect(IdentityModule.settings().issuer).toBe('https://custom.example');
+      expect(container.resolve<object>(IDENTITY_SETTINGS)).toBe(custom);
+    } finally {
+      IdentityModule.configure(original);
+    }
+    const fromEnv = await IdentityModule.connectFromConfig({
+      DATABASE_URL: databaseUrl('postgres'),
+      IDENTITY_DATABASE__POOL_MAX: '1',
+    });
+    const viaSettings = await IdentityModule.connectFromConfig();
+    try {
+      expect(await fromEnv.first<{ one: number }>('SELECT 1 AS one')).toEqual({ one: 1 });
+      expect(await viaSettings.first<{ one: number }>('SELECT 1 AS one')).toEqual({ one: 1 });
+    } finally {
+      await fromEnv.close?.();
+      await viaSettings.close?.();
+      const { useTestDatabase } = await import('./support/database.ts');
+      const shared = await useTestDatabase();
+      IdentityModule.connect(shared);
+    }
+    expect(testDatabaseName).toBe('identity_test');
   });
-  const viaSettings = await IdentityModule.connectFromConfig();
-  try {
-    expect(await fromEnv.first<{ one: number }>('SELECT 1 AS one')).toEqual({ one: 1 });
-    expect(await viaSettings.first<{ one: number }>('SELECT 1 AS one')).toEqual({ one: 1 });
-  } finally {
-    await fromEnv.close?.();
-    await viaSettings.close?.();
-    const { useTestDatabase } = await import('./support/database.ts');
-    const shared = await useTestDatabase();
-    IdentityModule.connect(shared);
-  }
-  expect(testDatabaseName).toBe('identity_test');
 });
 
-test('the notification worker starts only when the scheduler is enabled', () => {
-  const original = IdentityModule.settings();
-  try {
-    IdentityModule.configure(
-      loadIdentitySettings({ GSIO_IDENTITY_NOTIFICATION_SCHEDULER_ENABLED: 'false' }),
-    );
-    expect(IdentityModule.startNotificationWorker()).toBeUndefined();
-    IdentityModule.configure(
-      loadIdentitySettings({ GSIO_IDENTITY_NOTIFICATION_DELAY_MS: '60000' }),
-    );
-    const worker = IdentityModule.startNotificationWorker();
-    expect(worker).toBeDefined();
-    worker?.stop();
-  } finally {
-    IdentityModule.configure(original);
-  }
+test('the notification worker starts only when the scheduler is enabled', async () => {
+  await withContainer(async () => {
+    const original = IdentityModule.settings();
+    try {
+      IdentityModule.configure(
+        loadIdentitySettings({ GSIO_IDENTITY_NOTIFICATION_SCHEDULER_ENABLED: 'false' }),
+      );
+      expect(IdentityModule.startNotificationWorker()).toBeUndefined();
+      IdentityModule.configure(
+        loadIdentitySettings({ GSIO_IDENTITY_NOTIFICATION_DELAY_MS: '60000' }),
+      );
+      const worker = IdentityModule.startNotificationWorker();
+      expect(worker).toBeDefined();
+      worker?.stop();
+    } finally {
+      IdentityModule.configure(original);
+    }
+  });
 });

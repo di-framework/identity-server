@@ -1,0 +1,10 @@
+{
+  "name": "identity-postgres-probe",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@di-framework/bindings": "6.0.5",
+    "@di-framework/core": "6.0.3",
+    "@di-framework/http": "6.0.3"
+  }
+}

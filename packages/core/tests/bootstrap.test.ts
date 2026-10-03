@@ -14,6 +14,7 @@ import { Hashing } from '../src/shared/infrastructure/crypto/hashing.ts';
 import { PasswordHasher } from '../src/shared/infrastructure/crypto/passwords.ts';
 import { loadIdentitySettings } from '../src/shared/infrastructure/identity-settings.ts';
 import type { PostgresGateway } from '../src/shared/infrastructure/postgres-gateway.ts';
+import { withContainer } from './support/container-lock.ts';
 import { useTestDatabase } from './support/database.ts';
 
 let database: SqlDatabase;
@@ -70,10 +71,21 @@ async function role(slug: string, userId: string): Promise<string | undefined> {
 }
 
 describe('bootstrap reconciliation', () => {
+  test('a fresh process can adopt an already applied bootstrap', () => {
+    return withContainer(async () => {
+      const service = reconciler(environment());
+      expect(service.complete).toBe(false);
+      service.markComplete();
+      expect(service.complete).toBe(true);
+    });
+  });
+
   test('startup preparation fails closed without bootstrap configuration', async () => {
-    await expect(IdentityModule.prepare()).rejects.toThrow(
-      'Bootstrap owner configuration is required',
-    );
+    await withContainer(async () => {
+      await expect(IdentityModule.prepare()).rejects.toThrow(
+        'Bootstrap owner configuration is required',
+      );
+    });
   });
 
   test('rejects incomplete configuration with the auth server messages', async () => {
@@ -302,7 +314,9 @@ describe('readiness', () => {
     expect(await readiness(mail, hanging as never, true).check(10)).toMatchObject({
       database: false,
     });
-    const real = useContainer().resolve(Readiness);
-    expect((await real.check()).database).toBe(true);
+    await withContainer(async () => {
+      const real = useContainer().resolve(Readiness);
+      expect((await real.check()).database).toBe(true);
+    });
   });
 });

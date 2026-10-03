@@ -37,6 +37,8 @@ test('discovers the reused Flyway migrations in version order', async () => {
     ['10', 'identity security notifications'],
     ['11', 'browser sessions'],
     ['12', 'normalize jsonb metadata'],
+    ['13', 'runtime secrets'],
+    ['14', 'varchar hashes'],
   ]);
 });
 
@@ -57,6 +59,8 @@ test('applies the reused migrations and reads a user through UserRepository', as
       '10',
       '11',
       '12',
+      '13',
+      '14',
     ]);
 
     const again = await applyMigrations(db);
@@ -95,7 +99,10 @@ test('V12 unwraps metadata and session attributes stored as JSON string scalars'
   const earlier = mkdtempSync(join(tmpdir(), 'identity-v11-'));
   const root = join(earlier, 'migrations');
   cpSync(migrationsDirectory, root, { recursive: true });
-  for (const name of readdirSync(root)) if (name.startsWith('V12__')) rmSync(join(root, name));
+  for (const name of readdirSync(root)) {
+    const version = /^V(\d+)__/.exec(name);
+    if (version && Number(version[1]) >= 12) rmSync(join(root, name));
+  }
   try {
     await withThrowawayDatabase('identity_v12_test', async (db) => {
       await applyMigrations(db, root);
@@ -110,7 +117,11 @@ test('V12 unwraps metadata and session attributes stored as JSON string scalars'
          VALUES (?, 'csrf', to_jsonb(?::text), now())`,
         ['a'.repeat(64), '{"saved":"/admin"}'],
       );
-      expect((await applyMigrations(db)).applied.map((record) => record.version)).toEqual(['12']);
+      expect((await applyMigrations(db)).applied.map((record) => record.version)).toEqual([
+        '12',
+        '13',
+        '14',
+      ]);
       expect(
         await db.first<Record<string, unknown>>(
           `SELECT jsonb_typeof(before_metadata) AS before, before_metadata->>'role' AS role,

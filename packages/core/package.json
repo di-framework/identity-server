@@ -8,6 +8,8 @@
     "@di-framework/config": "^6.0.3",
     "@di-framework/core": "^6.0.3",
     "@di-framework/identity-migrations": "workspace:*",
-    "@di-framework/repo": "^6.0.3"
+    "@di-framework/repo": "^6.0.3",
+    "@noble/hashes": "^2.4.0",
+    "@noble/post-quantum": "^0.7.1"
   }
 }

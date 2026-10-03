@@ -61,6 +61,12 @@ export type Result =
   | { kind: 'page'; page: PageBody; status?: number }
   | { kind: 'redirect'; location: string; status?: number };
 
+/** `URL.searchParams` from Bun is the Node implementation, which is not the DOM class. */
+interface Query {
+  get(name: string): string | null;
+  has(name: string): boolean;
+}
+
 interface Context {
   url: URL;
   method: string;
@@ -466,7 +472,7 @@ export class WebApp {
     return page({ page: 'not-found' }, 404);
   }
 
-  private async usersPage(actor: string, q: URLSearchParams): Promise<Result> {
+  private async usersPage(actor: string, q: Query): Promise<Result> {
     const status = q.get('status') ?? '';
     const users = await this.users.list(actor, {
       q: q.get('q') ?? undefined,
@@ -487,7 +493,7 @@ export class WebApp {
     });
   }
 
-  private async userPage(actor: string, id: string, q: URLSearchParams): Promise<Result> {
+  private async userPage(actor: string, id: string, q: Query): Promise<Result> {
     return this.admin(await this.users.detail(actor, id), ({ user, memberships }) =>
       page({
         page: 'user',
@@ -521,7 +527,7 @@ export class WebApp {
     );
   }
 
-  private async organizationsPage(actor: string, q: URLSearchParams): Promise<Result> {
+  private async organizationsPage(actor: string, q: Query): Promise<Result> {
     const status = q.get('status') ?? '';
     const { rows, canCreate } = await this.organizations.list(
       actor,
@@ -542,7 +548,7 @@ export class WebApp {
     });
   }
 
-  private async organizationPage(actor: string, id: string, q: URLSearchParams): Promise<Result> {
+  private async organizationPage(actor: string, id: string, q: Query): Promise<Result> {
     const detail = await this.organizations.detail(actor, id);
     if (detail.kind !== 'ok') return this.admin(detail, () => page({ page: 'not-found' }));
     const { organization, memberCount, clientCount, canArchive } = detail.value;
@@ -567,7 +573,7 @@ export class WebApp {
     });
   }
 
-  private async membershipsPage(actor: string, q: URLSearchParams): Promise<Result> {
+  private async membershipsPage(actor: string, q: Query): Promise<Result> {
     const orgSlug = q.get('orgSlug') ?? '';
     const { memberships, organizations } = await this.memberships.list(actor, orgSlug);
     return page({
@@ -592,7 +598,7 @@ export class WebApp {
     });
   }
 
-  private async clientsPage(actor: string, q: URLSearchParams): Promise<Result> {
+  private async clientsPage(actor: string, q: Query): Promise<Result> {
     const status = q.get('status') ?? '';
     const orgSlug = q.get('orgSlug') ?? '';
     const { clients, organizations } = await this.clients.list(actor, {
@@ -613,12 +619,7 @@ export class WebApp {
     });
   }
 
-  private async clientPage(
-    c: Context,
-    actor: string,
-    id: string,
-    q: URLSearchParams,
-  ): Promise<Result> {
+  private async clientPage(c: Context, actor: string, id: string, q: Query): Promise<Result> {
     return this.admin(await this.clients.detail(actor, id), async (client: RegisteredClient) => {
       const reveal = c.active.session.attributes[SECRET_ATTRIBUTE];
       let secret: string | null = null;
@@ -653,7 +654,7 @@ export class WebApp {
     });
   }
 
-  private async auditPage(actor: string, q: URLSearchParams): Promise<Result> {
+  private async auditPage(actor: string, q: Query): Promise<Result> {
     const filters = {
       action: q.get('action') ?? '',
       actor: q.get('actor') ?? '',
@@ -914,7 +915,7 @@ function choices(organizations: Organization[]): OrgChoice[] {
   }));
 }
 
-function banner(q: URLSearchParams, flags: Record<string, BannerName>): BannerName | null {
+function banner(q: Query, flags: Record<string, BannerName>): BannerName | null {
   for (const [flag, name] of Object.entries(flags)) if (q.has(flag)) return name;
   return null;
 }

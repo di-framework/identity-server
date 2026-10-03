@@ -45,7 +45,7 @@ export class AuthorizeService {
   ) {}
 
   async authorize(
-    params: URLSearchParams,
+    params: { get(name: string): string | null; toString(): string },
     user: AuthorizeUser | undefined,
   ): Promise<AuthorizeResult> {
     const client = await this.clients.find(params.get('client_id') ?? '');
@@ -71,7 +71,7 @@ export class AuthorizeService {
     if (maxAge !== null && !/^\d+$/.test(maxAge)) return fail('invalid_request');
     // The sign-in a login redirect leads to is fresh by definition, so the resumed request drops
     // `prompt` and `max_age` (otherwise `max_age=0` would ask for a second sign-in).
-    const fresh = new URLSearchParams(params);
+    const fresh = new URLSearchParams(params.toString());
     fresh.delete('prompt');
     fresh.delete('max_age');
     if (!user) return prompt.includes('none') ? fail('login_required') : login(fresh);

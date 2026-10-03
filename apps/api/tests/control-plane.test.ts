@@ -305,6 +305,7 @@ test('serves the JSON control plane through application services', async () => {
   expect((secondPage.body as { items: unknown[]; next_cursor: null }).items).toHaveLength(1);
   expect((secondPage.body as { next_cursor: null }).next_cursor).toBeNull();
   expect((await call('GET', '/api/v1/organizations/acme/members?cursor=abc')).status).toBe(400);
+  expect((await call('GET', '/api/v1/organizations/acme/members?cursor=a')).status).toBe(400);
   expect((await call('GET', '/api/v1/organizations/acme/members?limit=abc')).body).toMatchObject({
     items: expect.any(Array),
   });

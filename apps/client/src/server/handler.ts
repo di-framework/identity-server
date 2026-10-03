@@ -27,7 +27,11 @@ const app = new WebApp();
  * gets the HTML shell with the page model embedded, so a failed form post keeps the auth
  * server's status code without a redirect.
  */
-export async function handle(request: Request, web: WebApp = app): Promise<Response> {
+export async function handle(
+  request: Request,
+  web: WebApp = app,
+  shell?: string,
+): Promise<Response> {
   if (request.method !== 'GET' && request.method !== 'POST') {
     return new Response(null, { status: 405, headers: { allow: 'GET, POST' } });
   }
@@ -50,8 +54,8 @@ export async function handle(request: Request, web: WebApp = app): Promise<Respo
     return new Response(JSON.stringify(model), { status: result.status ?? 200, headers });
   }
   headers.set('content-type', 'text/html; charset=utf-8');
-  const shell = await Bun.file(indexDocument()).text();
-  const html = shell.replace(
+  const document = shell ?? (await Bun.file(indexDocument()).text());
+  const html = document.replace(
     '<div id="root"></div>',
     `<div id="root"></div>\n    <script>window.__IDENTITY_PAGE__ = ${scriptJson(model)};</script>`,
   );

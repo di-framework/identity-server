@@ -1,4 +1,5 @@
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from 'node:crypto';
+import { encodeBase64Url } from './base64url.ts';
 
 /** One-way digests and random values. Tokens are stored as SHA-256 hex, never in plain form. */
 export class Hashing {
@@ -11,12 +12,14 @@ export class Hashing {
   }
 
   static hmacSha256Base64Url(key: Uint8Array, value: string): string {
-    return createHmac('sha256', key).update(value, 'utf8').digest('base64url');
+    return encodeBase64Url(
+      new Uint8Array(createHmac('sha256', key).update(value, 'utf8').digest()),
+    );
   }
 
   /** 32 random bytes as unpadded base64url: 43 characters. */
   static token(bytes = 32): string {
-    return randomBytes(bytes).toString('base64url');
+    return encodeBase64Url(new Uint8Array(randomBytes(bytes)));
   }
 
   /** `cli_` plus the first 16 hex characters of a dashless random UUID. */
@@ -26,7 +29,7 @@ export class Hashing {
 
   /** S256 PKCE challenge for a verifier. */
   static pkceChallenge(verifier: string): string {
-    return createHash('sha256').update(verifier, 'ascii').digest('base64url');
+    return encodeBase64Url(new Uint8Array(createHash('sha256').update(verifier, 'ascii').digest()));
   }
 
   static equal(left: string, right: string): boolean {

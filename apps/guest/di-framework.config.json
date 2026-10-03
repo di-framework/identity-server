@@ -1,0 +1,5 @@
+{
+  "name": "identity",
+  "entry": "src/app.ts",
+  "output": "dist/identity.wasm"
+}

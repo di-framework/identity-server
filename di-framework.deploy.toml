@@ -1,0 +1,16 @@
+# Deployment topology only. Project identity comes from each
+# di-framework.config.json `name` — this file has no `apps` table.
+default-target = "local"
+
+[targets.local]
+platform = "deploy/platform"
+stack = "dev"
+
+[targets.identity]
+kubeconfig = "deploy/platform/.kubeconfig-dev-identity"
+tenant = "identity"
+
+[targets.identity.registry]
+push = "${IDENTITY_REGISTRY_PUSH}"
+pull = "di-framework-registry.wasmcloud.svc.cluster.local:5000"
+insecure = true

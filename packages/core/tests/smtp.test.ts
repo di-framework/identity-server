@@ -4,6 +4,7 @@ import { IdentityModule } from '../src/composition.ts';
 import { Mailer } from '../src/mail/application/mailer.ts';
 import {
   formatMessage,
+  loadSmtpTls,
   SmtpError,
   SmtpMailSender,
   type SmtpOptions,
@@ -101,9 +102,12 @@ describe('SMTP client', () => {
       'SMTP TLS handshake failed',
     );
     const insecure = server({ starttls: true });
-    await sender(insecure.port, { starttls: true, tls: { rejectUnauthorized: false } }).send(
-      message,
-    );
+    await sender(insecure.port, {
+      starttls: true,
+      // The fixture certificate is local. Production SMTP keeps verification on unless set.
+      // nosemgrep: problem-based-packs.insecure-transport.js-node.bypass-tls-verification.bypass-tls-verification
+      tls: { rejectUnauthorized: false },
+    }).send(message);
     expect(insecure.messages).toHaveLength(1);
 
     const notOffered = server();
@@ -147,12 +151,30 @@ describe('SMTP client', () => {
     const port = refused.port;
     refused.stop();
     await expect(sender(port).send(message)).rejects.toThrow('SMTP connection failed');
+    const tlsRefused = server({ implicitTls: true });
+    const tlsPort = tlsRefused.port;
+    tlsRefused.stop();
+    await expect(
+      sender(tlsPort, {
+        ssl: true,
+        // nosemgrep: problem-based-packs.insecure-transport.js-node.bypass-tls-verification.bypass-tls-verification
+        tls: { rejectUnauthorized: false },
+      }).send(message),
+    ).rejects.toThrow('SMTP connection failed');
 
     const dropped = server({ dropOnQuit: true });
     await sender(dropped.port).send(message);
     expect(dropped.messages).toHaveLength(1);
 
     await expect(new UnconfiguredMailSender().send()).rejects.toThrow('SMTP is not configured');
+    await expect(
+      loadSmtpTls(async () => {
+        throw new Error('unlinked');
+      }),
+    ).rejects.toThrow('SMTP TLS is not available');
+    await expect(loadSmtpTls(async () => ({ connect: undefined as never }))).rejects.toThrow(
+      'SMTP TLS is not available',
+    );
   });
 
   test('formats headers safely', () => {

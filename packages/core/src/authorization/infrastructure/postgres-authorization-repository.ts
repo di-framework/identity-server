@@ -142,9 +142,10 @@ export class PostgresAuthorizationRepository implements AuthorizationRepository 
   }
 
   async deleteByPrincipal(principalName: string): Promise<number> {
-    const result = await this.db.run(`DELETE FROM oauth2_authorization WHERE principal_name = ?`, [
-      principalName,
-    ]);
+    const result = await this.db.run(
+      `DELETE FROM oauth2_authorization WHERE principal_name = ? RETURNING 1`,
+      [principalName],
+    );
     return result.changes ?? 0;
   }
 
