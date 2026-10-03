@@ -49,7 +49,7 @@ Authentication on every auth-server `/api/admin/**` call is an opaque access tok
 | Organization archive | HTML only (`archived_at`). The JSON API does not archive. | HTML screens filter active and archived organizations. The API hard-deletes. | Split |
 | Membership get, put, delete | Scope-gated. No last-owner block on the JSON API; the block is HTML-only (`ApiController.kt:326-383`). | Same routes and the same absence of a last-owner block. No caller check. | Partial |
 | `GET /api/v1/organizations/{slug}/members` | `directory:read`, cursor, limit. | Same paging. No caller check. | Partial |
-| OAuth client list, get, create, update, rotate, revoke | Caller supplies `clientId`. Stored client name is that id. Grant types come from the `browser` flag: authorization code plus refresh token, or client credentials. Secret is Argon2 (the password encoder). Idempotent create and rotate derive the secret as HMAC-SHA256 over `key\0operation` keyed by `SHA-256("gsio-oauth-idempotency-v1\0" + active private JWK)` (`ApiController.kt:533-544`). Revoke sets `revoked_at`. | Same route shape, `browser` grant split, Argon2 secret, and derivation key. Registered-client and lifecycle rows are written in two statements, not one transaction. No caller check. | Partial |
+| OAuth client list, get, create, update, rotate, revoke | Caller supplies `clientId`. Stored client name is that id. Grant types come from the `browser` flag: authorization code plus refresh token, or client credentials; the flag also sets PKCE and consent. Secret is Argon2 (the password encoder). Idempotent create and rotate derive the secret as HMAC-SHA256 over `key\0operation` keyed by `SHA-256("gsio-oauth-idempotency-v1\0" + active private JWK)` (`ApiController.kt:533-544`). Revoke sets `revoked_at`. | Same route shape, `browser` grant split with PKCE and consent settings, Argon2 secret, and derivation key. No caller check. | Partial |
 | `GET /api/admin/audit` | `admin:read`. Newest 500. No query filters. Metadata is returned as stored. | Newest 500. No caller check. No query filters. | Partial |
 | `GET/DELETE /api/v1/account/identity-links`, `POST .../unlink/prepare` | Bound to the authenticated user and session. Prepare requires the session's last authentication within 15 minutes; a bearer-only caller has no session and always fails it. Delete relies on the session-bound confirmation. Unlink refuses the last usable sign-in method, revokes persisted access and refresh tokens, and enqueues a security notification (`IdentityLinkController.kt:114-180,485-492`). | List, prepare, and unlink persist. Prepare and unlink need a user id and session id that the control plane does not establish. Token revoke and the notification outbox are unused. The last-method check is present in `LinkService`. | Partial |
 | `Idempotency-Key` | Mutations used by the Pulumi provider. Create paths replay from the earliest audit row with that action and correlation id (V5 index). Rotate replays by derivation only. | Same replay and derivation. No caller check. | Partial |
@@ -84,14 +84,14 @@ Auth-server renders these with kotlinx.html. This repository renders PatternFly 
 | Capability | Auth-server | This repository | Status |
 | --- | --- | --- | --- |
 | `GET/POST /oauth2/authorize` | Spring Authorization Server, consent page `/oauth2/consent` | Absent | Missing |
-| `POST /oauth2/token`, `/oauth2/jwks`, `/.well-known/**` | Public. Issuer from `gsio.issuer` | Absent | Missing |
+| `POST /oauth2/token`, `/oauth2/jwks`, `/.well-known/**` | Public. Issuer from `gsio.issuer` | `apps/api/src/authorization/endpoints.ts` serves token (`client_credentials`), introspection, revocation, JWKS, and both discovery documents from the configured issuer. `client_secret_basic` and `client_secret_post`. Authorization-code and refresh grants return `unsupported_grant_type` | Partial |
 | UserInfo | `sub`, `preferred_username`, `name`, `email`, `email_verified`, `picture`, organization roles | Absent | Missing |
-| Access tokens | Opaque references. Access TTL 10 minutes. Authorization code TTL 60 seconds. Refresh TTL 30 days. Refresh reuse disabled. | Tables `oauth2_authorization` and `oauth_refresh_token_history` are migrated and unused | Missing |
+| Access tokens | Opaque references. Access TTL 10 minutes. Authorization code TTL 60 seconds. Refresh TTL 30 days. Refresh reuse disabled. | Opaque 43-character references with a 10-minute TTL for `client_credentials`, stored as SHA-256 hashes in `oauth2_authorization`. Introspection rejects unknown, invalidated, expired, orphaned, and lifecycle-revoked tokens in the auth server's order. No code or refresh tokens yet | Partial |
 | ID tokens | Signed with the active `kid` using `RS256` or, when `AUTH_SIGNING_ALGORITHM=ML-DSA-65`, an RFC 9964 AKP key. Claims include login, display name, email, email verified, picture, and organization roles | Absent | Missing |
 | Consent storage | `oauth2_authorization_consent` | Table migrated and unused | Missing |
 | Refresh replay | `RefreshRotationAuthorizationService` inserts a hash under a row lock | Table migrated and unused | Missing |
 | Signing keys | `RS256` RSA, or feature-gated `ML-DSA-65` AKP. Previous public JWKs stay on JWKS. Missing or private-in-public keys fail startup | `SigningKeys` in `packages/core/src/shared/infrastructure/crypto` loads and validates the same inputs and signs with either algorithm. Nothing serves JWKS or issues tokens yet | Partial |
-| Registered clients used as an authorization server | `JdbcRegisteredClientRepository` on `oauth2_registered_client` | Rows are written for the admin API. Nothing issues tokens from them | Partial |
+| Registered clients used as an authorization server | `JdbcRegisteredClientRepository` on `oauth2_registered_client` | `PostgresRegisteredClientRepository` reads the same rows, including auth methods, grant types, and client settings, and the token endpoint authenticates against them with Argon2. Rows are this repository's JSON settings, not Spring's serialized form | Match |
 
 ## Schema
 
@@ -101,11 +101,11 @@ Auth-server renders these with kotlinx.html. This repository renders PatternFly 
 | --- | --- |
 | `users`, `organizations`, `organization_memberships` | Yes. `users.system_role` and `organizations.archived_at` are not mapped. |
 | `auth_audit_records` | Yes. |
-| `oauth2_registered_client`, `oauth_client_lifecycle` | Yes, for admin client registration. |
+| `oauth2_registered_client`, `oauth_client_lifecycle` | Yes. Admin registration writes both rows in one transaction, with client and token settings. |
 | `identity_links`, `identity_unlink_confirmations` | Yes, for list, prepare, and unlink. |
 | `email_challenges` | No. |
 | `identity_link_flows` | No. Pending links are in memory on the auth-server HTML path as well (`stagePendingLink`). The flow-state table is the persisted start/callback record. |
-| `oauth2_authorization`, `oauth2_authorization_consent`, `oauth_refresh_token_history` | No. |
+| `oauth2_authorization`, `oauth2_authorization_consent`, `oauth_refresh_token_history` | Yes, through `PostgresAuthorizationRepository`. Only `client_credentials` writes `oauth2_authorization` so far. Token columns hold SHA-256 hashes; `attributes` and `*_metadata` hold this repository's JSON. |
 | `identity_security_notifications` | No. |
 
 ## Operations outside the request path

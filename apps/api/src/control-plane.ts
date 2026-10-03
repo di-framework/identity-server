@@ -7,6 +7,7 @@ import { DirectoryService } from '@di-framework/identity/src/directory/applicati
 import { LinkService } from '@di-framework/identity/src/linking/application/link-service.ts';
 import { OAuthService } from '@di-framework/identity/src/oauth/application/oauth-service.ts';
 import type { ServiceResult } from '@di-framework/identity/src/shared/domain/service-result.ts';
+import { AuthorizationEndpoints } from './authorization/endpoints.ts';
 
 export interface RouteRequest {
   headers: { get(name: string): string | null };
@@ -249,8 +250,18 @@ export class ControlPlaneController {
 
 @Container()
 export class ControlPlaneRouter {
+  constructor(
+    @Component(AuthorizationEndpoints) private readonly authorization: AuthorizationEndpoints,
+  ) {}
+
+  /** Paths this router owns: the JSON API plus the session-free OAuth 2 endpoints. */
+  handles(pathname: string): boolean {
+    return pathname.startsWith('/api/') || this.authorization.handles(pathname);
+  }
+
   async fetch(request: Request): Promise<Response> {
     const { pathname } = new URL(request.url);
+    if (this.authorization.handles(pathname)) return this.authorization.fetch(request);
     if (pathname.startsWith('/api/admin')) {
       const { routes } = await import('./generated/admin/v1/http.ts');
       return routes.fetch(request);

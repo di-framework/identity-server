@@ -18,7 +18,7 @@ const ASSET_NAME = /^[A-Za-z0-9._-]+$/;
 
 export async function routeRequest(request: Request, store: Store, assets: URL): Promise<Response> {
   const { pathname } = new URL(request.url);
-  if (pathname.startsWith('/api/')) return controlPlane.fetch(request);
+  if (controlPlane.handles(pathname)) return controlPlane.fetch(request);
   if (pathname.startsWith('/assets/')) return asset(pathname.slice('/assets/'.length), assets);
   return handle(request, store, directory);
 }

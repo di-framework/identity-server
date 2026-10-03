@@ -1,4 +1,5 @@
 import { Component, Container } from '@di-framework/core/decorators';
+import { ClientColumns } from '../../authorization/infrastructure/postgres-registered-client-repository.ts';
 import { PostgresGateway, Timestamps } from '../../shared/infrastructure/postgres-gateway.ts';
 import type { NewOAuthClient, OAuthRepository } from '../domain/oauth-client.ts';
 import { OAuthClient } from '../domain/oauth-client.ts';
@@ -40,38 +41,47 @@ export class PostgresOAuthRepository implements OAuthRepository {
     return row ? this.client(row) : undefined;
   }
 
-  async insert(client: NewOAuthClient): Promise<void> {
-    await this.db.write(
-      `INSERT INTO oauth2_registered_client (
-         id, client_id, client_secret, client_name, client_authentication_methods,
-         authorization_grant_types, redirect_uris, scopes, client_settings, token_settings
-       ) VALUES (?, ?, ?, ?, 'client_secret_basic', ?, ?, ?, '{}', '{}')`,
-      [
-        crypto.randomUUID(),
-        client.clientId,
-        client.secretHash,
-        client.clientId,
-        this.grants(client.browser),
-        client.redirectUris.join(','),
-        client.scopes.join(','),
-      ],
-    );
-    await this.db.write(
-      `INSERT INTO oauth_client_lifecycle (client_id, organization_slug) VALUES (?, ?)`,
-      [client.clientId, client.organizationSlug],
-    );
+  /**
+   * JSON admin registration (`ApiController.createOAuthClient`): client name is the client id,
+   * `client_secret_basic` only, and the `browser` flag picks grant types, PKCE, and consent.
+   */
+  insert(client: NewOAuthClient): Promise<void> {
+    return this.db.transaction(async () => {
+      await this.db.write(
+        `INSERT INTO oauth2_registered_client (
+           id, client_id, client_secret, client_name, client_authentication_methods,
+           authorization_grant_types, redirect_uris, scopes, client_settings, token_settings
+         ) VALUES (?, ?, ?, ?, 'client_secret_basic', ?, ?, ?, ?, ?)`,
+        [
+          crypto.randomUUID(),
+          client.clientId,
+          client.secretHash,
+          client.clientId,
+          this.grants(client.browser),
+          ClientColumns.list(client.redirectUris),
+          ClientColumns.list(client.scopes),
+          this.settings(client.browser),
+          ClientColumns.tokenSettings(),
+        ],
+      );
+      await this.db.write(
+        `INSERT INTO oauth_client_lifecycle (client_id, organization_slug) VALUES (?, ?)`,
+        [client.clientId, client.organizationSlug],
+      );
+    });
   }
 
   update(client: Omit<NewOAuthClient, 'secretHash'>): Promise<void> {
     return this.db.transaction(async () => {
       await this.db.write(
         `UPDATE oauth2_registered_client
-         SET authorization_grant_types = ?, redirect_uris = ?, scopes = ?
+         SET authorization_grant_types = ?, redirect_uris = ?, scopes = ?, client_settings = ?
          WHERE client_id = ?`,
         [
           this.grants(client.browser),
-          client.redirectUris.join(','),
-          client.scopes.join(','),
+          ClientColumns.list(client.redirectUris),
+          ClientColumns.list(client.scopes),
+          this.settings(client.browser),
           client.clientId,
         ],
       );
@@ -104,6 +114,13 @@ export class PostgresOAuthRepository implements OAuthRepository {
     );
   }
 
+  private settings(browser: boolean): string {
+    return ClientColumns.settings({
+      requireProofKey: browser,
+      requireAuthorizationConsent: browser,
+    });
+  }
+
   private grants(browser: boolean): string {
     return browser ? 'authorization_code,refresh_token' : 'client_credentials';
   }
@@ -112,16 +129,11 @@ export class PostgresOAuthRepository implements OAuthRepository {
     return new OAuthClient(
       row.client_id,
       row.organization_slug,
-      this.csv(row.redirect_uris),
-      this.csv(row.scopes),
+      ClientColumns.parse(row.redirect_uris),
+      ClientColumns.parse(row.scopes),
       row.authorization_grant_types.split(',').includes('authorization_code'),
       row.revoked_at == null ? null : Timestamps.iso(row.revoked_at),
       Timestamps.iso(row.created_at),
     );
-  }
-
-  private csv(value: string | null): string[] {
-    if (!value) return [];
-    return value.split(',').filter((item) => item.length > 0);
   }
 }

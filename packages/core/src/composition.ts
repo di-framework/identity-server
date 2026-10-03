@@ -1,18 +1,22 @@
 import { useContainer } from '@di-framework/core/container';
 import type { SqlDatabase } from '@di-framework/repo';
 import { PostgresAuditRepository } from './audit/infrastructure/postgres-audit-repository.ts';
+import { PostgresAuthorizationRepository } from './authorization/infrastructure/postgres-authorization-repository.ts';
+import { PostgresRegisteredClientRepository } from './authorization/infrastructure/postgres-registered-client-repository.ts';
 import { PostgresDirectoryRepository } from './directory/infrastructure/postgres-directory-repository.ts';
 import { PostgresLinkRepository } from './linking/infrastructure/postgres-link-repository.ts';
 import { PostgresOAuthRepository } from './oauth/infrastructure/postgres-oauth-repository.ts';
 import { systemClock } from './shared/domain/clock.ts';
 import {
   AUDIT,
+  AUTHORIZATIONS,
   CLOCK,
   DIRECTORY,
   IDENTITY_DATABASE,
   IDENTITY_SETTINGS,
   LINKS,
   OAUTH,
+  REGISTERED_CLIENTS,
   SIGNING_KEYS,
 } from './shared/domain/tokens.ts';
 import { SigningKeys } from './shared/infrastructure/crypto/signing-keys.ts';
@@ -36,6 +40,8 @@ export class IdentityModule {
     IdentityModule.port(OAUTH, PostgresOAuthRepository);
     IdentityModule.port(AUDIT, PostgresAuditRepository);
     IdentityModule.port(LINKS, PostgresLinkRepository);
+    IdentityModule.port(REGISTERED_CLIENTS, PostgresRegisteredClientRepository);
+    IdentityModule.port(AUTHORIZATIONS, PostgresAuthorizationRepository);
   }
 
   /** Registers explicit settings, for a process that loaded them itself. */
