@@ -6,10 +6,11 @@
  *                     cluster) and installs @di-framework/platform with platform.json.
  *   InClusterRegistry component registry in the platform namespace, unless `registry`
  *                     names an external one.
- *   PublishedImage    the tenant host image (wash with wasi:tls, which the component
- *                     imports), pushed from the local engine to the registry; the node
- *                     pulls it through the registry's NodePort.
- *   DeploymentPatch   rolls the tenant host onto that image whenever its digest changes.
+ *   PublishedImage    only with `tenantHostLocalImage`: a local tenant host build, pushed
+ *                     from the local engine to the registry; the node pulls it through the
+ *                     registry's NodePort. Otherwise the host runs the published GHCR image.
+ *   DeploymentPatch   stop-then-start rollouts for the tenant host, and a roll whenever a
+ *                     published local image's digest changes.
  *   BackingService    `directory`, the tenant's Postgres, which the platform controller
  *                     provisions; the workload binds to it by name.
  *   CliWorkload       the identity component: `di-framework platform deploy` when its
@@ -37,9 +38,10 @@
  *   registryStorageClass   StorageClass for the in-cluster registry (default: cluster default)
  *   databaseDeletionPolicy `Retain` keeps the directory database's data when the stack is
  *                          destroyed; `Delete` removes it (default: Retain)
- *   tenantHostImage        node-pullable tenant host image; skips publishing a local one
- *   tenantHostLocalImage   local engine image published as the tenant host
- *                          (default: localhost/di-framework/wash:2.8.0-wasi-tls)
+ *   tenantHostImage        tenant host image the nodes pull
+ *                          (default: ghcr.io/di-framework/wash:2.8.0-wasi-tls, pinned by digest)
+ *   tenantHostLocalImage   local engine image to publish and run as the tenant host instead,
+ *                          such as localhost/di-framework/wash:2.8.0-wasi-tls
  *   registryNodePort       NodePort the node pulls the published host image through (default: 30500)
  *   containerEngine        podman or docker (default: whichever answers first)
  *   platformNamespace      namespace kube installs the platform into (default: wasmcloud)
@@ -89,22 +91,35 @@ const registryForwardPort =
   config.getNumber('registryForwardPort', { min: 1024, max: 65535 }) ?? 25180;
 
 /**
- * The tenant host must provide wasi:tls, which the stock wash image does not. Unless the
- * stack names a pullable image, the local build is published to the in-cluster registry
- * and pulled by the node from 127.0.0.1:<registryNodePort>; see the platform repo's
- * platform/tenant-host/README.md for building it.
+ * The tenant host must provide wasi:tls, which the stock wash image does not. The platform
+ * repo publishes its `platform/tenant-host` build (wash 2.8.0 with `--features wasi-tls`) to
+ * GHCR for amd64 and arm64; the host runs it pinned by digest.
  */
+const PUBLISHED_HOST_IMAGE =
+  'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:efdf31f04edeca4f5f852b2ae4c91743a92514c0a85b53c2d0bf9a0e83e9a0dd';
+
+/**
+ * To run an unpublished host build, `tenantHostLocalImage` names it in the local engine. It
+ * is published to the in-cluster registry and pulled by the node from
+ * 127.0.0.1:<registryNodePort>.
+ */
+const localHostImage = config.get('tenantHostLocalImage');
 const configuredHostImage = config.get('tenantHostImage');
-const publishHostImage = configuredHostImage === undefined;
-if (publishHostImage && externalRegistry !== undefined) {
-  throw new Error('with an external registry, set tenantHostImage to an image the nodes can pull');
+const publishHostImage = localHostImage !== undefined;
+if (publishHostImage && configuredHostImage !== undefined) {
+  throw new Error('set tenantHostImage or tenantHostLocalImage, not both');
 }
-const localHostImage =
-  config.get('tenantHostLocalImage') ?? 'localhost/di-framework/wash:2.8.0-wasi-tls';
+if (publishHostImage && externalRegistry !== undefined) {
+  throw new Error(
+    'tenantHostLocalImage needs the in-cluster registry; push it and set tenantHostImage',
+  );
+}
 const registryNodePort = config.getNumber('registryNodePort', { min: 30000, max: 32767 }) ?? 30500;
 /** `localhost/di-framework/wash:tag` without its registry host: `di-framework/wash:tag`. */
-const hostRepository = localHostImage.replace(/^(localhost|[^/]*[.:][^/]*)\//, '');
-const tenantHostImage = configuredHostImage ?? `127.0.0.1:${registryNodePort}/${hostRepository}`;
+const hostRepository = localHostImage?.replace(/^(localhost|[^/]*[.:][^/]*)\//, '');
+const tenantHostImage = publishHostImage
+  ? `127.0.0.1:${registryNodePort}/${hostRepository}`
+  : (configuredHostImage ?? PUBLISHED_HOST_IMAGE);
 
 const instanceName = config.get('kubeInstance') ?? 'identity';
 /** Known up front so previews of kube updates don't mark the registry's namespace unknown. */
@@ -190,7 +205,7 @@ const registryForward = inCluster && {
 };
 
 let hostImage: PublishedImage | undefined;
-if (publishHostImage && inCluster && registryForward) {
+if (localHostImage && hostRepository && inCluster && registryForward) {
   const engine = containerEngine(config.get('containerEngine'));
   hostImage = new PublishedImage(
     'tenant-host-image',
@@ -200,7 +215,7 @@ if (publishHostImage && inCluster && registryForward) {
       imageId: localImageId(
         engine,
         localHostImage,
-        'Build it from the platform repo: podman build -t localhost/di-framework/wash:2.8.0-wasi-tls platform/tenant-host, or set tenantHostImage.',
+        'Build it from the platform repo (platform/tenant-host), or unset tenantHostLocalImage.',
       ),
       repository: hostRepository,
       registryForward,
@@ -210,26 +225,31 @@ if (publishHostImage && inCluster && registryForward) {
 }
 
 /**
- * Rolls the tenant host (a Deployment the platform controller owns) onto the published image
- * whenever its digest changes, through a server-side-apply patch of two fields the controller
- * leaves alone. Tenant host pods run under a ResourceQuota with no room for a second host, so
- * the default start-then-stop rolling update would never finish; this one stops first.
+ * A server-side-apply patch of fields the platform controller leaves alone on the tenant host
+ * Deployment. Tenant host pods run under a ResourceQuota with no room for a second host, so
+ * the default start-then-stop rolling update never finishes; this one stops first, for every
+ * roll (an image change, new runtime secrets). With a published local image it also rolls the
+ * host whenever that image's digest changes, since its tag is mutable.
  */
-const hostRollout =
-  hostImage &&
-  new k8s.apps.v1.DeploymentPatch(
-    'tenant-host-rollout',
-    {
-      metadata: { name: `hostgroup-tenant-${TENANT}`, namespace: `di-runtime-${TENANT}` },
-      spec: {
-        strategy: { type: 'RollingUpdate', rollingUpdate: { maxSurge: 0, maxUnavailable: 1 } },
-        template: {
-          metadata: { annotations: { 'identity.di-framework.dev/host-image': hostImage.digest } },
-        },
-      },
+const hostRollout = new k8s.apps.v1.DeploymentPatch(
+  'tenant-host-rollout',
+  {
+    metadata: { name: `hostgroup-tenant-${TENANT}`, namespace: `di-runtime-${TENANT}` },
+    spec: {
+      strategy: { type: 'RollingUpdate', rollingUpdate: { maxSurge: 0, maxUnavailable: 1 } },
+      ...(hostImage
+        ? {
+            template: {
+              metadata: {
+                annotations: { 'identity.di-framework.dev/host-image': hostImage.digest },
+              },
+            },
+          }
+        : {}),
     },
-    { provider, dependsOn: [hostImage] },
-  );
+  },
+  { provider, dependsOn: hostImage ? [hostImage] : [] },
+);
 
 const databaseDeletionPolicy = config.get('databaseDeletionPolicy') ?? 'Retain';
 if (databaseDeletionPolicy !== 'Retain' && databaseDeletionPolicy !== 'Delete') {
@@ -288,7 +308,7 @@ const identity = new CliWorkload(
     ]),
   },
   {
-    dependsOn: [database, ...(inCluster ? [inCluster] : []), ...(hostRollout ? [hostRollout] : [])],
+    dependsOn: [database, ...(inCluster ? [inCluster] : []), hostRollout],
   },
 );
 

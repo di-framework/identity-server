@@ -12,9 +12,9 @@ pulumi destroy
 | Resource | What it does |
 | --- | --- |
 | `KubeInstance` (`components/kube.ts`) | Downloads the [di-framework-kube](https://github.com/di-framework/kube) release for this machine, verifies it against `checksums.txt`, and caches it. It runs `di-framework-kube up` on create and update, and `down` on delete. kube creates a Kubesolo container, or uses an existing cluster, and installs `@di-framework/platform` with the tenants in `platform.json` and the tenant host image below. |
-| `InClusterRegistry` (`components/registry.ts`) | Plain-HTTP OCI registry in the platform namespace: PVC, Deployment, a ClusterIP Service for component pulls, and a NodePort Service for node-level image pulls. It is skipped when the stack sets an external `registry`. |
-| `PublishedImage` (`components/image.ts`) | Publishes the tenant host image from the local engine to the registry. The engine saves it as an OCI layout and `oras` copies it through a port-forward. |
-| `DeploymentPatch` `tenant-host-rollout` | Rolls the tenant host onto that image whenever its digest changes. It switches the host to stop-then-start updates, because the tenant quota has no room for a second host pod. |
+| `InClusterRegistry` (`components/registry.ts`) | Plain-HTTP OCI registry in the platform namespace: PVC, Deployment, and a ClusterIP Service for component pulls, plus a NodePort Service when a local tenant host image is published. It is skipped when the stack sets an external `registry`. |
+| `PublishedImage` (`components/image.ts`) | Only with `tenantHostLocalImage`: publishes that local tenant host build to the registry. The engine saves it as an OCI layout and `oras` copies it through a port-forward. |
+| `DeploymentPatch` `tenant-host-rollout` | Switches the tenant host to stop-then-start updates, because the tenant quota has no room for a second host pod. With a published local image, it also rolls the host whenever that image's digest changes. |
 | `BackingService` `directory` | The tenant's Postgres, provisioned by the platform controller. Pulumi waits for `Ready`. |
 | `CliWorkload` (`components/workload.ts`) | The identity component. It runs `di-framework platform deploy identity` when its sources change, and `di-framework platform destroy identity` on delete. |
 | `Mailpit` (`components/mailpit.ts`) | SMTP relay in `di-tenant-identity` on a fixed ClusterIP, plus the platform egress grant that lets the guest dial it. Skipped when `smtpHost` is set. |
@@ -57,17 +57,24 @@ A failure reports the log path, its last lines, and the CLI's error message.
 ## Tenant host image
 
 The identity component imports `wasi:tls`, which the stock `ghcr.io/wasmcloud/wash:2.8.0`
-host does not provide. The tenant host must run wash built with the `wasi-tls` feature. No
-registry publishes that image yet, so by default the program publishes your local build:
+host does not provide. The tenant host runs the platform repo's `platform/tenant-host` build
+instead: wash 2.8.0 with the `wasi-tls` feature and the Postgres invocation-lease patch,
+published as `ghcr.io/di-framework/wash:2.8.0-wasi-tls` for amd64 and arm64. The program
+pins it by digest with pull policy `IfNotPresent`. Set `tenantHostImage` to run a different
+pullable image.
+
+To try an unpublished host build, build it and name it in `tenantHostLocalImage`:
 
 ```sh
 # In the platform repo
 podman build -t localhost/di-framework/wash:2.8.0-wasi-tls platform/tenant-host
+# Here
+pulumi config set tenantHostLocalImage localhost/di-framework/wash:2.8.0-wasi-tls
 ```
 
-The node pulls it from `127.0.0.1:<registryNodePort>`, which Kubesolo's containerd allows
-over plain HTTP because it is a loopback address. On a cluster that can pull from a real
-registry, set `tenantHostImage` to that image instead, and nothing is published.
+The program publishes it to the in-cluster registry, and the node pulls it from
+`127.0.0.1:<registryNodePort>`, which Kubesolo's containerd allows over plain HTTP because it
+is a loopback address. Each rebuild rolls the host.
 
 ## Prerequisites
 
@@ -77,7 +84,7 @@ registry, set `tenantHostImage` to that image instead, and nothing is published.
   kube publishes builds for macOS and Linux on amd64 and arm64.
 - `kubectl` and `oras`, and the `di-framework` CLI with the platform extension. The
   program uses the repo's `node_modules/.bin/di-framework` when it exists.
-- Podman or Docker with the `wasi-tls` tenant host image, unless `tenantHostImage` is set.
+- With `tenantHostLocalImage`, Podman or Docker holding that image.
 
 ## Stack config
 
@@ -97,10 +104,10 @@ All keys are optional.
 | `registry` | unset | `{ push, pull }` of an external registry; skips the in-cluster one |
 | `registryForwardPort` | `25180` | Loopback port for pushes to the in-cluster registry |
 | `registryStorageClass` | cluster default | StorageClass for the in-cluster registry |
-| `registryNodePort` | `30500` | NodePort the node pulls the published tenant host image through |
-| `tenantHostImage` | unset | Node-pullable tenant host image; skips publishing a local one |
-| `tenantHostLocalImage` | `localhost/di-framework/wash:2.8.0-wasi-tls` | Local image published as the tenant host |
-| `containerEngine` | first of `podman`, `docker` that answers | Engine that holds the local image |
+| `tenantHostImage` | `ghcr.io/di-framework/wash:2.8.0-wasi-tls` by digest | Tenant host image the nodes pull |
+| `tenantHostLocalImage` | unset | Local engine image to publish and run as the tenant host instead |
+| `registryNodePort` | `30500` | NodePort the node pulls a published local host image through |
+| `containerEngine` | first of `podman`, `docker` that answers | Engine that holds `tenantHostLocalImage` |
 | `platformNamespace` | `wasmcloud` | Namespace kube installs the platform into |
 | `databaseDeletionPolicy` | `Retain` | `Delete` also removes the `directory` database's data on destroy |
 | `publicOrigin` | `url` output | identity's public origin |
@@ -184,9 +191,11 @@ literal `ip:port`. So Mailpit's Service has a fixed ClusterIP, kube puts
 
 - `latest` needs the GitHub API. When it fails, the program retries, then falls back to the
   newest cached kube release with a warning.
-- Changing the platform config right after a fresh install can race the platform controller
-  on the user token Secret (`di-user-<user>-<tenant>-token ... does not exist`). Run
-  `pulumi up` again; the platform README documents this.
+- Changing the platform config restarts the platform controller, which then recreates the
+  user token Secret. Until it does, kube fails with
+  `di-user-<user>-<tenant>-token ... does not exist`; that can take a few minutes. Wait for
+  the Secret in the platform namespace, then run `pulumi up` again. The platform README
+  documents this.
 - An interrupted `pulumi destroy` can leave `directory` deleting, held by a binding from the
   identity workload. Run `di-framework platform destroy identity --target identity`, then
   `pulumi up --refresh`.
