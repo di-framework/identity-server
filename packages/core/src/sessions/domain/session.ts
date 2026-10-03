@@ -1,3 +1,6 @@
+/** Browser session cookie (HttpOnly, `Secure` per settings, SameSite=Lax). */
+export const SESSION_COOKIE = 'identity_session';
+
 /** Session attribute names, kept from the auth server's servlet session. */
 export const SESSION_ATTRIBUTES = {
   pendingLink: 'GSIO_IDENTITY_LINK_PENDING_TOKEN',

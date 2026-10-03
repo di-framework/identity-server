@@ -24,6 +24,12 @@ try {
   process.exit(1);
 }
 
+IdentityModule.startNotificationWorker((error) =>
+  console.error(
+    `notification delivery failed: ${error instanceof Error ? error.message : 'unknown'}`,
+  ),
+);
+
 const assets = Bun.isStandaloneExecutable
   ? new URL('embedded/assets/', pathToFileURL(`${import.meta.dir}/`))
   : await buildClientAssets();

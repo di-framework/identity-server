@@ -6,9 +6,12 @@ import { PostgresAuthorizationRepository } from './authorization/infrastructure/
 import { PostgresRegisteredClientRepository } from './authorization/infrastructure/postgres-registered-client-repository.ts';
 import { BootstrapReconciler } from './bootstrap/application/bootstrap-reconciler.ts';
 import { PostgresDirectoryRepository } from './directory/infrastructure/postgres-directory-repository.ts';
+import { HttpIdentityProviderClient } from './linking/infrastructure/http-identity-provider-client.ts';
 import { PostgresLinkRepository } from './linking/infrastructure/postgres-link-repository.ts';
 import type { MailSender } from './mail/domain/mail.ts';
 import { SmtpMailSender, UnconfiguredMailSender } from './mail/infrastructure/smtp-mail-sender.ts';
+import { NotificationWorker } from './notifications/application/security-notifications.ts';
+import { PostgresNotificationRepository } from './notifications/infrastructure/postgres-notification-repository.ts';
 import { PostgresOAuthRepository } from './oauth/infrastructure/postgres-oauth-repository.ts';
 import { PostgresSessionRepository } from './sessions/infrastructure/postgres-session-repository.ts';
 import { systemClock } from './shared/domain/clock.ts';
@@ -19,9 +22,11 @@ import {
   CLOCK,
   DIRECTORY,
   IDENTITY_DATABASE,
+  IDENTITY_PROVIDERS,
   IDENTITY_SETTINGS,
   LINKS,
   MAIL,
+  NOTIFICATIONS,
   OAUTH,
   REGISTERED_CLIENTS,
   SESSIONS,
@@ -53,6 +58,8 @@ export class IdentityModule {
     IdentityModule.port(AUTHORIZATIONS, PostgresAuthorizationRepository);
     IdentityModule.port(SESSIONS, PostgresSessionRepository);
     IdentityModule.port(CHALLENGES, PostgresChallengeRepository);
+    IdentityModule.port(NOTIFICATIONS, PostgresNotificationRepository);
+    IdentityModule.port(IDENTITY_PROVIDERS, HttpIdentityProviderClient);
   }
 
   /** SMTP from settings, or a sender that always fails when no host is configured. */
@@ -92,6 +99,17 @@ export class IdentityModule {
     const container = useContainer();
     container.resolve(SIGNING_KEYS);
     await container.resolve(BootstrapReconciler).reconcile();
+  }
+
+  /** Starts the security-notification worker unless the settings disable it. */
+  static startNotificationWorker(
+    onError?: (error: unknown) => void,
+  ): NotificationWorker | undefined {
+    const { notifications } = IdentityModule.settings();
+    if (!notifications.schedulerEnabled) return undefined;
+    const worker = useContainer().resolve(NotificationWorker);
+    worker.start(notifications.fixedDelayMs, onError);
+    return worker;
   }
 
   /** Binds a port token to an adapter class. Exposed so other modules can add ports. */

@@ -4,10 +4,14 @@ import { Controller, json } from '@di-framework/http';
 import { AuditService } from '@di-framework/identity/src/audit/application/audit-service.ts';
 import '@di-framework/identity/src/composition.ts';
 import { DirectoryService } from '@di-framework/identity/src/directory/application/directory-service.ts';
-import { LinkService } from '@di-framework/identity/src/linking/application/link-service.ts';
+import {
+  type AccountCaller,
+  LinkService,
+} from '@di-framework/identity/src/linking/application/link-service.ts';
 import { OAuthService } from '@di-framework/identity/src/oauth/application/oauth-service.ts';
 import type { ServiceResult } from '@di-framework/identity/src/shared/domain/service-result.ts';
 import { AuthorizationEndpoints } from './authorization/endpoints.ts';
+import { AccountGuard } from './guards/account-guard.ts';
 import { apiAccess, BearerGuard } from './guards/bearer-guard.ts';
 import { RequestContext } from './guards/request-context.ts';
 import { OperationsEndpoints } from './operations/health.ts';
@@ -49,6 +53,19 @@ export class RequestValues {
   actor(): string {
     return RequestContext.current()?.principalName ?? 'system';
   }
+}
+
+/** The signed-in user behind an account route, from the request context. */
+function accountCaller(): AccountCaller | undefined {
+  const caller = RequestContext.current();
+  if (!caller) return undefined;
+  return caller.kind === 'session'
+    ? {
+        userId: caller.principalName,
+        sessionId: caller.sessionId,
+        lastAuthenticatedAt: caller.lastAuthenticatedAt,
+      }
+    : { userId: caller.principalName };
 }
 
 export class HttpResponse {
@@ -226,15 +243,13 @@ export class ControlPlaneController {
     );
   }
 
-  apiList(request: RouteRequest): Promise<ServiceResult<unknown>> {
-    return this.links.list(new RequestValues(request).header('x-user-id'));
+  apiList(): Promise<ServiceResult<unknown>> {
+    return this.links.list(accountCaller());
   }
 
   apiPrepareUnlink(request: RouteRequest): Promise<ServiceResult<unknown>> {
     const values = new RequestValues(request);
-    return this.links.prepare({
-      userId: values.header('x-user-id'),
-      sessionId: values.header('x-session-id'),
+    return this.links.prepare(accountCaller(), {
       issuer: values.query('issuer'),
       subject: values.query('subject'),
     });
@@ -242,9 +257,7 @@ export class ControlPlaneController {
 
   apiUnlink(request: RouteRequest): Promise<ServiceResult<unknown>> {
     const values = new RequestValues(request);
-    return this.links.unlink({
-      userId: values.header('x-user-id'),
-      sessionId: values.header('x-session-id'),
+    return this.links.unlink(accountCaller(), {
       issuer: values.query('issuer'),
       subject: values.query('subject'),
       confirmationToken: values.query('confirmationToken'),
@@ -258,6 +271,7 @@ export class ControlPlaneRouter {
     @Component(AuthorizationEndpoints) private readonly authorization: AuthorizationEndpoints,
     @Component(BearerGuard) private readonly bearer: BearerGuard,
     @Component(OperationsEndpoints) private readonly operations: OperationsEndpoints,
+    @Component(AccountGuard) private readonly account: AccountGuard,
   ) {}
 
   /** Paths this router owns: the JSON API, session-free OAuth 2 endpoints, health, readiness. */
@@ -276,6 +290,11 @@ export class ControlPlaneRouter {
     const access = apiAccess(request.method, pathname);
     if (access) {
       const caller = await this.bearer.authorize(request, access);
+      if (caller instanceof Response) return caller;
+      return RequestContext.run(caller, () => this.route(pathname, request));
+    }
+    if (pathname.startsWith('/api/v1/account')) {
+      const caller = await this.account.authorize(request);
       if (caller instanceof Response) return caller;
       return RequestContext.run(caller, () => this.route(pathname, request));
     }

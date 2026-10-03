@@ -43,6 +43,8 @@ export interface DirectoryRepository {
   transaction<T>(fn: () => Promise<T>): Promise<T>;
   listUsers(): Promise<UserAccount[]>;
   findUser(id: string): Promise<UserAccount | undefined>;
+  /** `findByIdForUpdate`: the user row with `FOR UPDATE`; call inside a transaction. */
+  lockUser(id: string): Promise<UserAccount | undefined>;
   insertUser(user: NewUser): Promise<void>;
   /** First user whose normalized email or normalized login matches, in any status. */
   findUserByEmailOrLogin(email: string, login: string): Promise<UserAccount | undefined>;
