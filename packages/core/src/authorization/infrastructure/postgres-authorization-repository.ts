@@ -130,6 +130,13 @@ export class PostgresAuthorizationRepository implements AuthorizationRepository 
     return row ? this.authorization(row) : undefined;
   }
 
+  async findByState(hash: string): Promise<Authorization | undefined> {
+    const row = await this.db.one<Row>(`SELECT * FROM oauth2_authorization WHERE state = ?`, [
+      hash,
+    ]);
+    return row ? this.authorization(row) : undefined;
+  }
+
   delete(id: string): Promise<void> {
     return this.db.write(`DELETE FROM oauth2_authorization WHERE id = ?`, [id]);
   }

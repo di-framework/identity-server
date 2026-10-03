@@ -55,6 +55,10 @@
         "@di-framework/identity-client": "workspace:*",
         "@di-framework/identity-migrations": "workspace:*",
       },
+      "devDependencies": {
+        "@di-framework/core": "^6.0.3",
+        "@di-framework/repo": "^6.0.3",
+      },
     },
     "examples/app": {
       "name": "@di-framework/identity-example",

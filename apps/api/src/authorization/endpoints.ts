@@ -1,4 +1,5 @@
 import { Component, Container } from '@di-framework/core/decorators';
+import { UserClaims } from '@di-framework/identity/src/authorization/application/claims.ts';
 import { ClientAuthenticator } from '@di-framework/identity/src/authorization/application/client-authenticator.ts';
 import { Introspector } from '@di-framework/identity/src/authorization/application/introspector.ts';
 import { ServerMetadata } from '@di-framework/identity/src/authorization/application/server-metadata.ts';
@@ -16,18 +17,19 @@ const NO_STORE = { 'cache-control': 'no-store', pragma: 'no-cache' };
 export class AuthorizationEndpoints {
   private readonly routes: Record<
     string,
-    { method: string; handle: (request: Request) => Promise<Response> }
+    { methods: string[]; handle: (request: Request) => Promise<Response> }
   > = {
-    '/oauth2/token': { method: 'POST', handle: (request) => this.token(request) },
-    '/oauth2/introspect': { method: 'POST', handle: (request) => this.introspect(request) },
-    '/oauth2/revoke': { method: 'POST', handle: (request) => this.revoke(request) },
-    '/oauth2/jwks': { method: 'GET', handle: async () => json(this.metadata.jwks()) },
+    '/oauth2/token': { methods: ['POST'], handle: (request) => this.token(request) },
+    '/oauth2/introspect': { methods: ['POST'], handle: (request) => this.introspect(request) },
+    '/oauth2/revoke': { methods: ['POST'], handle: (request) => this.revoke(request) },
+    '/oauth2/jwks': { methods: ['GET'], handle: async () => json(this.metadata.jwks()) },
+    '/userinfo': { methods: ['GET', 'POST'], handle: (request) => this.userinfo(request) },
     '/.well-known/openid-configuration': {
-      method: 'GET',
+      methods: ['GET'],
       handle: async () => json(this.metadata.openidConfiguration()),
     },
     '/.well-known/oauth-authorization-server': {
-      method: 'GET',
+      methods: ['GET'],
       handle: async () => json(this.metadata.authorizationServer()),
     },
   };
@@ -37,6 +39,7 @@ export class AuthorizationEndpoints {
     @Component(TokenService) private readonly tokens: TokenService,
     @Component(Introspector) private readonly introspector: Introspector,
     @Component(ServerMetadata) private readonly metadata: ServerMetadata,
+    @Component(UserClaims) private readonly claims: UserClaims,
   ) {}
 
   handles(pathname: string): boolean {
@@ -46,8 +49,8 @@ export class AuthorizationEndpoints {
   async fetch(request: Request): Promise<Response> {
     const route = this.routes[new URL(request.url).pathname];
     if (!route) return new Response(null, { status: 404 });
-    if (request.method !== route.method) {
-      return new Response(null, { status: 405, headers: { allow: route.method } });
+    if (!route.methods.includes(request.method)) {
+      return new Response(null, { status: 405, headers: { allow: route.methods.join(', ') } });
     }
     try {
       return await route.handle(request);
@@ -80,6 +83,23 @@ export class AuthorizationEndpoints {
     const client = await this.clients.authenticate(request.headers.get('authorization'), form);
     await this.introspector.revoke(client, this.required(form, 'token'));
     return new Response(null, { status: 200, headers: NO_STORE });
+  }
+
+  /** OIDC UserInfo for an access token with `openid` whose principal is an active user. */
+  private async userinfo(request: Request): Promise<Response> {
+    const match = /^Bearer\s+(\S+)$/i.exec(request.headers.get('authorization') ?? '');
+    const principal = match?.[1] ? await this.introspector.accessToken(match[1]) : undefined;
+    const invalid = { 'www-authenticate': 'Bearer error="invalid_token"' };
+    if (!principal) return new Response(null, { status: 401, headers: invalid });
+    if (!principal.scopes.includes('openid')) {
+      return new Response(null, {
+        status: 403,
+        headers: { 'www-authenticate': 'Bearer error="insufficient_scope", scope="openid"' },
+      });
+    }
+    const claims = await this.claims.forUser(principal.principalName);
+    if (!claims) return new Response(null, { status: 401, headers: invalid });
+    return json({ sub: principal.principalName, ...claims }, 200, NO_STORE);
   }
 
   private async form(request: Request): Promise<URLSearchParams> {
