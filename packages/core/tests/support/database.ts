@@ -15,16 +15,41 @@ export function databaseUrl(name: string): string {
   return localPostgresUrl.replace(/\/identity$/, `/${name}`);
 }
 
-/** Creates `identity_test` once per process, applies migrations, and connects the container. */
-export function useTestDatabase(): Promise<SqlDatabase> {
+/**
+ * Creates `identity_test` once per process, applies migrations, and connects the container.
+ * Every call reconnects it, so a file that used an isolated database hands the container back.
+ */
+export async function useTestDatabase(): Promise<SqlDatabase> {
   shared ??= (async () => {
     await recreate(testDatabaseName);
     const database = await openPostgresDatabase(databaseUrl(testDatabaseName));
     await applyMigrations(database);
-    IdentityModule.connect(database);
     return database;
   })();
-  return shared;
+  const database = await shared;
+  IdentityModule.connect(database);
+  return database;
+}
+
+/**
+ * Fresh migrated database connected to the container for one test file that needs an empty
+ * directory. `release` drops it and reconnects the shared database.
+ */
+export async function useIsolatedDatabase(
+  name: string,
+): Promise<{ database: SqlDatabase; release(): Promise<void> }> {
+  await recreate(name);
+  const database = await openPostgresDatabase(databaseUrl(name));
+  await applyMigrations(database);
+  IdentityModule.connect(database);
+  return {
+    database,
+    async release() {
+      await database.close?.();
+      await drop(name);
+      await useTestDatabase();
+    },
+  };
 }
 
 /** Runs `fn` against a fresh, unmigrated database that is dropped afterwards. */
