@@ -19,7 +19,6 @@ const REGISTRY_NODE_PORT = 30500;
 const HTTP_NODE_PORT = 30180;
 const namespaceName = 'wasmcloud';
 const tenantName = 'identity';
-const developerName = 'gsio';
 
 const config = new pulumi.Config();
 const host = config.require('sshHost');
@@ -75,19 +74,24 @@ const kubeconfigCommand = new command.remote.Command(
 );
 
 const originalCorefilePath = config.get('corednsOriginalCorefilePath');
-const corednsGsioBlock = new command.remote.Command(
-  'coredns-gsio-block',
-  {
-    connection,
-    ...dnsCommands({
-      stateDirectory: `${markerPath}.dns`,
-      originalCorefile: originalCorefilePath
-        ? fs.readFileSync(expandHome(originalCorefilePath), 'utf8')
-        : undefined,
-    }),
-  },
-  { dependsOn: [kubeconfigCommand] },
-);
+const dnsSinkZone = config.get('dnsSinkZone');
+const corednsSink =
+  dnsSinkZone === undefined
+    ? undefined
+    : new command.remote.Command(
+        'coredns-lan-sink',
+        {
+          connection,
+          ...dnsCommands({
+            stateDirectory: `${markerPath}.dns`,
+            zone: dnsSinkZone,
+            originalCorefile: originalCorefilePath
+              ? fs.readFileSync(expandHome(originalCorefilePath), 'utf8')
+              : undefined,
+          }),
+        },
+        { dependsOn: [kubeconfigCommand] },
+      );
 
 const kubeconfigContents = pulumi.secret(kubeconfigCommand.stdout);
 const kubeconfigFileCommand = writeKubeconfigFile(
@@ -106,7 +110,7 @@ const provider = new k8s.Provider(
     // them into this stack instead of failing create with AlreadyExists.
     upsertExistingObjects: true,
   },
-  { dependsOn: [kubeconfigCommand, corednsGsioBlock] },
+  { dependsOn: corednsSink ? [kubeconfigCommand, corednsSink] : [kubeconfigCommand] },
 );
 
 const apiServer = `https://${host}:${apiPort}`;
@@ -121,9 +125,8 @@ const platform = createPlatform({
   storageRoot: '/var/lib/k0s',
   networkPolicyEngine: 'existing',
   apiServer,
-  // Absolute NATS FQDNs (trailing dot). Pod search includes gsio.local and
-  // ndots:5, so nats.wasmcloud.svc.cluster.local resolves via LAN DNS to a
-  // stale nats.gsio.local address unless the name is absolute.
+  // Absolute NATS FQDNs (trailing dot). Pod search can include a LAN zone that
+  // still answers stale service names, so cluster names stay absolute.
   values: {
     global: {
       nats: {
@@ -152,6 +155,7 @@ const platform = createPlatform({
 if (platform.kubeconfigs === undefined) {
   throw new Error('createPlatform must export tenant kubeconfigs when apiServer is set');
 }
+const developerName = developerFor(config, tenantName);
 const tenantKubeconfig = pulumi.secret(
   platform.kubeconfigs.apply((all) => {
     const yaml = all[tenantName]?.[developerName];
@@ -220,6 +224,22 @@ function writeKubeconfigFile(
     },
     { dependsOn, additionalSecretOutputs: ['environment'] },
   );
+}
+
+function developerFor(configuration: pulumi.Config, tenant: string): string {
+  const users =
+    configuration.requireObject<
+      { name?: string; memberships?: { tenant?: string; role?: string }[] }[]
+    >('users');
+  const developer = users.find((user) =>
+    user.memberships?.some(
+      (membership) => membership.tenant === tenant && membership.role === 'developer',
+    ),
+  );
+  if (!developer?.name) {
+    throw new Error(`stack users must include a developer of tenant ${tenant}`);
+  }
+  return developer.name;
 }
 
 function hostPort(configuration: pulumi.Config, name: string, fallback: number): number {

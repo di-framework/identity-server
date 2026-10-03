@@ -90,7 +90,7 @@ That routes the existing control plane and browser app without new handlers:
 
 ## 5. SMTP
 
-`smtp-mail-sender.ts` no longer calls `Bun.connect`. The dialogue uses `node:net`. EHLO, AUTH, MAIL, RCPT, and DATA are unchanged. STARTTLS or implicit TLS fail closed when `wasi:tls` is not linked. This host image (`wash:2.8.0-tx-lease`) has no TLS provider, so the lab used plaintext SMTP. The destination host is the `SMTP_HOST` row, not a value compiled into the guest.
+`smtp-mail-sender.ts` no longer calls `Bun.connect`. The dialogue uses `node:net`. EHLO, AUTH, MAIL, RCPT, and DATA are unchanged. STARTTLS or implicit TLS fail closed when `wasi:tls` is not linked. The stock host image has no TLS provider, so plaintext SMTP is what works until the tenant host uses the `wasi-tls` image. The destination host is the `SMTP_HOST` row, not a value compiled into the guest.
 
 Egress is the `identity-egress` backing service. `allowedIpNameLookups` in `apps/guest/di-framework.config.json` lists the hosts the workload dials, and it is unset in this repo. Public IdP hostnames were left out of that list: DNS answers for those names changed often enough to reconcile the workload, roll the replica, and wipe in-memory bootstrap.
 
@@ -130,7 +130,7 @@ di-framework platform deploy identity --target identity
 
 That builds `apps/guest/dist/identity.wasm`, pushes it to `IDENTITY_REGISTRY_PUSH`, and updates `WorkloadDeployment/identity` in `di-tenant-identity`. No second Postgres service is created. Egress is limited to the hosts in `allowedIpNameLookups`.
 
-The deploy warns that the component imports `wasi:tls` and this host has no TLS provider. Plaintext SMTP still works. TLS to an identity provider will not until the host image includes `wasi-tls`.
+The deploy warns that the component imports `wasi:tls` when the tenant host is stock `ghcr.io/wasmcloud/wash:2.8.0`. That image is a default-features build, so its host world has no `wasi:tls/client@0.3.0-draft`. Plaintext SMTP still works. TLS needs the host built from `platform/platform/tenant-host` in the platform repo: `cargo build --features wasi-tls` on wasmCloud `v2.8.0`, which also applies the postgres invocation-lease patch. Tag it `di-framework/wash:2.8.0-wasi-tls`, push it where the node can pull it, and set stack config `tenantHostImage` (and `tenantHostImagePullPolicy`) to that reference. `createPlatform` otherwise defaults to `ghcr.io/wasmcloud/wash:2.8.0`. Nothing publishes the TLS image yet; a GHCR release needs maintainer approval.
 
 ## 9. What failed on the way to the proof
 

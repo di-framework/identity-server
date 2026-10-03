@@ -28,7 +28,8 @@ di-framework platform cluster up --yes
 
 ## Tenant
 
-Stack `dev` declares tenant `identity` and developer `gsio`. Workloads use
+Stack `dev` declares tenant `identity`. The developer kubeconfig is the `users`
+entry whose membership on that tenant has role `developer`. Workloads use
 `di-tenant-identity` and host group `tenant-identity`. The admin kubeconfig is
 `.kubeconfig-dev`. The developer kubeconfig is `.kubeconfig-dev-identity`.
 
@@ -40,12 +41,6 @@ That gateway rewrites the host to the workload name and forwards to
 `di-http` in `di-runtime-identity`. A host without the `.identity.localhost`
 suffix reaches the default host group instead.
 
-`deploy/postgres-probe` is the one-binding check for service `orders`.
-From the repo root:
-
-```sh
-di-framework platform deploy postgres-probe --target identity
-curl -X POST -H 'Host: postgres-probe.identity.localhost' \
-  -H 'Content-Type: application/json' \
-  "http://${GATEWAY_HOST}:${HTTP_PORT:-30180}/verify"
-```
+`dnsSinkZone`, when set, adds a CoreDNS zone that answers NXDOMAIN. Use it when
+pod search includes a LAN zone that still resolves stale cluster names. The
+zone is stack config, not a name compiled into this program.

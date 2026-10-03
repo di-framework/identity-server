@@ -1,3 +1,5 @@
+const DNS_NAME = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)+$/;
+
 /** Remote lifecycle commands, kept separate so they can be exercised without SSH. */
 export function shellQuote(value: string): string {
   return `'${value.replaceAll("'", "'\\''")}'`;
@@ -88,7 +90,13 @@ rm -f -- "$MARKER" "$MARKER.k0s.yaml"
   return { create, update: create, delete: remove };
 }
 
-export function dnsCommands(options: { stateDirectory: string; originalCorefile?: string }) {
+export function dnsCommands(options: {
+  stateDirectory: string;
+  zone: string;
+  originalCorefile?: string;
+}) {
+  if (!DNS_NAME.test(options.zone)) throw new Error('dnsSinkZone must be a dotted DNS name');
+  const zonePattern = options.zone.replaceAll('.', '\\.');
   const setup = `
 STATE=${shellQuote(options.stateDirectory)}
 mkdir -p "$STATE"
@@ -107,7 +115,7 @@ apply_corefile() {
   const recovery =
     options.originalCorefile === undefined
       ? `
-  if grep -q '^gsio\\.local:53 {' "$STATE/current"; then
+  if grep -q '^${zonePattern}:53 {' "$STATE/current"; then
     echo 'Legacy DNS override has no backup. Set corednsOriginalCorefilePath to the original Corefile before migrating.' >&2
     exit 1
   fi
@@ -128,7 +136,7 @@ elif [ -f "$STATE/applied" ] && ! cmp -s "$STATE/current" "$STATE/applied" && ! 
 fi
 # Preserve every existing zone and setting, adding only this LAN workaround.
 cat > "$STATE/next" <<'DI_DNS_BLOCK'
-gsio.local:53 {
+${options.zone}:53 {
     errors
     template ANY ANY {
         rcode NXDOMAIN

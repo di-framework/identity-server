@@ -1,5 +1,0 @@
-{
-  "name": "postgres-probe",
-  "entry": "src/app.ts",
-  "output": "dist/postgres-probe.wasm"
-}
