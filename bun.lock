@@ -28,6 +28,8 @@
     "apps/client": {
       "name": "@di-framework/identity-client",
       "dependencies": {
+        "@di-framework/core": "^6.0.3",
+        "@di-framework/identity": "workspace:*",
         "@patternfly/react-core": "6",
         "@patternfly/react-icons": "6",
         "@patternfly/react-table": "6",

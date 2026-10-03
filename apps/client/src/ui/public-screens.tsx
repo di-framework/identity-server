@@ -1,6 +1,6 @@
 import { ActionGroup, Button, Checkbox, Content, FormGroup } from '@patternfly/react-core';
 import { useState } from 'react';
-import type { PageModel } from '../domain/model.ts';
+import type { PageModel } from '../domain/page-model.ts';
 import { t } from '../i18n/messages.ts';
 import { AppPage, AuthPage, Notice, PageTitle, PostForm, TextField } from './chrome.tsx';
 
@@ -15,7 +15,7 @@ export function LoginScreen({ page }: { page: PageOf<'login'> }) {
         <TextField
           id="identifier"
           label={t('identifier')}
-          name="identifier"
+          name="username"
           value={identifier}
           onChange={setIdentifier}
           required
@@ -122,28 +122,30 @@ export function ConsentScreen({ page }: { page: PageOf<'consent'> }) {
   return (
     <AppPage page={page} layout="form">
       <PageTitle>{t('reviewAccess')}</PageTitle>
-      <Content component="p">{t('consentBody', { client: page.clientName })}</Content>
+      <Content component="p">{t('consentBody')}</Content>
       <PostForm action="/oauth2/authorize" csrf={page.csrf}>
         <input type="hidden" name="client_id" value={page.clientId} />
-        <input type="hidden" name="redirect_uri" value={page.redirectUri} />
-        <input type="hidden" name="scope" value="openid" />
-        <FormGroup label={t('scopes')} fieldId="scope-openid">
-          {page.scopes.map((scope) => (
-            <Checkbox
-              key={scope}
-              id={`scope-${scope}`}
-              name="scope"
-              value={scope}
-              label={scope}
-              isChecked={scopes.includes(scope)}
-              onChange={(_event, checked) => {
-                setScopes((current) =>
-                  checked ? [...current, scope] : current.filter((item) => item !== scope),
-                );
-              }}
-            />
-          ))}
-        </FormGroup>
+        {page.state !== null ? <input type="hidden" name="state" value={page.state} /> : null}
+        {page.openid ? <input type="hidden" name="scope" value="openid" /> : null}
+        {page.scopes.length > 0 ? (
+          <FormGroup label={t('scopes')} fieldId="consent-scopes" role="group">
+            {page.scopes.map((scope) => (
+              <Checkbox
+                key={scope}
+                id={`scope-${scope}`}
+                name="scope"
+                value={scope}
+                label={scope}
+                isChecked={scopes.includes(scope)}
+                onChange={(_event, checked) => {
+                  setScopes((current) =>
+                    checked ? [...current, scope] : current.filter((item) => item !== scope),
+                  );
+                }}
+              />
+            ))}
+          </FormGroup>
+        ) : null}
         <ActionGroup>
           <Button type="submit" variant="primary">
             {t('allow')}

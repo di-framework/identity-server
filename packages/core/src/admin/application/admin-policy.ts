@@ -20,7 +20,7 @@ export interface AuthorizationContext {
 
 /** HTML admin denial. The browser layer answers 403. */
 export class AdminAccessDenied extends Error {
-  constructor(capability: AdminCapability) {
+  constructor(readonly capability: AdminCapability) {
     super(`Access denied for capability ${capability}`);
     this.name = 'AdminAccessDenied';
   }

@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
-import type { PageModel } from '../domain/model.ts';
+import type { PageModel } from '../domain/page-model.ts';
 import { LinkConfirmScreen, LinksScreen, UnlinkConfirmScreen } from './account-screens.tsx';
-import { Denied, LinkUnavailable, LoadError, Loading, NotFound } from './chrome.tsx';
+import { Denied, ErrorPage, LinkUnavailable, LoadError, Loading, NotFound } from './chrome.tsx';
 import {
   AuditRecordScreen,
   AuditScreen,
@@ -26,11 +26,27 @@ import {
   PasswordScreen,
 } from './public-screens.tsx';
 
+declare global {
+  interface Window {
+    __IDENTITY_PAGE__?: PageModel;
+  }
+}
+
+/** The page model the server embedded in the HTML shell, used once on first render. */
+export function takeEmbeddedPage(): PageModel | null {
+  const embedded = typeof window === 'undefined' ? undefined : window.__IDENTITY_PAGE__;
+  if (!embedded) return null;
+  window.__IDENTITY_PAGE__ = undefined;
+  return embedded;
+}
+
 export function useResource(path: string, search: string, load: typeof globalThis.fetch) {
-  const [phase, setPhase] = useState<'loading' | 'error' | 'ready'>('loading');
-  const [page, setPage] = useState<PageModel | null>(null);
+  const [embedded] = useState(takeEmbeddedPage);
+  const [phase, setPhase] = useState<'loading' | 'error' | 'ready'>(embedded ? 'ready' : 'loading');
+  const [page, setPage] = useState<PageModel | null>(embedded);
   const [attempt, setAttempt] = useState(0);
   useEffect(() => {
+    if (embedded && attempt === 0) return;
     let active = true;
     setPhase('loading');
     load(`${path}${search}`, {
@@ -53,7 +69,7 @@ export function useResource(path: string, search: string, load: typeof globalThi
     return () => {
       active = false;
     };
-  }, [path, search, load, attempt]);
+  }, [path, search, load, attempt, embedded]);
   return { phase, page, retry: () => setAttempt((value) => value + 1) };
 }
 
@@ -76,7 +92,9 @@ export function Screen({ page }: { page: PageModel }) {
     case 'not-found':
       return <NotFound page={page} />;
     case 'link-unavailable':
-      return <LinkUnavailable page={page} />;
+      return <LinkUnavailable page={page} message={page.message} />;
+    case 'error':
+      return <ErrorPage page={page} title={page.title} message={page.message} />;
     case 'users':
       return <UsersScreen page={page} />;
     case 'invite':

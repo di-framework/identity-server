@@ -1,7 +1,7 @@
 import './dom.ts';
 import { afterEach, describe, expect, test } from 'bun:test';
 import { cleanup, render, screen } from '@testing-library/react';
-import type { PageModel } from '../domain/model.ts';
+import type { PageModel } from '../domain/page-model.ts';
 import { Screen } from './app.tsx';
 
 afterEach(() => {
@@ -22,7 +22,7 @@ describe('identity client accessibility', () => {
     expect(screen.getByRole('textbox', { name: /Email or login/ })).toBeTruthy();
     expect(screen.getByLabelText(/Password/)).toBeTruthy();
     expect(screen.getByRole('button', { name: 'Sign in' })).toBeTruthy();
-    expect(screen.getByRole('link', { name: 'Email sign-in' })).toBeTruthy();
+    expect(screen.getByRole('link', { name: 'Email me a sign-in link' })).toBeTruthy();
     expect(screen.queryByText(/signed out/i)).toBeNull();
     expect(document.querySelector('input[name="_csrf"]')).toBeTruthy();
   });
@@ -31,14 +31,18 @@ describe('identity client accessibility', () => {
     const page: PageModel = {
       page: 'consent',
       ...actor,
-      clientName: 'Acme web',
       clientId: 'cli_aaaaaaaaaaaaaaaa',
+      state: 'xyz',
       scopes: ['profile', 'email'],
-      redirectUri: 'https://acme.example/callback',
+      openid: true,
     };
     render(<Screen page={page} />);
     expect(screen.getByRole('heading', { name: 'Review access' })).toBeTruthy();
-    expect(screen.getByText('Acme web wants access to the identity.')).toBeTruthy();
+    expect(
+      screen.getByText('This application is requesting access to your GSIO identity.'),
+    ).toBeTruthy();
+    expect(screen.queryByText(/cli_aaaaaaaaaaaaaaaa/)).toBeNull();
+    expect(document.querySelector('input[name="state"][value="xyz"]')).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'Deny' })).toBeNull();
     expect(screen.getByRole('checkbox', { name: 'profile' })).toBeTruthy();
     expect(screen.getByRole('checkbox', { name: 'email' })).toBeTruthy();
@@ -72,9 +76,9 @@ describe('identity client accessibility', () => {
     render(<Screen page={empty} />);
     expect(screen.getByText('No users found')).toBeTruthy();
     cleanup();
-    const unavailable: PageModel = { page: 'link-unavailable', ...actor };
+    const unavailable: PageModel = { page: 'link-unavailable', ...actor, message: 'Gone.' };
     render(<Screen page={unavailable} />);
-    expect(screen.getByRole('heading', { name: 'Link unavailable' })).toBeTruthy();
+    expect(screen.getByRole('heading', { name: 'Link Unavailable' })).toBeTruthy();
   });
 
   test('password rejection is announced and the updated flag is not shown', () => {

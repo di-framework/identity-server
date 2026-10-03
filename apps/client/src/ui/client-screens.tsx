@@ -7,7 +7,7 @@ import {
   ToolbarItem,
 } from '@patternfly/react-core';
 import { useState } from 'react';
-import type { PageModel } from '../domain/model.ts';
+import type { PageModel } from '../domain/page-model.ts';
 import { formatTimestamp, t } from '../i18n/messages.ts';
 import {
   AppPage,
@@ -44,7 +44,7 @@ export function ClientsScreen({ page }: { page: PageOf<'clients'> }) {
             <SelectField
               id="client-organization"
               label={t('organization')}
-              name="organization"
+              name="orgSlug"
               value={organization}
               onChange={setOrganization}
               options={organizations}
@@ -113,7 +113,7 @@ export function RegisterClientScreen({ page }: { page: PageOf<'register-client'>
         <SelectField
           id="register-organization"
           label={t('organization')}
-          name="organization"
+          name="orgSlug"
           value={organization}
           onChange={setOrganization}
           options={page.organizations.map(orgOption)}
@@ -122,7 +122,7 @@ export function RegisterClientScreen({ page }: { page: PageOf<'register-client'>
         <TextField
           id="client-name"
           label={t('clientName')}
-          name="name"
+          name="clientName"
           value={name}
           onChange={setName}
           required
@@ -200,7 +200,7 @@ export function ClientScreen({ page }: { page: PageOf<'client'> }) {
           <TextField
             id="edit-name"
             label={t('clientName')}
-            name="name"
+            name="clientName"
             value={name}
             onChange={setName}
             required

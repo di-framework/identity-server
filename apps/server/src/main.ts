@@ -2,8 +2,6 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { IdentityModule } from '@di-framework/identity/src/composition.ts';
 import { applyMigrations } from '@di-framework/identity-migrations';
-import { systemClock } from '../../client/src/domain/clock.ts';
-import { createStore } from '../../client/src/domain/model.ts';
 import { routeRequest } from './serve.ts';
 
 const settings = IdentityModule.settings();
@@ -34,11 +32,10 @@ const assets = Bun.isStandaloneExecutable
   ? new URL('embedded/assets/', pathToFileURL(`${import.meta.dir}/`))
   : await buildClientAssets();
 
-const store = createStore(systemClock());
 const server = Bun.serve({
   hostname: settings.server.host,
   port: settings.server.port,
-  fetch: (request) => routeRequest(request, store, assets),
+  fetch: (request) => routeRequest(request, assets),
 });
 
 console.log(
