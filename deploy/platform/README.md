@@ -33,6 +33,14 @@ entry whose membership on that tenant has role `developer`. Workloads use
 `di-tenant-identity` and host group `tenant-identity`. The admin kubeconfig is
 `.kubeconfig-dev`. The developer kubeconfig is `.kubeconfig-dev-identity`.
 
+The host group runs `ghcr.io/di-framework/wash:2.8.0-wasi-tls` (`tenantHostImage`,
+pull policy `IfNotPresent`). That image is the platform `tenant-host` build
+(`--features wasi-tls`, including the postgres invocation-lease patch) and links
+`wasi:tls/client@0.3.0-draft`. `createPlatform` otherwise defaults to
+`ghcr.io/wasmcloud/wash:2.8.0`, which does not. The tag is pinned until
+platform#28 records a digest; then set `tenantHostImage` to `image@sha256:…`.
+Use `Always` only when overriding the image to a mutable local tag.
+
 PostgreSQL uses the cluster default StorageClass (`local-path` on this host).
 `createPlatform` seeds `postgres-dedicated` without its own `storageClassName`.
 

@@ -4,5 +4,12 @@ runtime:
   options:
     typescript: true
 description: Baremetal wasmCloud platform (k0s over SSH) on @di-framework/platform 6.0.5. Application resources are owned by the DI Framework CLI.
+config:
+  tenantHostImage:
+    description: Tenant host image. The wasi-tls wash build links wasi:tls/client@0.3.0-draft. Pin image@sha256:… when platform#28 records a digest.
+    default: ghcr.io/di-framework/wash:2.8.0-wasi-tls
+  tenantHostImagePullPolicy:
+    description: Pull policy for the tenant host image. Use Always only for a mutable local tag.
+    default: IfNotPresent
 backend:
   url: file://./.pulumi-state

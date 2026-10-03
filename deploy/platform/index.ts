@@ -20,7 +20,35 @@ const HTTP_NODE_PORT = 30180;
 const namespaceName = 'wasmcloud';
 const tenantName = 'identity';
 
-const config = new pulumi.Config();
+/**
+ * wash 2.8.0 built with `--features wasi-tls` (`platform/tenant-host`).
+ * Stock `ghcr.io/wasmcloud/wash:2.8.0` does not link `wasi:tls/client@0.3.0-draft`.
+ * Replace the tag with `image@sha256:…` when platform#28 records a digest.
+ * `Always` is only for a mutable local tag set in stack config.
+ */
+const TENANT_HOST_IMAGE = 'ghcr.io/di-framework/wash:2.8.0-wasi-tls';
+const TENANT_HOST_IMAGE_PULL_POLICY = 'IfNotPresent';
+
+/**
+ * `createPlatform` reads `tenantHostImage` from this config (`hostImage: config.get(...)`).
+ * Stack config overrides the pin; an unset key must not fall through to stock wash.
+ */
+class IdentityPlatformConfig extends pulumi.Config {
+  override get<K extends string = string>(
+    key: string,
+    opts?: pulumi.StringConfigOptions<K>,
+  ): K | undefined {
+    if (key === 'tenantHostImage') {
+      return (super.get(key, opts) ?? TENANT_HOST_IMAGE) as K;
+    }
+    if (key === 'tenantHostImagePullPolicy') {
+      return (super.get(key, opts) ?? TENANT_HOST_IMAGE_PULL_POLICY) as K;
+    }
+    return super.get(key, opts);
+  }
+}
+
+const config = new IdentityPlatformConfig();
 const host = config.require('sshHost');
 const user = config.require('sshUser');
 const sshPort = config.getNumber('sshPort') ?? 22;
