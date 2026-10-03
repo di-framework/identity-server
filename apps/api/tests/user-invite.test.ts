@@ -46,6 +46,20 @@ test('POST /api/admin/users mails a passwordless invite, and a replay does not m
   expect(challenge?.purpose).toBe('invite');
   expect((await create()).status).toBe(201);
   expect(mail.to(email)).toHaveLength(1);
+
+  const reader = await bearerFor((request) => controlPlane.fetch(request), ['admin:read']);
+  const audit = (await (
+    await controlPlane.fetch(
+      new Request('https://identity.test/api/admin/audit', {
+        headers: { authorization: `Bearer ${reader}` },
+      }),
+    )
+  ).json()) as Array<{ action: string; target: string; after_metadata: string }>;
+  const id = ((await created.json()) as { id: string }).id;
+  const record = audit.find(
+    (entry) => entry.action === 'admin.user_created' && entry.target === id,
+  );
+  expect(JSON.parse(record?.after_metadata ?? 'null')).toEqual({ status: 'pending' });
 });
 
 test('the invite is mailed only after the new account commits', async () => {

@@ -4,11 +4,12 @@
   "private": true,
   "license": "ISC",
   "dependencies": {
-    "@di-framework/identity-codegen": "workspace:*",
-    "@di-framework/identity-migrations": "workspace:*",
-    "@di-framework/identity": "workspace:*",
+    "@di-framework/authz": "^6.0.3",
     "@di-framework/core": "^6.0.3",
     "@di-framework/http": "^6.0.3",
+    "@di-framework/identity": "workspace:*",
+    "@di-framework/identity-codegen": "workspace:*",
+    "@di-framework/identity-migrations": "workspace:*",
     "@di-framework/repo": "^6.0.3"
   }
 }

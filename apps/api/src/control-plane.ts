@@ -8,7 +8,7 @@ import { LinkService } from '@di-framework/identity/src/linking/application/link
 import { OAuthService } from '@di-framework/identity/src/oauth/application/oauth-service.ts';
 import type { ServiceResult } from '@di-framework/identity/src/shared/domain/service-result.ts';
 import { AuthorizationEndpoints } from './authorization/endpoints.ts';
-import { BearerGuard, requiredScope } from './guards/bearer-guard.ts';
+import { apiAccess, BearerGuard } from './guards/bearer-guard.ts';
 import { RequestContext } from './guards/request-context.ts';
 import { OperationsEndpoints } from './operations/health.ts';
 
@@ -273,9 +273,9 @@ export class ControlPlaneRouter {
     const { pathname } = new URL(request.url);
     if (this.authorization.handles(pathname)) return this.authorization.fetch(request);
     if (this.operations.handles(pathname)) return this.operations.fetch(request);
-    const scope = requiredScope(request.method, pathname);
-    if (scope) {
-      const caller = await this.bearer.authorize(request, scope);
+    const access = apiAccess(request.method, pathname);
+    if (access) {
+      const caller = await this.bearer.authorize(request, access);
       if (caller instanceof Response) return caller;
       return RequestContext.run(caller, () => this.route(pathname, request));
     }

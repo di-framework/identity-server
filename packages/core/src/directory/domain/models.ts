@@ -19,7 +19,22 @@ export class Organization {
     readonly slug: string,
     readonly name: string,
     readonly createdAt: string,
+    /** `organizations.archived_at`, set only by the HTML admin. Not part of the JSON payload. */
+    readonly archivedAt: string | null = null,
   ) {}
+}
+
+/** A membership joined with its organization and user, for the HTML admin. */
+export interface MembershipDetail {
+  organizationId: string;
+  organizationSlug: string;
+  organizationName: string;
+  organizationArchivedAt: string | null;
+  userId: string;
+  userLogin: string;
+  userDisplayName: string;
+  userEmail: string | null;
+  role: string;
 }
 
 export class Membership {

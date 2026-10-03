@@ -22,7 +22,7 @@ export class PostgresAuditRepository implements AuditRepository {
     return this.db.write(
       `INSERT INTO auth_audit_records (
          id, action, actor_client_id, target, correlation_id, before_metadata, after_metadata
-       ) VALUES (?, ?, ?, ?, ?, ?::jsonb, ?::jsonb)`,
+       ) VALUES (?, ?, ?, ?, ?, ?::text::jsonb, ?::text::jsonb)`,
       [
         crypto.randomUUID(),
         entry.action,
@@ -55,18 +55,29 @@ export class PostgresAuditRepository implements AuditRepository {
        ORDER BY created_at DESC
        LIMIT 500`,
     );
-    return rows.map(
-      (row) =>
-        new AuditEntry(
-          String(row.id),
-          row.action,
-          row.actor_client_id,
-          row.target,
-          row.correlation_id,
-          row.before_metadata,
-          row.after_metadata,
-          Timestamps.iso(row.created_at),
-        ),
+    return rows.map((row) => this.entry(row));
+  }
+
+  async find(id: string): Promise<AuditEntry | undefined> {
+    const row = await this.db.one<AuditRow>(
+      `SELECT id::text AS id, action, actor_client_id, target, correlation_id,
+              before_metadata::text AS before_metadata, after_metadata::text AS after_metadata, created_at
+       FROM auth_audit_records WHERE id = ?`,
+      [id],
+    );
+    return row ? this.entry(row) : undefined;
+  }
+
+  private entry(row: AuditRow): AuditEntry {
+    return new AuditEntry(
+      String(row.id),
+      row.action,
+      row.actor_client_id,
+      row.target,
+      row.correlation_id,
+      row.before_metadata,
+      row.after_metadata,
+      Timestamps.iso(row.created_at),
     );
   }
 }

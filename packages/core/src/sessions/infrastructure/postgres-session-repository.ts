@@ -7,7 +7,7 @@ interface Row {
   user_id: string | null;
   csrf_token: string;
   last_authenticated_at: unknown;
-  attributes: Record<string, string> | string;
+  attributes: Record<string, string>;
   expires_at: unknown;
 }
 
@@ -19,7 +19,7 @@ export class PostgresSessionRepository implements SessionRepository {
     return this.db.write(
       `INSERT INTO browser_sessions (id, user_id, csrf_token, last_authenticated_at, attributes,
          created_at, last_seen_at, expires_at)
-       VALUES (?, ?, ?, ?, ?::jsonb, ?, ?, ?)`,
+       VALUES (?, ?, ?, ?, ?::text::jsonb, ?, ?, ?)`,
       [...this.values(session), new Date(now), new Date(now), new Date(session.expiresAt)],
     );
   }
@@ -37,7 +37,7 @@ export class PostgresSessionRepository implements SessionRepository {
       csrf: row.csrf_token,
       lastAuthenticatedAt:
         row.last_authenticated_at == null ? null : Timestamps.ms(row.last_authenticated_at),
-      attributes: typeof row.attributes === 'string' ? JSON.parse(row.attributes) : row.attributes,
+      attributes: row.attributes,
       expiresAt: Timestamps.ms(row.expires_at),
     };
   }
@@ -45,7 +45,7 @@ export class PostgresSessionRepository implements SessionRepository {
   update(session: BrowserSession, now: number): Promise<void> {
     return this.db.write(
       `UPDATE browser_sessions SET user_id = ?, csrf_token = ?, last_authenticated_at = ?,
-         attributes = ?::jsonb, last_seen_at = ?, expires_at = ?
+         attributes = ?::text::jsonb, last_seen_at = ?, expires_at = ?
        WHERE id = ?`,
       [...this.values(session).slice(1), new Date(now), new Date(session.expiresAt), session.id],
     );
@@ -54,7 +54,7 @@ export class PostgresSessionRepository implements SessionRepository {
   rename(oldId: string, session: BrowserSession, now: number): Promise<void> {
     return this.db.write(
       `UPDATE browser_sessions SET id = ?, user_id = ?, csrf_token = ?, last_authenticated_at = ?,
-         attributes = ?::jsonb, last_seen_at = ?, expires_at = ?
+         attributes = ?::text::jsonb, last_seen_at = ?, expires_at = ?
        WHERE id = ?`,
       [...this.values(session), new Date(now), new Date(session.expiresAt), oldId],
     );

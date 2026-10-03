@@ -7,7 +7,13 @@ import type {
   NewOrganization,
   NewUser,
 } from '../domain/directory-repository.ts';
-import { DirectoryMember, Membership, Organization, UserAccount } from '../domain/models.ts';
+import {
+  DirectoryMember,
+  Membership,
+  type MembershipDetail,
+  Organization,
+  UserAccount,
+} from '../domain/models.ts';
 
 interface UserRow {
   id: string;
@@ -26,7 +32,26 @@ interface OrganizationRow {
   slug: string;
   name: string;
   created_at: unknown;
+  archived_at: unknown;
 }
+
+interface MembershipRow {
+  organization_id: string;
+  slug: string;
+  name: string;
+  archived_at: unknown;
+  user_id: string;
+  login: string;
+  display_name: string;
+  email: string | null;
+  role: string;
+}
+
+const MEMBERSHIP_SELECT = `SELECT o.id::text AS organization_id, o.slug, o.name, o.archived_at,
+         u.id::text AS user_id, u.login, u.display_name, u.email, m.role
+  FROM organization_memberships m
+  JOIN organizations o ON o.id = m.organization_id
+  JOIN users u ON u.id = m.user_id`;
 
 interface MemberRow {
   id: string;
@@ -165,14 +190,14 @@ export class PostgresDirectoryRepository implements DirectoryRepository {
 
   async listOrganizations(): Promise<Organization[]> {
     const rows = await this.db.query<OrganizationRow>(
-      `SELECT id::text AS id, slug, name, created_at FROM organizations ORDER BY slug`,
+      `SELECT id::text AS id, slug, name, created_at, archived_at FROM organizations ORDER BY slug`,
     );
     return rows.map((row) => this.organization(row));
   }
 
   async findOrganization(slug: string): Promise<Organization | undefined> {
     const row = await this.db.one<OrganizationRow>(
-      `SELECT id::text AS id, slug, name, created_at FROM organizations WHERE slug = ?`,
+      `SELECT id::text AS id, slug, name, created_at, archived_at FROM organizations WHERE slug = ?`,
       [slug],
     );
     return row ? this.organization(row) : undefined;
@@ -256,6 +281,84 @@ export class PostgresDirectoryRepository implements DirectoryRepository {
     return rows.map((row) => this.member(row));
   }
 
+  async lockOrganization(slug: string): Promise<void> {
+    await this.db.query(`SELECT id::text AS id FROM organizations WHERE slug = ? FOR UPDATE`, [
+      slug,
+    ]);
+  }
+
+  async lockPlatformAdmins(): Promise<void> {
+    await this.db.query(
+      `SELECT pg_advisory_xact_lock(hashtextextended('platform_admins', 0))::text AS locked`,
+    );
+  }
+
+  async findOrganizationById(id: string): Promise<Organization | undefined> {
+    const row = await this.db.one<OrganizationRow>(
+      `SELECT id::text AS id, slug, name, created_at, archived_at FROM organizations WHERE id = ?`,
+      [id],
+    );
+    return row ? this.organization(row) : undefined;
+  }
+
+  archiveOrganization(slug: string, at: number): Promise<void> {
+    return this.db.write(`UPDATE organizations SET archived_at = ? WHERE slug = ?`, [
+      new Date(at),
+      slug,
+    ]);
+  }
+
+  async membershipsForUser(userId: string): Promise<MembershipDetail[]> {
+    const rows = await this.db.query<MembershipRow>(
+      `${MEMBERSHIP_SELECT} WHERE m.user_id = ? ORDER BY o.slug`,
+      [userId],
+    );
+    return rows.map((row) => this.membership(row));
+  }
+
+  async membershipsForOrganization(slug: string): Promise<MembershipDetail[]> {
+    const rows = await this.db.query<MembershipRow>(
+      `${MEMBERSHIP_SELECT} WHERE o.slug = ? ORDER BY u.login`,
+      [slug],
+    );
+    return rows.map((row) => this.membership(row));
+  }
+
+  async allMemberships(): Promise<MembershipDetail[]> {
+    const rows = await this.db.query<MembershipRow>(
+      `${MEMBERSHIP_SELECT} ORDER BY o.slug, u.login`,
+    );
+    return rows.map((row) => this.membership(row));
+  }
+
+  countOwners(slug: string): Promise<number> {
+    return this.db.count(
+      `SELECT count(*)::int AS count FROM organization_memberships m
+       JOIN organizations o ON o.id = m.organization_id WHERE o.slug = ? AND m.role = 'owner'`,
+      [slug],
+    );
+  }
+
+  countActivePlatformAdmins(): Promise<number> {
+    return this.db.count(
+      `SELECT count(*)::int AS count FROM users WHERE system_role = 'platform_admin' AND status = 'active'`,
+    );
+  }
+
+  private membership(row: MembershipRow): MembershipDetail {
+    return {
+      organizationId: row.organization_id,
+      organizationSlug: row.slug,
+      organizationName: row.name,
+      organizationArchivedAt: Timestamps.isoOrNull(row.archived_at),
+      userId: row.user_id,
+      userLogin: row.login,
+      userDisplayName: row.display_name,
+      userEmail: row.email,
+      role: row.role,
+    };
+  }
+
   private user(row: UserRow): UserAccount {
     return new UserAccount(
       String(row.id),
@@ -276,6 +379,7 @@ export class PostgresDirectoryRepository implements DirectoryRepository {
       String(row.slug),
       String(row.name),
       Timestamps.iso(row.created_at),
+      Timestamps.isoOrNull(row.archived_at),
     );
   }
 

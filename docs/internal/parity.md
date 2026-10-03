@@ -73,7 +73,7 @@ Auth-server renders these with kotlinx.html. This repository renders PatternFly 
 | OAuth clients | HTML registration assigns `cli_` plus 16 hex characters from a UUID, shows the secret once, and stores the typed name and grant types. | The register form sends the typed name as `clientId`. Grant types are not on the API. The API requires the caller to supply `clientId`. | Local |
 | Audit HTML | Filters by action, actor, target, and from/to. Owners see a row only when the target or the before/after metadata contains an owned organization slug. Detail outside that scope is denied. Sensitive metadata is redacted. Newest 500. | In-memory list and detail. API list has no filters and no owner scope. | Local |
 | Linked identities | Start redirects to an allowlisted OIDC provider (PKCE, nonce, `prompt=login`). Callback stages a pending link. Confirm writes `(issuer, subject)`. Unlink requires authentication within 15 minutes, a 5-minute session-bound confirmation, and a remaining sign-in method (password, verified email, or another link). Success revokes that account's access and refresh tokens. The current browser session stays. | List and unlink can call the API for a user that already exists in Postgres. Start, callback, and confirm stay in memory. Unlink does not revoke tokens. | Local |
-| Access rules | Active platform admin: every admin action. Owner: owned organizations only. Create organization, archive organization, and platform-admin management are platform-admin only. An inactive user is denied. A non-owner member has no admin pages. | Implemented against the in-memory store. API reads ignore the actor. | Local |
+| Access rules | Active platform admin: every admin action. Owner: owned organizations only. Create organization, archive organization, and platform-admin management are platform-admin only. An inactive user is denied. A non-owner member has no admin pages. | `AdminAccessPolicy` (a `@di-framework/authz` policy) and `AdminPolicy` in `packages/core/src/admin` implement the rules against Postgres, and the admin services enforce them. The browser pages still use the in-memory store. | Local |
 
 `apps/client/TODO.md` says the consent page names the client, and that organization rows show an active member count. Auth-server does neither. It also says every bad or expired email token shows "Link unavailable". That page is used for a malformed `GET` token. A failed consume uses the confirm form.
 
@@ -99,8 +99,8 @@ Auth-server renders these with kotlinx.html. This repository renders PatternFly 
 
 | Table | Written by this repository's services |
 | --- | --- |
-| `users`, `organizations`, `organization_memberships` | Yes. `users.system_role` and `organizations.archived_at` are not mapped. |
-| `auth_audit_records` | Yes. |
+| `users`, `organizations`, `organization_memberships` | Yes. `users.system_role` and `organizations.archived_at` are mapped and read by the HTML admin services; the JSON payloads still omit them. |
+| `auth_audit_records` | Yes. Metadata is stored as a JSON object (an earlier version stored a JSON string scalar). |
 | `oauth2_registered_client`, `oauth_client_lifecycle` | Yes. Admin registration writes both rows in one transaction, with client and token settings. |
 | `identity_links`, `identity_unlink_confirmations` | Yes, for list, prepare, and unlink. |
 | `email_challenges` | Yes, through `PasswordlessService`: issue (rate-limited per email and purpose), consume under a row lock, and delivery-failure consumption. |

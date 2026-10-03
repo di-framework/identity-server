@@ -88,6 +88,8 @@ export interface NewRegisteredClient {
 
 export interface RegisteredClientRepository {
   find(clientId: string): Promise<RegisteredClient | undefined>;
+  /** Clients with a lifecycle row, by client id; only one organization's when a slug is given. */
+  list(organizationSlug?: string): Promise<RegisteredClient[]>;
   findById(id: string): Promise<RegisteredClient | undefined>;
   insert(client: NewRegisteredClient): Promise<void>;
   /** Replaces metadata and, when `secretHash` is set, the secret. */
