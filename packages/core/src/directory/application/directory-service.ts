@@ -1,4 +1,8 @@
 import { Component, Container } from '@di-framework/core/decorators';
+import {
+  type Delivery,
+  PasswordlessService,
+} from '../../account/application/passwordless-service.ts';
 import type { AuditRepository } from '../../audit/domain/audit-entry.ts';
 import type { OAuthRepository } from '../../oauth/domain/oauth-client.ts';
 import { JsonBody } from '../../shared/application/json-body.ts';
@@ -26,6 +30,7 @@ export class DirectoryService {
     @Component(OAUTH) private readonly oauth: OAuthRepository,
     @Component(CursorCodec) private readonly cursors: CursorCodec,
     @Component(IDENTITY_SETTINGS) private readonly settings: IdentitySettings,
+    @Component(PasswordlessService) private readonly passwordless: PasswordlessService,
   ) {}
 
   async listUsers(): Promise<ServiceResult<ReturnType<DirectoryService['user']>[]>> {
@@ -49,11 +54,15 @@ export class DirectoryService {
     const displayName = body.text('displayName');
     if (!login || !email || !displayName) return new ServiceResult(400);
     try {
-      return await this.directory.transaction(async () => {
+      let deliver: Delivery | undefined;
+      const result = await this.directory.transaction(async () => {
         const replay = await this.replayUser(command.idempotencyKey, login, email, displayName);
         if (replay) return replay;
         const id = crypto.randomUUID();
         await this.directory.insertUser({ id, login, email, displayName });
+        deliver = await this.passwordless.invite(
+          new UserAccount(id, login, email, displayName, false, 'pending', null),
+        );
         await this.audit.append({
           action: 'admin.user_created',
           actor: command.actor,
@@ -63,6 +72,8 @@ export class DirectoryService {
         });
         return new ServiceResult(201, { id, status: 'pending' });
       });
+      await deliver?.();
+      return result;
     } catch (error) {
       return this.failed(error);
     }

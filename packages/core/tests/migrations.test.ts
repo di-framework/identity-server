@@ -28,6 +28,7 @@ test('discovers the reused Flyway migrations in version order', async () => {
     ['8', 'identity link flows'],
     ['9', 'identity unlink confirmations'],
     ['10', 'identity security notifications'],
+    ['11', 'browser sessions'],
   ]);
 });
 
@@ -46,6 +47,7 @@ test('applies the reused migrations and reads a user through UserRepository', as
       '8',
       '9',
       '10',
+      '11',
     ]);
 
     const again = await applyMigrations(db);

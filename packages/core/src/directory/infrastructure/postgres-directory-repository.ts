@@ -84,6 +84,25 @@ export class PostgresDirectoryRepository implements DirectoryRepository {
     return row ? this.user(row) : undefined;
   }
 
+  async findActiveByLoginOrEmail(identifier: string): Promise<UserAccount | undefined> {
+    const normalized = identifier.trim().toLowerCase();
+    const row = await this.db.one<UserRow>(
+      `SELECT ${USER_COLUMNS} FROM users
+       WHERE (normalized_login = ? OR normalized_email = ?) AND status = 'active'
+       ORDER BY created_at, id LIMIT 1`,
+      [normalized, normalized],
+    );
+    return row ? this.user(row) : undefined;
+  }
+
+  async findUserByEmail(email: string): Promise<UserAccount | undefined> {
+    const row = await this.db.one<UserRow>(
+      `SELECT ${USER_COLUMNS} FROM users WHERE normalized_email = ?`,
+      [email.trim().toLowerCase()],
+    );
+    return row ? this.user(row) : undefined;
+  }
+
   insertAccount(account: NewAccount): Promise<void> {
     return this.db.write(
       `INSERT INTO users (id, login, normalized_login, email, normalized_email, password_hash,

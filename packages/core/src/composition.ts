@@ -1,23 +1,30 @@
 import { useContainer } from '@di-framework/core/container';
 import type { SqlDatabase } from '@di-framework/repo';
+import { PostgresChallengeRepository } from './account/infrastructure/postgres-challenge-repository.ts';
 import { PostgresAuditRepository } from './audit/infrastructure/postgres-audit-repository.ts';
 import { PostgresAuthorizationRepository } from './authorization/infrastructure/postgres-authorization-repository.ts';
 import { PostgresRegisteredClientRepository } from './authorization/infrastructure/postgres-registered-client-repository.ts';
 import { BootstrapReconciler } from './bootstrap/application/bootstrap-reconciler.ts';
 import { PostgresDirectoryRepository } from './directory/infrastructure/postgres-directory-repository.ts';
 import { PostgresLinkRepository } from './linking/infrastructure/postgres-link-repository.ts';
+import type { MailSender } from './mail/domain/mail.ts';
+import { SmtpMailSender, UnconfiguredMailSender } from './mail/infrastructure/smtp-mail-sender.ts';
 import { PostgresOAuthRepository } from './oauth/infrastructure/postgres-oauth-repository.ts';
+import { PostgresSessionRepository } from './sessions/infrastructure/postgres-session-repository.ts';
 import { systemClock } from './shared/domain/clock.ts';
 import {
   AUDIT,
   AUTHORIZATIONS,
+  CHALLENGES,
   CLOCK,
   DIRECTORY,
   IDENTITY_DATABASE,
   IDENTITY_SETTINGS,
   LINKS,
+  MAIL,
   OAUTH,
   REGISTERED_CLIENTS,
+  SESSIONS,
   SIGNING_KEYS,
 } from './shared/domain/tokens.ts';
 import { SigningKeys } from './shared/infrastructure/crypto/signing-keys.ts';
@@ -37,12 +44,21 @@ export class IdentityModule {
       SigningKeys.load(container.resolve<IdentitySettings>(IDENTITY_SETTINGS).jwk),
     );
     container.registerFactory(CLOCK, () => systemClock());
+    container.registerFactory(MAIL, () => IdentityModule.mailSender(IdentityModule.settings()));
     IdentityModule.port(DIRECTORY, PostgresDirectoryRepository);
     IdentityModule.port(OAUTH, PostgresOAuthRepository);
     IdentityModule.port(AUDIT, PostgresAuditRepository);
     IdentityModule.port(LINKS, PostgresLinkRepository);
     IdentityModule.port(REGISTERED_CLIENTS, PostgresRegisteredClientRepository);
     IdentityModule.port(AUTHORIZATIONS, PostgresAuthorizationRepository);
+    IdentityModule.port(SESSIONS, PostgresSessionRepository);
+    IdentityModule.port(CHALLENGES, PostgresChallengeRepository);
+  }
+
+  /** SMTP from settings, or a sender that always fails when no host is configured. */
+  static mailSender(settings: IdentitySettings): MailSender {
+    if (!settings.smtp.host) return new UnconfiguredMailSender();
+    return new SmtpMailSender(settings.smtp);
   }
 
   /** Registers explicit settings, for a process that loaded them itself. */

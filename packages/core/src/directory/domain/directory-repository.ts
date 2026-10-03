@@ -40,6 +40,10 @@ export interface DirectoryRepository {
   insertUser(user: NewUser): Promise<void>;
   /** First user whose normalized email or normalized login matches, in any status. */
   findUserByEmailOrLogin(email: string, login: string): Promise<UserAccount | undefined>;
+  /** Active user whose normalized login or normalized email equals `identifier` (form login). */
+  findActiveByLoginOrEmail(identifier: string): Promise<UserAccount | undefined>;
+  /** User with this normalized email, in any status (passwordless request). */
+  findUserByEmail(email: string): Promise<UserAccount | undefined>;
   insertAccount(account: NewAccount): Promise<void>;
   updateAccount(id: string, changes: AccountChanges): Promise<void>;
   updateDisplayName(id: string, displayName: string): Promise<void>;
