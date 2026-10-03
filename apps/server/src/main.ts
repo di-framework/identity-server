@@ -1,11 +1,16 @@
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { useContainer } from '@di-framework/core/container';
 import { IdentityModule } from '@di-framework/identity/src/composition.ts';
+import { SIGNING_KEYS } from '@di-framework/identity/src/shared/domain/tokens.ts';
 import { applyMigrations } from '@di-framework/identity-migrations';
 import { systemClock } from '../../client/src/domain/clock.ts';
 import { createStore } from '../../client/src/domain/model.ts';
 import { routeRequest } from './serve.ts';
 
+const settings = IdentityModule.settings();
+// Fail closed: a missing or invalid AUTH_ACTIVE_PRIVATE_JWK stops startup.
+useContainer().resolve(SIGNING_KEYS);
 const database = await IdentityModule.connectFromConfig();
 const embeddedRoot = join(import.meta.dir, 'embedded');
 await applyMigrations(
@@ -18,16 +23,15 @@ const assets = Bun.isStandaloneExecutable
   : await buildClientAssets();
 
 const store = createStore(systemClock());
-const port = Number(process.env.PORT ?? 4180);
 const server = Bun.serve({
-  // TODO: This should be configurable via @di-framework/config
-  hostname: '0.0.0.0',
-  port,
+  hostname: settings.server.host,
+  port: settings.server.port,
   fetch: (request) => routeRequest(request, store, assets),
 });
 
-// TODO: This should be configurable via @di-framework/config
-console.log(`identity http://0.0.0.0:${server.port}`);
+console.log(
+  `identity listening on ${settings.server.host}:${server.port}, public origin ${settings.publicOrigin}`,
+);
 
 async function buildClientAssets(): Promise<URL> {
   const dist = new URL('../../client/dist/', import.meta.url);

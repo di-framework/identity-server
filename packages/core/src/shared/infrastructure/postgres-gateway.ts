@@ -1,12 +1,18 @@
-import { Component, Container } from '@di-framework/core/decorators';
+import { useContainer } from '@di-framework/core/container';
+import { Container } from '@di-framework/core/decorators';
 import type { SqlDatabase } from '@di-framework/repo';
 import { IdentityError } from '../domain/identity-error.ts';
 import { IDENTITY_DATABASE } from '../domain/tokens.ts';
 
-/** Shared Postgres access for infrastructure adapters. */
+/**
+ * Shared Postgres access for infrastructure adapters. The database is looked up on each call,
+ * so `IdentityModule.connect` can replace it after adapters were constructed.
+ */
 @Container()
 export class PostgresGateway {
-  constructor(@Component(IDENTITY_DATABASE) private readonly database: SqlDatabase) {}
+  private get database(): SqlDatabase {
+    return useContainer().resolve<SqlDatabase>(IDENTITY_DATABASE);
+  }
 
   query<T>(sql: string, params: unknown[] = []): Promise<T[]> {
     return this.database.query<T>(sql, params);
@@ -29,6 +35,7 @@ export class PostgresGateway {
     }
   }
 
+  /** Runs `fn` in one transaction. Statements issued inside it, at any depth, join it. */
   transaction<T>(fn: () => Promise<T>): Promise<T> {
     return this.database.transaction(async () => fn());
   }
@@ -40,8 +47,8 @@ export class PostgresGateway {
 
   isUnique(error: unknown): boolean {
     if (typeof error !== 'object' || error === null) return false;
-    const record = error as { code?: unknown; message?: unknown };
-    if (record.code === '23505') return true;
+    const record = error as { code?: unknown; errno?: unknown; message?: unknown };
+    if (record.code === '23505' || record.errno === '23505') return true;
     return typeof record.message === 'string' && record.message.includes('duplicate key');
   }
 }
@@ -51,5 +58,13 @@ export class Timestamps {
   static iso(value: unknown): string {
     const date = value instanceof Date ? value : new Date(String(value));
     return date.toISOString();
+  }
+
+  static ms(value: unknown): number {
+    return (value instanceof Date ? value : new Date(String(value))).getTime();
+  }
+
+  static isoOrNull(value: unknown): string | null {
+    return value == null ? null : Timestamps.iso(value);
   }
 }

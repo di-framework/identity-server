@@ -5,6 +5,7 @@ import { ClientSecrets } from '../../shared/domain/client-secrets.ts';
 import { IdentityError } from '../../shared/domain/identity-error.ts';
 import { ServiceResult } from '../../shared/domain/service-result.ts';
 import { AUDIT, OAUTH } from '../../shared/domain/tokens.ts';
+import { PasswordHasher } from '../../shared/infrastructure/crypto/passwords.ts';
 import { OAuthClient, type OAuthRepository } from '../domain/oauth-client.ts';
 
 interface Command {
@@ -19,6 +20,7 @@ export class OAuthService {
     @Component(OAUTH) private readonly oauth: OAuthRepository,
     @Component(AUDIT) private readonly audit: AuditRepository,
     @Component(ClientSecrets) private readonly secrets: ClientSecrets,
+    @Component(PasswordHasher) private readonly passwords: PasswordHasher,
   ) {}
 
   async list(): Promise<ServiceResult<ReturnType<OAuthService['response']>[]>> {
@@ -63,7 +65,7 @@ export class OAuthService {
         redirectUris,
         scopes,
         browser,
-        secretHash: this.secrets.hash(secret),
+        secretHash: await this.passwords.hash(secret),
       });
       await this.audit.append({
         action: 'admin.oauth_client_created',
@@ -123,7 +125,7 @@ export class OAuthService {
     if (!existing) return new ServiceResult(404);
     if (existing.revokedAt) return new ServiceResult(409);
     const secret = this.secrets.sign(command.idempotencyKey, `rotate:${clientId}:${version}`);
-    await this.oauth.rotateSecret(clientId, this.secrets.hash(secret));
+    await this.oauth.rotateSecret(clientId, await this.passwords.hash(secret));
     await this.audit.append({
       action: 'admin.oauth_client_secret_rotated',
       actor: command.actor,

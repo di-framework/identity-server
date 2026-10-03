@@ -1,6 +1,5 @@
 import { useContainer } from '@di-framework/core/container';
 import { Container } from '@di-framework/core/decorators';
-import { json } from '@di-framework/http';
 import { ControlPlaneController, HttpResponse, type RouteRequest } from './control-plane.ts';
 
 export interface HttpCall {
@@ -89,8 +88,8 @@ export class ControlPlaneHandlers {
       ) => Promise<{ status: number; body?: unknown }>;
       return HttpResponse.from(await method.call(controller, request));
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Request failed';
-      return json({ error: message }, { status: 500 });
+      console.error(`control-plane ${name} failed`, error);
+      return new Response(null, { status: 500 });
     }
   }
 }

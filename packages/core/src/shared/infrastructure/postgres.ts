@@ -1,12 +1,12 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
 import {
-  createSqlDatabase,
+  SQL_DATABASE_BRAND,
   type SqlAdapterOptions,
   type SqlDatabase,
-  type SqlDriver,
   SqlStorageAdapter,
   type StorageAdapter,
 } from '@di-framework/repo';
-import { type ReservedSQL, SQL } from 'bun';
+import { SQL } from 'bun';
 import { loadDatabaseConfig, localPostgresUrl } from './database-config.ts';
 
 export { localPostgresUrl };
@@ -41,34 +41,52 @@ export class PostgresChanges {
   }
 }
 
+type Handle = Pick<SQL, 'unsafe'>;
+
 /**
- * Opens one reserved Postgres session as a `SqlDatabase`.
- * `MigrationRunner` brackets each migration in BEGIN/COMMIT on that session.
+ * Opens a pooled Postgres database as a `SqlDatabase`.
+ *
+ * Statements outside a transaction take any pooled connection. `transaction(fn)` reserves one
+ * connection for `fn` through `SQL.begin`, and every statement issued in that async context,
+ * including nested `transaction` calls, runs on it. Row locks (`SELECT … FOR UPDATE`) therefore
+ * serialize concurrent requests, the notification worker, and bootstrap. `MigrationRunner`
+ * receives the transaction view it is handed, so migrations run on one connection as well.
  */
 export async function openPostgresDatabase(
   url: string = loadDatabaseConfig().url,
+  options: { max?: number } = {},
 ): Promise<SqlDatabase> {
-  const pool = new SQL({ url, adapter: 'postgres', max: 1 });
-  const reserved: ReservedSQL = await pool.reserve();
-  const driver: SqlDriver = {
-    async run(sql, params) {
-      const bound = toPostgresParams(sql, params);
-      return PostgresChanges.from(await reserved.unsafe(bound.text, [...bound.params]));
-    },
-    async query(sql, params) {
-      const bound = toPostgresParams(sql, params);
-      const rows = await reserved.unsafe(bound.text, [...bound.params]);
-      return [...rows] as Record<string, unknown>[];
-    },
-    async exec(sql) {
-      await reserved.unsafe(sql).simple();
-    },
-    close() {
-      reserved.release();
-      return pool.close();
-    },
+  const pool = new SQL({ url, adapter: 'postgres', max: options.max ?? 8 });
+  await pool.unsafe('SELECT 1');
+  const active = new AsyncLocalStorage<Handle>();
+  const view = (fixed?: Handle): SqlDatabase => {
+    const handle = (): Handle => fixed ?? active.getStore() ?? pool;
+    const database: SqlDatabase & { [SQL_DATABASE_BRAND]: true } = {
+      [SQL_DATABASE_BRAND]: true,
+      async run(sql, params = []) {
+        const bound = toPostgresParams(sql, params);
+        return PostgresChanges.from(await handle().unsafe(bound.text, [...bound.params]));
+      },
+      async query<T>(sql: string, params: unknown[] = []) {
+        const bound = toPostgresParams(sql, params);
+        return [...(await handle().unsafe(bound.text, [...bound.params]))] as T[];
+      },
+      async first<T>(sql: string, params: unknown[] = []) {
+        return ((await database.query<T>(sql, params))[0] ?? null) as T | null;
+      },
+      async exec(sql) {
+        await handle().unsafe(sql).simple();
+      },
+      async transaction<T>(fn: (db: SqlDatabase) => Promise<T>): Promise<T> {
+        const current = fixed ?? active.getStore();
+        if (current) return fn(view(current));
+        return (await pool.begin((tx) => active.run(tx, () => fn(view(tx))))) as T;
+      },
+      close: () => pool.close(),
+    };
+    return database;
   };
-  return createSqlDatabase(driver, { beginStatement: 'BEGIN' });
+  return view();
 }
 
 /**

@@ -1,45 +1,36 @@
-import { afterAll, expect, test } from 'bun:test';
+import { expect, spyOn, test } from 'bun:test';
 import { createHash } from 'node:crypto';
 import { useContainer } from '@di-framework/core/container';
-import { IdentityModule } from '@di-framework/identity/src/composition.ts';
-import {
-  localPostgresUrl,
-  openPostgresDatabase,
-} from '@di-framework/identity/src/shared/infrastructure/postgres.ts';
 import { PostgresGateway } from '@di-framework/identity/src/shared/infrastructure/postgres-gateway.ts';
-import { applyMigrations } from '@di-framework/identity-migrations';
-import type { SqlDatabase } from '@di-framework/repo';
+import { useTestDatabase } from '@di-framework/identity/tests/support/database.ts';
 import { ControlPlaneController, controlPlane, IdentityServer } from '../src/control-plane.ts';
-
-const databaseName = 'identity_control_test';
-let database: SqlDatabase | undefined;
-
-afterAll(async () => {
-  await database?.close?.();
-  const admin = await openPostgresDatabase(localPostgresUrl);
-  await admin.exec(`DROP DATABASE IF EXISTS ${databaseName} WITH (FORCE)`);
-  await admin.close?.();
-});
+import { ControlPlaneHandlers } from '../src/handlers.ts';
 
 test('unknown paths are not control-plane routes', async () => {
   const response = await controlPlane.fetch(new Request('https://identity.test/login'));
   expect(response.status).toBe(404);
 });
 
-test('reports a server error when the database is not connected', async () => {
-  const response = await controlPlane.fetch(new Request('https://identity.test/api/admin/users'));
+test('reports a server error with no body when an operation throws', async () => {
+  const logged = spyOn(console, 'error').mockImplementation(() => {});
+  const handlers = useContainer().resolve(ControlPlaneHandlers);
+  const failing = {
+    get(): string | null {
+      throw new Error('internal detail');
+    },
+  };
+  const response = await handlers.createUser(
+    {},
+    { transport: 'http', request: { headers: failing } },
+  );
   expect(response.status).toBe(500);
+  expect(await response.text()).toBe('');
+  expect(logged).toHaveBeenCalledWith('control-plane createUser failed', expect.any(Error));
+  logged.mockRestore();
 });
 
 test('serves the JSON control plane through application services', async () => {
-  const admin = await openPostgresDatabase(localPostgresUrl);
-  await admin.exec(`DROP DATABASE IF EXISTS ${databaseName} WITH (FORCE)`);
-  await admin.exec(`CREATE DATABASE ${databaseName}`);
-  await admin.close?.();
-  database = await IdentityModule.connectFromConfig({
-    DATABASE_URL: localPostgresUrl.replace(/\/identity$/, `/${databaseName}`),
-  });
-  await applyMigrations(database);
+  const database = await useTestDatabase();
 
   const gateway = useContainer().resolve(PostgresGateway);
   expect(gateway.isUnique(null)).toBe(false);
@@ -335,7 +326,8 @@ test('serves the JSON control plane through application services', async () => {
     `SELECT client_secret FROM oauth2_registered_client WHERE client_id = ?`,
     ['machine'],
   );
-  expect(stored[0]?.client_secret).toBe(createHash('sha256').update(machineSecret).digest('hex'));
+  expect(stored[0]?.client_secret).toStartWith('$argon2id$v=19$m=16384,t=2,p=1$');
+  expect(await Bun.password.verify(machineSecret, stored[0]?.client_secret ?? '')).toBe(true);
   expect((await call('GET', '/api/admin/oauth-clients')).body).toEqual(
     expect.arrayContaining([
       expect.objectContaining({ client_id: 'machine', browser: false, organization_slug: 'acme' }),
