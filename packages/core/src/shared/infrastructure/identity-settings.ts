@@ -1,7 +1,7 @@
 import { deepMerge, envSource } from '@di-framework/config';
 import { localPostgresUrl } from './database-config.ts';
 
-/** One allowlisted external OpenID provider (`gsio.identity-link.providers.<name>`). */
+/** One allowlisted external OpenID provider (`IDENTITY_IDENTITY_LINK__PROVIDERS`). */
 export interface ProviderSettings {
   issuer?: string;
   authorizationEndpoint?: string;

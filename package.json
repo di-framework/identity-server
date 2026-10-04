@@ -10,7 +10,7 @@
     "examples/app"
   ],
   "scripts": {
-    "postinstall": "git config core.hooksPath .githooks",
+    "postinstall": "git config core.hooksPath .githooks && bun apps/guest/scripts/embed-migrations.ts",
     "generate:api": "di-framework generate && bun apps/api/scripts/generate-openapi.ts",
     "generate:types": "bun packages/codegen/scripts/generate-oas-types.ts",
     "generate:client": "bun x openapi-typescript apps/api/api/v1/openapi.yaml -o apps/client/src/api/schema.d.ts",

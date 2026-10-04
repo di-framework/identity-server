@@ -65,9 +65,10 @@ export class PostgresSessionRepository implements SessionRepository {
   }
 
   async deleteExpired(now: number): Promise<number> {
-    const result = await this.db.run(`DELETE FROM browser_sessions WHERE expires_at <= ?`, [
-      new Date(now),
-    ]);
+    const result = await this.db.run(
+      `DELETE FROM browser_sessions WHERE expires_at <= ? RETURNING 1`,
+      [new Date(now)],
+    );
     return result.changes ?? 0;
   }
 

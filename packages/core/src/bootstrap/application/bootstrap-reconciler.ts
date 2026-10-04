@@ -46,6 +46,14 @@ export class BootstrapReconciler {
     return this.reconciled;
   }
 
+  /**
+   * Records bootstrap as done without hashing. The guest calls this when a fresh component
+   * realm finds the same secret fingerprint it stored after the last successful reconcile.
+   */
+  markComplete(): void {
+    this.reconciled = true;
+  }
+
   async reconcile(): Promise<void> {
     const { bootstrap, clients } = this.settings;
     const { owner, organization } = bootstrap;

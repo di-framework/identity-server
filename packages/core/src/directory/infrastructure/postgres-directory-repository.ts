@@ -258,7 +258,8 @@ export class PostgresDirectoryRepository implements DirectoryRepository {
     const result = await this.db.run(
       `DELETE FROM organization_memberships AS m
        USING organizations AS o
-       WHERE m.organization_id = o.id AND o.slug = ? AND m.user_id = ?`,
+       WHERE m.organization_id = o.id AND o.slug = ? AND m.user_id = ?
+       RETURNING 1`,
       [slug, userId],
     );
     return (result.changes ?? 0) > 0;

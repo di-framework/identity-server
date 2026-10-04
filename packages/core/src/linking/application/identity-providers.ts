@@ -20,7 +20,7 @@ export interface ResolvedProvider {
 const DEFAULT_SCOPES = ['openid', 'profile', 'email'];
 const DEFAULT_FRESH = 'prompt=login';
 
-/** Built-in providers used when `gsio.identity-link.providers.<name>` is not configured. */
+/** Built-in providers used when `IDENTITY_IDENTITY_LINK__PROVIDERS` does not name one. */
 const BUILT_IN: Record<string, Omit<ResolvedProvider, 'name' | 'clientId' | 'scopes'>> = {
   google: {
     issuer: 'https://accounts.google.com',

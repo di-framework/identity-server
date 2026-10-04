@@ -47,6 +47,15 @@
         "openapi-typescript": "^7.13.0",
       },
     },
+    "apps/guest": {
+      "name": "@di-framework/identity-guest",
+      "dependencies": {
+        "@di-framework/bindings": "6.0.5",
+        "@di-framework/core": "6.0.3",
+        "@di-framework/http": "6.0.3",
+        "@di-framework/repo": "6.0.4",
+      },
+    },
     "apps/server": {
       "name": "@di-framework/identity-server",
       "dependencies": {
@@ -83,6 +92,8 @@
         "@di-framework/core": "^6.0.3",
         "@di-framework/identity-migrations": "workspace:*",
         "@di-framework/repo": "^6.0.3",
+        "@noble/hashes": "^2.4.0",
+        "@noble/post-quantum": "^0.7.1",
       },
     },
     "packages/migrations": {
@@ -136,6 +147,8 @@
 
     "@di-framework/authz": ["@di-framework/authz@6.0.3", "", { "peerDependencies": { "@di-framework/auth": "^6", "@di-framework/core": "^6", "@di-framework/http": "^6", "typescript": "^5" }, "optionalPeers": ["@di-framework/http"] }, "sha512-9a2a0pqlIGHJlhNhd4/RjqShJMQbPymQW9YFNsNFRssHL8WNkyr5wv5IMG2/nJZ3JUFlaFcJBPwL0AI8tAEyDw=="],
 
+    "@di-framework/bindings": ["@di-framework/bindings@6.0.5", "", { "peerDependencies": { "@di-framework/core": "^5", "typescript": "^5" } }, "sha512-T937CXaAyDbDtus71M+AltdytFTLjtjUDds6gR1899xBxtkYUZKGF4k/Zknh2/CxGhJbaj6nlZqAh1STOTt7gw=="],
+
     "@di-framework/cli": ["@di-framework/cli@6.0.3", "", { "dependencies": { "@di-framework/cli-extension": "^6", "@di-framework/codegen": "^6", "bun": "^1.4.2" }, "peerDependencies": { "typescript": "^5" }, "bin": { "di-framework": "main.ts" } }, "sha512-0P0nnHwYAZjHj7XavQuo6XLnnN9IAu1zbYkJUF7zrOMQUV7XQK+cOhkPSS/gAm73WZNolFRN2dMknIDZge0B1g=="],
 
     "@di-framework/cli-extension": ["@di-framework/cli-extension@6.0.3", "", { "peerDependencies": { "typescript": "^5" } }, "sha512-kbqPOlDhr/BY+S7wloJMV2a++9wBIn4zr5X2iTRxQX5jU4bEiUISHlxlQHdt2h1QyAWTUddSQsP/uz3Od0nuog=="],
@@ -158,13 +171,15 @@
 
     "@di-framework/identity-example": ["@di-framework/identity-example@workspace:examples/app"],
 
+    "@di-framework/identity-guest": ["@di-framework/identity-guest@workspace:apps/guest"],
+
     "@di-framework/identity-migrations": ["@di-framework/identity-migrations@workspace:packages/migrations"],
 
     "@di-framework/identity-provider": ["@di-framework/identity-provider@workspace:packages/provider"],
 
     "@di-framework/identity-server": ["@di-framework/identity-server@workspace:apps/server"],
 
-    "@di-framework/repo": ["@di-framework/repo@6.0.3", "", { "peerDependencies": { "@di-framework/core": "^6", "typescript": "^5" } }, "sha512-Vz03efP9t3fF6FjVydaY08J6xWKrz5QywgGtzYeRmuo3nGMNTlpoTu9PY9wNVnQKwN86Fbptk16np7tSZDG/rQ=="],
+    "@di-framework/repo": ["@di-framework/repo@6.0.4", "", { "peerDependencies": { "@di-framework/core": "^6", "typescript": "^5" } }, "sha512-AFUsi9MruXxV1+aSjVDkjJpvUBeL4jptGauNlhlzp+HNKe94OXXOPW4XUfd4hPEMVoehUhi3Sqf6qBBgqo++OA=="],
 
     "@exodus/schemasafe": ["@exodus/schemasafe@1.3.0", "", {}, "sha512-5Aap/GaRupgNx/feGBwLLTVv8OQFfv3pq2lPRzPg9R+IOBnDgghTGW7l7EuVXOvg5cc/xSAlRW8rBrjIC3Nvqw=="],
 
@@ -187,6 +202,14 @@
     "@jsep-plugin/regex": ["@jsep-plugin/regex@1.0.4", "", { "peerDependencies": { "jsep": "^0.4.0||^1.0.0" } }, "sha512-q7qL4Mgjs1vByCaTnDFcBnV9HS7GVPJX5vyVoCgZHNSC9rjwIlmbXG5sUuorR5ndfHAIlJ8pVStxvjXHbNvtUg=="],
 
     "@logdna/tail-file": ["@logdna/tail-file@2.2.0", "", {}, "sha512-XGSsWDweP80Fks16lwkAUIr54ICyBs6PsI4mpfTLQaWgEJRtY9xEV+PeyDpJ+sJEGZxqINlpmAwe/6tS1pP8Ng=="],
+
+    "@noble/ciphers": ["@noble/ciphers@2.4.0", "", {}, "sha512-AnjFn0Jv92laAkvMrghlFZq4qQCIN/4DxFV/eooqtC2YTjB7kBeLMS2T9KJX4Dn+ZVXLOwK0lSgqDtx9gvxtiw=="],
+
+    "@noble/curves": ["@noble/curves@2.4.0", "", { "dependencies": { "@noble/hashes": "2.4.0" } }, "sha512-P4/62zrgfH33CneE3Dn4WhJVA22YUU0eR51wKIan4NVRvwsA0YnPTwWGpNbpuacSujmSFLvyzpyuR30+fbq2Ew=="],
+
+    "@noble/hashes": ["@noble/hashes@2.4.0", "", {}, "sha512-X5XaVWZIBCT7HHZGm5I7ZQXDwLG+bGXuSrMQAW+7Zvl87h1kmc1ZB1VSRJcpUfoUrGQp4Fkoxm5kZ+Ms+aW+eA=="],
+
+    "@noble/post-quantum": ["@noble/post-quantum@0.7.1", "", { "dependencies": { "@noble/ciphers": "2.4.0", "@noble/curves": "2.4.0", "@noble/hashes": "2.4.0" } }, "sha512-+P9981IiAnVh+rmcubozzVwrEy3XsN/tMhTnvsjV9VDaYpOnNCqWqKo2FLWxbu92YHfjGIlE5XnW175UK+ln+Q=="],
 
     "@npmcli/agent": ["@npmcli/agent@4.0.2", "", { "dependencies": { "agent-base": "^7.1.0", "http-proxy-agent": "^7.0.0", "https-proxy-agent": "^7.0.1", "lru-cache": "^11.2.1", "socks-proxy-agent": "^8.0.3" } }, "sha512-EUEuWAxnL07Sp5/iC/1X6Xj+XThUvnbei9zfRWZdEXa7lss9RTHMhAHBeg+MZ5To9s/gGaSI+UwZTPdYMvKSeg=="],
 

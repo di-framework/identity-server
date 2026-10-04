@@ -1,4 +1,4 @@
-import type { Socket } from 'bun';
+import net, { type Socket } from 'node:net';
 import type { MailMessage, MailSender } from '../domain/mail.ts';
 
 export interface SmtpOptions {
@@ -36,7 +36,37 @@ interface Reply {
   lines: string[];
 }
 
-/** Minimal RFC 5321 client on `Bun.connect`: EHLO, STARTTLS, AUTH, MAIL, RCPT, DATA, QUIT. */
+type TlsConnect = (options: {
+  host?: string;
+  port?: number;
+  servername?: string;
+  socket?: Socket;
+  rejectUnauthorized?: boolean;
+  ca?: string;
+}) => Socket;
+
+/**
+ * `node:tls` when the host linked it. A variable specifier keeps the guest bundle from importing
+ * `wasi:tls` until a relay actually asks for TLS; a host without that link fails the send.
+ */
+export async function loadSmtpTls(
+  load: () => Promise<{ connect: TlsConnect }> = loadNodeTls,
+): Promise<{ connect: TlsConnect }> {
+  try {
+    const loaded = await load();
+    if (typeof loaded.connect !== 'function') throw new Error('missing connect');
+    return loaded;
+  } catch {
+    throw new SmtpError('SMTP TLS is not available');
+  }
+}
+
+async function loadNodeTls(): Promise<{ connect: TlsConnect }> {
+  const specifier = 'node:tls';
+  return (await import(specifier)) as { connect: TlsConnect };
+}
+
+/** Minimal RFC 5321 client on `node:net`: EHLO, STARTTLS, AUTH, MAIL, RCPT, DATA, QUIT. */
 export class SmtpMailSender implements MailSender {
   constructor(private readonly options: SmtpOptions) {}
 
@@ -88,54 +118,20 @@ class SmtpSession {
   private buffer = '';
   private waiting: ((reply: Reply | Error) => void) | undefined;
   private failure: Error | undefined;
-  private active: Socket<undefined>;
-  private capabilities: string[] = [];
-  /** Bumped on STARTTLS so the raw socket's handlers stop feeding replies. */
-  private generation = 0;
+  private active: Socket;
 
   private constructor(
     private readonly options: SmtpOptions,
-    socket: Socket<undefined>,
+    socket: Socket,
   ) {
     this.active = socket;
   }
 
   static async open(options: SmtpOptions): Promise<SmtpSession> {
-    let session: SmtpSession | undefined;
-    const handlers = SmtpSession.handlers(() => session, 0);
-    const socket = await Bun.connect({
-      hostname: options.host,
-      port: options.port,
-      socket: handlers,
-      ...(options.ssl ? { tls: SmtpSession.tlsOptions(options) } : {}),
-    }).catch(() => {
-      throw new SmtpError('SMTP connection failed');
-    });
-    session = new SmtpSession(options, socket);
+    const socket = options.ssl ? await connectTls(options) : await connectPlain(options);
+    const session = new SmtpSession(options, socket);
+    session.watch(socket);
     return session;
-  }
-
-  private static tlsOptions(options: SmtpOptions) {
-    return {
-      serverName: options.host,
-      rejectUnauthorized: options.tls?.rejectUnauthorized ?? true,
-      ...(options.tls?.ca ? { ca: options.tls.ca } : {}),
-    };
-  }
-
-  private static handlers(current: () => SmtpSession | undefined, generation: number) {
-    const live = () => {
-      const session = current();
-      return session && session.generation === generation ? session : undefined;
-    };
-    const lost = () => live()?.fail(new SmtpError('SMTP connection closed'));
-    return {
-      data(_socket: Socket<undefined>, chunk: Buffer) {
-        live()?.receive(chunk.toString('utf8'));
-      },
-      close: lost,
-      error: lost,
-    };
   }
 
   async deliver(message: MailMessage): Promise<void> {
@@ -167,6 +163,8 @@ class SmtpSession {
     this.capabilities = reply.lines.slice(1).map((line) => line.toUpperCase());
   }
 
+  private capabilities: string[] = [];
+
   private offers(extension: string): boolean {
     return this.capabilities.some((line) => line === extension || line.startsWith(`${extension} `));
   }
@@ -184,27 +182,59 @@ class SmtpSession {
     await this.command(Buffer.from(password, 'utf8').toString('base64'), [235]);
   }
 
-  private upgrade(): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const session = this;
-      this.generation += 1;
-      this.buffer = '';
-      const result = this.active.upgradeTLS({
-        tls: SmtpSession.tlsOptions(this.options),
-        socket: {
-          ...SmtpSession.handlers(() => session, this.generation),
-          handshake(_socket, success, authorizationError) {
-            const verify = session.options.tls?.rejectUnauthorized ?? true;
-            if (!success || (verify && authorizationError)) {
-              reject(new SmtpError('SMTP TLS handshake failed'));
-              return;
-            }
-            resolve();
-          },
-        },
-      }) as unknown as [Socket<undefined>, Socket<undefined>];
-      this.active = result[1];
+  private async upgrade(): Promise<void> {
+    const tls = await loadSmtpTls();
+    this.unwatch(this.active);
+    // Bytes after the 220 arrived in plaintext; read as TLS replies they would let anyone on
+    // the path forge the post-upgrade EHLO (STARTTLS response injection).
+    if (this.buffer !== '') throw new SmtpError('SMTP server sent data before TLS');
+    const secure = await new Promise<Socket>((resolve, reject) => {
+      let settled = false;
+      const socket = tls.connect({
+        socket: this.active,
+        ...tlsName(this.options.host),
+        rejectUnauthorized: this.options.tls?.rejectUnauthorized ?? true,
+        ...(this.options.tls?.ca ? { ca: this.options.tls.ca } : {}),
+      });
+      const fail = () => {
+        if (settled) return;
+        settled = true;
+        reject(new SmtpError('SMTP TLS handshake failed'));
+      };
+      socket.once('error', fail);
+      socket.once('secureConnect', () => {
+        if (settled) return;
+        const verify = this.options.tls?.rejectUnauthorized ?? true;
+        const authorized = !('authorized' in socket) || socket.authorized !== false;
+        if (verify && !authorized) {
+          fail();
+          return;
+        }
+        settled = true;
+        socket.removeAllListeners('error');
+        resolve(socket);
+      });
     });
+    this.active = secure;
+    this.watch(secure);
+  }
+
+  private watch(socket: Socket): void {
+    const lost = () => this.fail(new SmtpError('SMTP connection closed'));
+    socket.on('data', (chunk: Buffer | string) => {
+      this.receive(typeof chunk === 'string' ? chunk : chunk.toString('utf8'));
+    });
+    socket.on('end', lost);
+    socket.on('close', lost);
+    socket.on('error', lost);
+  }
+
+  private unwatch(socket: Socket): void {
+    socket.removeAllListeners('data');
+    socket.removeAllListeners('end');
+    socket.removeAllListeners('close');
+    socket.removeAllListeners('error');
+    socket.on('error', () => undefined);
   }
 
   private async command(line: string, codes: number[]): Promise<Reply> {
@@ -274,6 +304,65 @@ class SmtpSession {
       this.release();
     });
   }
+}
+
+/** Node rejects an IP address as a TLS server name; the certificate's IP SAN is checked instead. */
+function tlsName(host: string): { servername?: string } {
+  return net.isIP(host) ? {} : { servername: host };
+}
+
+function connectPlain(options: SmtpOptions): Promise<Socket> {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect({ host: options.host, port: options.port });
+    const fail = () => {
+      socket.destroy();
+      reject(new SmtpError('SMTP connection failed'));
+    };
+    socket.once('error', fail);
+    socket.once('connect', () => {
+      socket.off('error', fail);
+      resolve(socket);
+    });
+  });
+}
+
+async function connectTls(options: SmtpOptions): Promise<Socket> {
+  const tls = await loadSmtpTls();
+  const verify = options.tls?.rejectUnauthorized ?? true;
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const socket = tls.connect({
+      host: options.host,
+      port: options.port,
+      ...tlsName(options.host),
+      rejectUnauthorized: verify,
+      ...(options.tls?.ca ? { ca: options.tls.ca } : {}),
+    });
+    const fail = (message: string) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      reject(new SmtpError(message));
+    };
+    socket.once('error', (error: NodeJS.ErrnoException) => {
+      const refused =
+        error?.code === 'ECONNREFUSED' ||
+        error?.code === 'ENOTFOUND' ||
+        error?.code === 'EAI_AGAIN';
+      fail(refused ? 'SMTP connection failed' : 'SMTP TLS handshake failed');
+    });
+    socket.once('secureConnect', () => {
+      const authorized = !('authorized' in socket) || socket.authorized !== false;
+      if (verify && !authorized) {
+        fail('SMTP TLS handshake failed');
+        return;
+      }
+      if (settled) return;
+      settled = true;
+      socket.removeAllListeners('error');
+      resolve(socket);
+    });
+  });
 }
 
 /** Mail port used when no SMTP host is configured. Every send fails, as an unreachable relay would. */

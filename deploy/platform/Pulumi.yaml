@@ -1,0 +1,9 @@
+name: identity-platform
+runtime:
+  name: nodejs
+  options:
+    typescript: true
+    packagemanager: bun
+description: Identity on wasmCloud end to end. A di-framework-kube instance with @di-framework/platform, the component registry, and the identity workload.
+backend:
+  url: file://./.pulumi-state

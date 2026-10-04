@@ -35,7 +35,8 @@ export class PostgresNotificationRepository implements NotificationRepository {
          provider_name, issuer, identity_hint, correlation_id, status, attempts, next_attempt_at,
          created_at, sent_at, last_error)
        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT (event_key) DO NOTHING`,
+       ON CONFLICT (event_key) DO NOTHING
+       RETURNING 1`,
       [
         n.id,
         n.eventKey,

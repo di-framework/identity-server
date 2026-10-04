@@ -1,0 +1,12 @@
+{
+  "name": "@di-framework/identity-guest",
+  "private": true,
+  "type": "module",
+  "license": "ISC",
+  "dependencies": {
+    "@di-framework/bindings": "6.0.5",
+    "@di-framework/core": "6.0.3",
+    "@di-framework/http": "6.0.3",
+    "@di-framework/repo": "6.0.4"
+  }
+}

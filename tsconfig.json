@@ -12,6 +12,7 @@
 
     // Bundler mode
     "moduleResolution": "bundler",
+    "resolveJsonModule": true,
     "allowImportingTsExtensions": true,
     "verbatimModuleSyntax": true,
     "noEmit": true,
@@ -28,5 +29,5 @@
     "noUnusedParameters": false,
     "noPropertyAccessFromIndexSignature": false
   },
-  "exclude": ["apps/client", "node_modules", "dist", "coverage"]
+  "exclude": ["apps/client", "deploy/platform", "node_modules", "dist", "coverage"]
 }

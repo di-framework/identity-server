@@ -1,0 +1,14 @@
+# Deployment topology only. Project identity comes from each
+# di-framework.config.json `name` — this file has no `apps` table.
+default-target = "identity"
+
+# The deploy/platform Pulumi program deploys through this target and sets these
+# variables from its kube instance and registry. `insecure` follows the push URL.
+[targets.identity]
+kubeconfig = "${IDENTITY_KUBECONFIG}"
+context = "${IDENTITY_KUBE_CONTEXT}"
+tenant = "identity"
+
+[targets.identity.registry]
+push = "${IDENTITY_REGISTRY_PUSH}"
+pull = "${IDENTITY_REGISTRY_PULL}"

@@ -1,5 +1,6 @@
 [test]
 preload = [
+  "./apps/guest/scripts/embed-migrations.ts",
   "./packages/core/tests/support/preload.ts",
   "./apps/api/scripts/generate-openapi.ts",
   "./apps/client/src/ui/dom.ts",

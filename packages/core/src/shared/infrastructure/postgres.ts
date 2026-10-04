@@ -6,8 +6,20 @@ import {
   SqlStorageAdapter,
   type StorageAdapter,
 } from '@di-framework/repo';
-import { SQL } from 'bun';
 import { loadDatabaseConfig, localPostgresUrl } from './database-config.ts';
+
+interface QueryResult extends Promise<Iterable<unknown>> {
+  simple(): Promise<unknown>;
+}
+
+interface SqlHandle {
+  unsafe(query: string, params?: readonly unknown[]): QueryResult;
+}
+
+interface BunPool extends SqlHandle {
+  begin<T>(fn: (tx: SqlHandle) => Promise<T>): Promise<T>;
+  close(): void | Promise<void>;
+}
 
 export { localPostgresUrl };
 
@@ -41,8 +53,6 @@ export class PostgresChanges {
   }
 }
 
-type Handle = Pick<SQL, 'unsafe'>;
-
 /**
  * Opens a pooled Postgres database as a `SqlDatabase`.
  *
@@ -56,11 +66,17 @@ export async function openPostgresDatabase(
   url: string = loadDatabaseConfig().url,
   options: { max?: number } = {},
 ): Promise<SqlDatabase> {
+  // A variable specifier keeps `bun` out of the guest bundle. The Wasm component
+  // never opens this pool; it uses the wasmCloud Postgres binding instead.
+  const specifier = 'bun';
+  const { SQL } = (await import(specifier)) as {
+    SQL: new (options: { url: string; adapter: 'postgres'; max: number }) => BunPool;
+  };
   const pool = new SQL({ url, adapter: 'postgres', max: options.max ?? 8 });
   await pool.unsafe('SELECT 1');
-  const active = new AsyncLocalStorage<Handle>();
-  const view = (fixed?: Handle): SqlDatabase => {
-    const handle = (): Handle => fixed ?? active.getStore() ?? pool;
+  const active = new AsyncLocalStorage<SqlHandle>();
+  const view = (fixed?: SqlHandle): SqlDatabase => {
+    const handle = (): SqlHandle => fixed ?? active.getStore() ?? pool;
     const database: SqlDatabase & { [SQL_DATABASE_BRAND]: true } = {
       [SQL_DATABASE_BRAND]: true,
       async run(sql, params = []) {
