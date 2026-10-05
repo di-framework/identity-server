@@ -96,7 +96,7 @@ const registryForwardPort =
  * GHCR for amd64 and arm64; the host runs it pinned by digest.
  */
 const PUBLISHED_HOST_IMAGE =
-  'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:efdf31f04edeca4f5f852b2ae4c91743a92514c0a85b53c2d0bf9a0e83e9a0dd';
+  'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:ee89fd4bce4f9f35f4cd09c63d3cbdd07bea3071b5d372f82c9f49b9741c3669';
 
 /**
  * To run an unpublished host build, `tenantHostLocalImage` names it in the local engine. It
