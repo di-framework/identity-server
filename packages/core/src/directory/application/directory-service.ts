@@ -52,7 +52,16 @@ export class DirectoryService {
     const login = body.text('login');
     const email = body.text('email');
     const displayName = body.text('displayName');
-    if (!login || !email || !displayName) return new ServiceResult(400);
+    if (
+      !login ||
+      !email ||
+      !displayName ||
+      login.length > 128 ||
+      email.length > 254 ||
+      displayName.length > 255
+    ) {
+      return new ServiceResult(400);
+    }
     try {
       let deliver: Delivery | undefined;
       const result = await this.directory.transaction(async () => {
@@ -84,7 +93,7 @@ export class DirectoryService {
     command: Command,
   ): Promise<ServiceResult<ReturnType<DirectoryService['user']>>> {
     const displayName = new JsonBody(command.body).text('displayName');
-    if (!displayName) return new ServiceResult(400);
+    if (!displayName || displayName.length > 255) return new ServiceResult(400);
     if (!this.isUuid(userId)) return new ServiceResult(400);
     const user = await this.directory.findUser(userId);
     if (!user) return new ServiceResult(404);
@@ -154,7 +163,7 @@ export class DirectoryService {
     const body = new JsonBody(command.body);
     const slug = body.text('slug');
     const name = body.text('name');
-    if (!slug || !name) return new ServiceResult(400);
+    if (!slug || !name || slug.length > 128 || name.length > 255) return new ServiceResult(400);
     try {
       return await this.directory.transaction(async () => {
         const replay = await this.replayOrganization(command.idempotencyKey, slug, name);
@@ -180,7 +189,7 @@ export class DirectoryService {
     command: Command,
   ): Promise<ServiceResult<ReturnType<DirectoryService['organization']>>> {
     const name = new JsonBody(command.body).text('name');
-    if (!name) return new ServiceResult(400);
+    if (!name || name.length > 255) return new ServiceResult(400);
     const organization = await this.directory.findOrganization(slug);
     if (!organization) return new ServiceResult(404);
     await this.directory.updateOrganizationName(slug, name);

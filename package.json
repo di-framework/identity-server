@@ -25,6 +25,7 @@
   },
   "devDependencies": {
     "@biomejs/biome": "^2.5.14",
+    "@di-framework/biome": "^6.0.5",
     "@di-framework/cli": "^6.0.3",
     "@types/bun": "latest"
   },

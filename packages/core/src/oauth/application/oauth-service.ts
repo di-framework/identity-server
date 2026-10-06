@@ -42,8 +42,9 @@ export class OAuthService {
   ): Promise<ServiceResult<{ client_id: string; client_secret: string }>> {
     const body = new JsonBody(command.body);
     const clientId = body.text('clientId');
-    if (!clientId) return new ServiceResult(400);
+    if (!clientId || clientId.length > 100) return new ServiceResult(400);
     const organizationSlug = body.optional('organizationSlug');
+    if (organizationSlug && organizationSlug.length > 128) return new ServiceResult(400);
     const redirectUris = body.texts('redirectUris');
     const scopes = body.texts('scopes');
     const browser = body.flag('browser');
@@ -88,6 +89,7 @@ export class OAuthService {
     const scopes = body.texts('scopes');
     const browser = body.flag('browser');
     const organizationSlug = body.optional('organizationSlug');
+    if (organizationSlug && organizationSlug.length > 128) return new ServiceResult(400);
     if (browser && redirectUris.length === 0) return new ServiceResult(400);
     const existing = await this.oauth.find(clientId);
     if (!existing) return new ServiceResult(404);
