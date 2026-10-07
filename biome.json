@@ -66,5 +66,6 @@
         "noBannedTypes": "warn"
       }
     }
-  }
+  },
+  "extends": ["@di-framework/biome"]
 }

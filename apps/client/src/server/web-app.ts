@@ -205,7 +205,7 @@ export class WebApp {
     c.active = await this.sessions.setAttribute(c.active, SESSION_ATTRIBUTES.savedRequest, null);
     c.cookies.push(this.sessionCookie(c.active.token));
     c.user = user;
-    return redirect(saved && saved.startsWith('/') && !saved.startsWith('//') ? saved : '/');
+    return redirect(safeRelativePath(saved));
   }
 
   private async logOut(c: Context): Promise<Result> {
@@ -928,4 +928,15 @@ export function cookie(header: string | null, name: string): string | undefined 
     }
   }
   return undefined;
+}
+
+/**
+ * Ensures saved redirect paths stay relative to the application and cannot be used
+ * for open redirects via protocol-relative URLs (`//evil.com`), backslash escapes
+ * (`/\evil.com`, `/\\evil.com`), or external hostnames.
+ */
+export function safeRelativePath(path: string | null | undefined): string {
+  if (!path || typeof path !== 'string') return '/';
+  if (!path.startsWith('/') || path.startsWith('//') || path.startsWith('/\\')) return '/';
+  return path;
 }

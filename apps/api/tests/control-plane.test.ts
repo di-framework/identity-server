@@ -1,5 +1,4 @@
 import { afterAll, beforeAll, expect, spyOn, test } from 'bun:test';
-import { createHash } from 'node:crypto';
 import { useContainer } from '@di-framework/core/container';
 import { PostgresGateway } from '@di-framework/identity/src/shared/infrastructure/postgres-gateway.ts';
 import {
@@ -81,6 +80,27 @@ test('serves the JSON control plane through application services', async () => {
       })
     ).status,
   ).toBe(400);
+  expect(
+    (
+      await call('POST', '/api/admin/users', {
+        body: { login: 'a'.repeat(129), email: 'a@b.c', displayName: 'A' },
+      })
+    ).status,
+  ).toBe(400);
+  expect(
+    (
+      await call('POST', '/api/admin/users', {
+        body: { login: 'ok', email: `${'a'.repeat(250)}@b.com`, displayName: 'A' },
+      })
+    ).status,
+  ).toBe(400);
+  expect(
+    (
+      await call('POST', '/api/admin/users', {
+        body: { login: 'ok', email: 'a@b.c', displayName: 'a'.repeat(256) },
+      })
+    ).status,
+  ).toBe(400);
 
   const adaAdmin = await registerClient({ clientId: 'ada-admin', scopes: ['admin:write'] });
   const adaToken = (await (
@@ -157,6 +177,13 @@ test('serves the JSON control plane through application services', async () => {
 
   expect((await call('PATCH', `/api/admin/users/${ada.id}`, { body: {} })).status).toBe(400);
   expect(
+    (
+      await call('PATCH', `/api/admin/users/${ada.id}`, {
+        body: { displayName: 'a'.repeat(256) },
+      })
+    ).status,
+  ).toBe(400);
+  expect(
     (await call('PATCH', '/api/admin/users/bad', { body: { displayName: 'Ada' } })).status,
   ).toBe(400);
   expect(
@@ -198,6 +225,20 @@ test('serves the JSON control plane through application services', async () => {
   expect(
     (await call('POST', '/api/admin/organizations', { body: { slug: ' ', name: 'Nope' } })).status,
   ).toBe(400);
+  expect(
+    (
+      await call('POST', '/api/admin/organizations', {
+        body: { slug: 'a'.repeat(129), name: 'Nope' },
+      })
+    ).status,
+  ).toBe(400);
+  expect(
+    (
+      await call('POST', '/api/admin/organizations', {
+        body: { slug: 'valid-slug', name: 'a'.repeat(256) },
+      })
+    ).status,
+  ).toBe(400);
   await database.run(
     `INSERT INTO auth_audit_records (id, action, actor_client_id, target, correlation_id, before_metadata, after_metadata)
      VALUES (?, 'admin.organization_created', 'system', 'missing-org', 'org-missing', '{}', '{}')`,
@@ -216,6 +257,13 @@ test('serves the JSON control plane through application services', async () => {
   );
   expect((await call('GET', '/api/admin/organizations/missing')).status).toBe(404);
   expect((await call('PATCH', '/api/admin/organizations/acme', { body: {} })).status).toBe(400);
+  expect(
+    (
+      await call('PATCH', '/api/admin/organizations/acme', {
+        body: { name: 'a'.repeat(256) },
+      })
+    ).status,
+  ).toBe(400);
   expect(
     (await call('PATCH', '/api/admin/organizations/missing', { body: { name: 'Nope' } })).status,
   ).toBe(404);
@@ -380,6 +428,20 @@ test('serves the JSON control plane through application services', async () => {
       })
     ).status,
   ).toBe(400);
+  expect(
+    (
+      await call('POST', '/api/admin/oauth-clients', {
+        body: { clientId: 'a'.repeat(101) },
+      })
+    ).status,
+  ).toBe(400);
+  expect(
+    (
+      await call('POST', '/api/admin/oauth-clients', {
+        body: { clientId: 'valid-cli', organizationSlug: 'a'.repeat(129) },
+      })
+    ).status,
+  ).toBe(400);
   const browser = await call('POST', '/api/admin/oauth-clients', {
     headers: { 'idempotency-key': 'client-key' },
     body: {
@@ -433,6 +495,13 @@ test('serves the JSON control plane through application services', async () => {
   expect((await call('POST', '/api/admin/oauth-clients', { body: {} })).status).toBe(400);
   expect(
     (await call('PUT', '/api/admin/oauth-clients/browser', { body: { browser: true } })).status,
+  ).toBe(400);
+  expect(
+    (
+      await call('PUT', '/api/admin/oauth-clients/browser', {
+        body: { organizationSlug: 'a'.repeat(129) },
+      })
+    ).status,
   ).toBe(400);
   expect(
     (await call('PUT', '/api/admin/oauth-clients/missing', { body: { scopes: ['a'] } })).status,

@@ -21,7 +21,7 @@ import {
 import type { PageModel } from '../domain/page-model.ts';
 import { takeEmbeddedPage } from '../ui/app.tsx';
 import { handle, indexDocument, scriptJson } from './handler.ts';
-import { cookie } from './web-app.ts';
+import { cookie, safeRelativePath } from './web-app.ts';
 
 let isolated: Awaited<ReturnType<typeof useIsolatedDatabase>>;
 let mail: RecordingMailSender;
@@ -194,6 +194,19 @@ describe('shell and transport', () => {
     expect(
       (await anonymous.post('/account/password', { password: 'x' })).headers.get('location'),
     ).toBe('/login');
+  });
+
+  test('open redirect attempts in savedRequest fallback safely to /', async () => {
+    expect(safeRelativePath('//evil.com')).toBe('/');
+    expect(safeRelativePath('/\\evil.com')).toBe('/');
+    expect(safeRelativePath('\\evil.com')).toBe('/');
+    expect(safeRelativePath('https://evil.com')).toBe('/');
+    expect(safeRelativePath('javascript:alert(1)')).toBe('/');
+    expect(safeRelativePath(null)).toBe('/');
+    expect(safeRelativePath(undefined)).toBe('/');
+    expect(safeRelativePath('')).toBe('/');
+    expect(safeRelativePath('/admin/users')).toBe('/admin/users');
+    expect(safeRelativePath('/admin/users?q=1#frag')).toBe('/admin/users?q=1#frag');
   });
 });
 
