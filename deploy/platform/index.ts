@@ -151,7 +151,13 @@ const kube = new KubeInstance('kube', {
     tenantHostImagePullPolicy: publishHostImage ? 'Always' : 'IfNotPresent',
     ...(mailpitClusterIP
       ? { egressAllowedDestinations: [mailpitDestination(mailpitClusterIP)] }
-      : {}),
+      : configuredSmtpHost
+        ? {
+            egressAllowedDestinations: [
+              `${configuredSmtpHost}:${config.getNumber('smtpPort', { min: 1, max: 65535 }) ?? 587}`,
+            ],
+          }
+        : {}),
   },
   values: config.getObject<unknown[]>('values'),
   allowInsecureRegistries: externalRegistry === undefined,
@@ -407,6 +413,7 @@ new k8s.apps.v1.DeploymentPatch(
   {
     metadata: { name: `hostgroup-tenant-${TENANT}`, namespace: `di-runtime-${TENANT}` },
     spec: {
+      strategy: { type: 'RollingUpdate', rollingUpdate: { maxSurge: 0, maxUnavailable: 1 } },
       template: {
         metadata: {
           annotations: {

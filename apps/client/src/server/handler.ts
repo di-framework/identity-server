@@ -39,6 +39,14 @@ export async function handle(
   const headers = new Headers();
   for (const value of cookies) headers.append('set-cookie', value);
   headers.set('cache-control', 'no-store');
+  headers.set('x-content-type-options', 'nosniff');
+  headers.set('x-frame-options', 'DENY');
+  headers.set('referrer-policy', 'strict-origin-when-cross-origin');
+  headers.set('strict-transport-security', 'max-age=31536000; includeSubDomains');
+  headers.set(
+    'content-security-policy',
+    "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; object-src 'none'; base-uri 'self'; form-action 'self'; frame-ancestors 'none';",
+  );
   if (result.kind === 'redirect') {
     headers.set('location', result.location);
     return new Response(null, { status: result.status ?? 303, headers });

@@ -96,6 +96,8 @@ describe('example app journeys', () => {
     expect(attributes(cleared ?? '')).toContain('max-age=0');
     const afterLogout = await call('/me', { headers: { cookie: pair(sid ?? '') } });
     expect(afterLogout.status).toBe(401);
+    const unauthenticated = await call('/me');
+    expect(unauthenticated.status).toBe(401);
   });
 
   test('an unexpected failure does not return the internal message', async () => {

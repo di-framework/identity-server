@@ -47,6 +47,43 @@ test('reports a server error with no body when an operation throws', async () =>
   expect(await response.text()).toBe('');
   expect(logged).toHaveBeenCalledWith('control-plane createUser failed', expect.any(Error));
   logged.mockRestore();
+
+  const responseNoHeaders = await handlers.getUser(
+    {},
+    { transport: 'http', request: { params: { userId: crypto.randomUUID() } } },
+  );
+  expect(responseNoHeaders.status).toBe(404);
+
+  const allOps = [
+    'users',
+    'createUser',
+    'getUser',
+    'updateUser',
+    'archiveUser',
+    'organizations',
+    'createOrganization',
+    'getOrganization',
+    'updateOrganization',
+    'deleteOrganization',
+    'getMembership',
+    'putMembership',
+    'deleteMembership',
+    'oauthClients',
+    'createOAuthClient',
+    'getOAuthClient',
+    'updateOAuthClient',
+    'rotateOAuthClientSecret',
+    'revokeOAuthClient',
+    'audit',
+    'members',
+    'apiList',
+    'apiPrepareUnlink',
+    'apiUnlink',
+  ] as const;
+  for (const op of allOps) {
+    const res = await handlers[op]({}, { transport: 'http', request: {} });
+    expect(res).toBeInstanceOf(Response);
+  }
 });
 
 test('serves the JSON control plane through application services', async () => {

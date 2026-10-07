@@ -152,17 +152,21 @@ export class NotificationWorker {
     return ids.length;
   }
 
-  /** Runs `runOnce`, then waits `delayMs` after it finishes, until `stop`. */
+  /** Runs `runOnce`, then waits `delayMs` after it finishes, until `stop`. Backs off on consecutive errors. */
   start(delayMs: number, onError: (error: unknown) => void = () => {}): void {
     if (this.running) return;
     this.running = true;
+    let consecutiveFailures = 0;
     const tick = async () => {
       try {
         await this.runOnce();
+        consecutiveFailures = 0;
       } catch (error) {
+        consecutiveFailures++;
         onError(error);
       }
-      if (this.running) this.timer = setTimeout(tick, delayMs);
+      const backoff = Math.min(delayMs * 2 ** Math.min(consecutiveFailures, 5), 60_000);
+      if (this.running) this.timer = setTimeout(tick, backoff);
     };
     this.timer = setTimeout(tick, delayMs);
   }
