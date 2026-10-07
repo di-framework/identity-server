@@ -56,7 +56,8 @@ describe('bearer guard', () => {
     expect(requiredScope('GET', '/api/v1/organizations/acme/members')).toBe('directory:read');
     expect(requiredScope('GET', '/api/v1/account/identity-links')).toBeUndefined();
     expect(RequestContext.current()).toBeUndefined();
-    expect(new RequestContext()).toBeDefined();
+    expect(RequestContext).toBeDefined();
+
     RequestContext.run({ kind: 'token', principalName: 'p', clientId: 'c', scopes: [] }, () =>
       expect(RequestContext.current()?.principalName).toBe('p'),
     );

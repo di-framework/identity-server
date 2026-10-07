@@ -30,28 +30,28 @@ const SELECT = `SELECT c.id, c.client_id, c.client_name, c.client_secret, c.clie
   LEFT JOIN oauth_client_lifecycle l ON l.client_id = c.client_id`;
 
 /** Comma-separated list columns and JSON settings columns of `oauth2_registered_client`. */
-export class ClientColumns {
-  static list(value: readonly string[]): string {
+export const ClientColumns = {
+  list(value: readonly string[]): string {
     return value.join(',');
-  }
+  },
 
-  static parse(value: string | null): string[] {
+  parse(value: string | null): string[] {
     if (!value) return [];
     return value
       .split(',')
       .map((item) => item.trim())
       .filter((item) => item.length > 0);
-  }
+  },
 
-  static settings(settings: ClientSettings): string {
+  settings(settings: ClientSettings): string {
     return JSON.stringify(settings);
-  }
+  },
 
-  static tokenSettings(): string {
+  tokenSettings(): string {
     return JSON.stringify(TOKEN_SETTINGS);
-  }
+  },
 
-  static readSettings(value: string): ClientSettings {
+  readSettings(value: string): ClientSettings {
     let parsed: Record<string, unknown> = {};
     try {
       const candidate: unknown = JSON.parse(value);
@@ -65,8 +65,8 @@ export class ClientColumns {
       requireProofKey: parsed.requireProofKey === true,
       requireAuthorizationConsent: parsed.requireAuthorizationConsent === true,
     };
-  }
-}
+  },
+};
 
 @Container()
 export class PostgresRegisteredClientRepository implements RegisteredClientRepository {

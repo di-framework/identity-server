@@ -68,12 +68,12 @@ function accountCaller(): AccountCaller | undefined {
     : { userId: caller.principalName };
 }
 
-export class HttpResponse {
-  static from(result: ServiceResult<unknown>): Response {
+export const HttpResponse = {
+  from(result: ServiceResult<unknown>): Response {
     if (result.body === undefined) return new Response(null, { status: result.status });
     return json(result.body, { status: result.status });
-  }
-}
+  },
+};
 
 @Controller()
 export class ControlPlaneController {

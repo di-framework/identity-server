@@ -22,14 +22,12 @@ export type Caller = TokenCaller | SessionCaller;
 const storage = new AsyncLocalStorage<Caller>();
 
 /** Request-scoped caller. Replaces the unauthenticated `x-actor-id` header. */
-export class RequestContext {
-  constructor() {}
-
-  static run<T>(caller: Caller, fn: () => T): T {
+export const RequestContext = {
+  run<T>(caller: Caller, fn: () => T): T {
     return storage.run(caller, fn);
-  }
+  },
 
-  static current(): Caller | undefined {
+  current(): Caller | undefined {
     return storage.getStore();
-  }
-}
+  },
+};
