@@ -54,17 +54,17 @@ export class PostgresGateway {
 }
 
 /** Formats database timestamps for control-plane JSON. */
-export class Timestamps {
-  static iso(value: unknown): string {
+export const Timestamps = {
+  iso(value: unknown): string {
     const date = value instanceof Date ? value : new Date(String(value));
     return date.toISOString();
-  }
+  },
 
-  static ms(value: unknown): number {
+  ms(value: unknown): number {
     return (value instanceof Date ? value : new Date(String(value))).getTime();
-  }
+  },
 
-  static isoOrNull(value: unknown): string | null {
+  isoOrNull(value: unknown): string | null {
     return value == null ? null : Timestamps.iso(value);
-  }
-}
+  },
+};

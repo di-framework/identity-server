@@ -25,9 +25,10 @@ export class ClientAuthenticator {
   ): Promise<RegisteredClient> {
     const credentials = this.credentials(authorization, form);
     const client = await this.clients.find(credentials.clientId);
-    if (!client || !client.authenticationMethods.includes(credentials.method)) {
+    if (!client?.authenticationMethods.includes(credentials.method)) {
       throw new OAuthError('invalid_client', 401);
     }
+
     if (!(await this.passwords.verify(credentials.secret, client.secretHash))) {
       throw new OAuthError('invalid_client', 401);
     }

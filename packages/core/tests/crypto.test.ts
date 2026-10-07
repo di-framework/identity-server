@@ -25,7 +25,8 @@ function load(active: unknown, algorithm = 'RS256', previous = ''): SigningKeys 
 
 describe('hashing', () => {
   test('digests, tokens, client ids, and PKCE', () => {
-    expect(new Hashing()).toBeDefined();
+    expect(Hashing).toBeDefined();
+
     expect(Hashing.sha256Hex('abc')).toBe(createHash('sha256').update('abc').digest('hex'));
     expect(Hashing.sha256('abc').length).toBe(32);
     expect(Hashing.hmacSha256Base64Url(Buffer.from('k'), 'v')).toBe(

@@ -198,7 +198,8 @@ export class LinkService {
   ): Promise<IdentityLink | ServiceResult> {
     return this.directory.transaction(async () => {
       const user = await this.directory.lockUser(caller.userId);
-      if (!user || user.status !== 'active') return new ServiceResult(409);
+      if (user?.status !== 'active') return new ServiceResult(409);
+
       const link = await this.links.lockForUser(user.id, issuer, subject);
       if (!link) return new ServiceResult(404);
       const remaining = await this.links.countOther(user.id, link.id);

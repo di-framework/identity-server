@@ -10,8 +10,9 @@ import { PostgresChanges, toPostgresParams } from '../src/shared/infrastructure/
 import { Timestamps } from '../src/shared/infrastructure/postgres-gateway.ts';
 
 test('maps postgres results and rewrites placeholders', () => {
-  expect(new PostgresChanges()).toBeDefined();
-  expect(new Timestamps()).toBeDefined();
+  expect(PostgresChanges).toBeDefined();
+  expect(Timestamps).toBeDefined();
+
   expect(PostgresChanges.from(null)).toEqual({});
   expect(PostgresChanges.from(undefined)).toEqual({});
   expect(PostgresChanges.from('x')).toEqual({});

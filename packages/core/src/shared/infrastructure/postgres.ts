@@ -41,8 +41,8 @@ export function toPostgresParams(
 }
 
 /** Maps a Bun Postgres result onto the change count `@di-framework/repo` stores. */
-export class PostgresChanges {
-  static from(result: unknown): { changes?: number } {
+export const PostgresChanges = {
+  from(result: unknown): { changes?: number } {
     if (result === null || result === undefined || typeof result !== 'object') return {};
     const record = result as { changes?: unknown; count?: unknown; rowCount?: unknown };
     for (const value of [record.changes, record.count, record.rowCount]) {
@@ -50,8 +50,8 @@ export class PostgresChanges {
       if (typeof value === 'bigint') return { changes: Number(value) };
     }
     return {};
-  }
-}
+  },
+};
 
 /**
  * Opens a pooled Postgres database as a `SqlDatabase`.
@@ -109,6 +109,7 @@ export async function openPostgresDatabase(
  * Custom SQL adapter for Postgres. Repositories receive it through `EntityRepository`.
  * Placeholders stay `?`; `openPostgresDatabase` rewrites them.
  */
+// biome-ignore lint/suspicious/noExplicitAny: SqlStorageAdapter from @di-framework/repo constrains entity types to Record<string, any>
 export class PostgresAdapter<E extends Record<string, any>, ID extends string | number = string>
   extends SqlStorageAdapter<E, ID>
   implements StorageAdapter<E, ID>
