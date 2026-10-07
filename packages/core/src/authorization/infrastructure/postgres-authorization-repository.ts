@@ -57,7 +57,13 @@ export class PostgresAuthorizationRepository implements AuthorizationRepository 
       value?.hash ?? null,
       value ? new Date(value.issuedAt) : null,
       value ? new Date(value.expiresAt) : null,
-      value ? JSON.stringify({ invalidated: value.invalidated }) : null,
+      value
+        ? JSON.stringify({
+            invalidated: value.invalidated,
+            ...(value.previousHash ? { previousHash: value.previousHash } : {}),
+            ...(value.rotatedAt ? { rotatedAt: value.rotatedAt } : {}),
+          })
+        : null,
     ];
     return this.db.write(
       `INSERT INTO oauth2_authorization (
@@ -201,15 +207,18 @@ export class PostgresAuthorizationRepository implements AuthorizationRepository 
       issued: unknown,
       expires: unknown,
       metadata: string | null,
-    ): StoredToken | null =>
-      value
-        ? {
-            hash: value,
-            issuedAt: Timestamps.ms(issued),
-            expiresAt: Timestamps.ms(expires),
-            invalidated: this.json(metadata).invalidated === true,
-          }
-        : null;
+    ): StoredToken | null => {
+      if (!value) return null;
+      const meta = this.json(metadata);
+      return {
+        hash: value,
+        issuedAt: Timestamps.ms(issued),
+        expiresAt: Timestamps.ms(expires),
+        invalidated: meta.invalidated === true,
+        ...(typeof meta.previousHash === 'string' ? { previousHash: meta.previousHash } : {}),
+        ...(typeof meta.rotatedAt === 'number' ? { rotatedAt: meta.rotatedAt } : {}),
+      };
+    };
     const access = token(
       row.access_token_value,
       row.access_token_issued_at,

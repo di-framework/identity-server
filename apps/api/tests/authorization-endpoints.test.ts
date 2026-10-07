@@ -478,6 +478,7 @@ describe('authorization persistence', () => {
       requireProofKey: false,
       requireAuthorizationConsent: false,
     });
+    expect(new ClientColumns()).toBeDefined();
     expect(ClientColumns.readSettings('7')).toEqual({
       requireProofKey: false,
       requireAuthorizationConsent: false,

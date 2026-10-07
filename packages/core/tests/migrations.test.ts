@@ -39,6 +39,7 @@ test('discovers the reused Flyway migrations in version order', async () => {
     ['12', 'normalize jsonb metadata'],
     ['13', 'runtime secrets'],
     ['14', 'varchar hashes'],
+    ['15', 'concurrency indexes'],
   ]);
 });
 
@@ -61,6 +62,7 @@ test('applies the reused migrations and reads a user through UserRepository', as
       '12',
       '13',
       '14',
+      '15',
     ]);
 
     const again = await applyMigrations(db);
@@ -121,6 +123,7 @@ test('V12 unwraps metadata and session attributes stored as JSON string scalars'
         '12',
         '13',
         '14',
+        '15',
       ]);
       expect(
         await db.first<Record<string, unknown>>(

@@ -2,6 +2,7 @@ import { beforeAll, describe, expect, test } from 'bun:test';
 import { bearerFor } from '@di-framework/identity/tests/support/clients.ts';
 import { useTestDatabase } from '@di-framework/identity/tests/support/database.ts';
 import { controlPlane } from '../src/control-plane.ts';
+import { AdminApiPolicy, DirectoryApiPolicy } from '../src/guards/api-policies.ts';
 import { requiredScope } from '../src/guards/bearer-guard.ts';
 import { RequestContext } from '../src/guards/request-context.ts';
 
@@ -55,6 +56,17 @@ describe('bearer guard', () => {
     expect(requiredScope('GET', '/api/v1/organizations/acme/members')).toBe('directory:read');
     expect(requiredScope('GET', '/api/v1/account/identity-links')).toBeUndefined();
     expect(RequestContext.current()).toBeUndefined();
+    expect(new RequestContext()).toBeDefined();
+    RequestContext.run({ kind: 'token', principalName: 'p', clientId: 'c', scopes: [] }, () =>
+      expect(RequestContext.current()?.principalName).toBe('p'),
+    );
+    const adminPolicy = new AdminApiPolicy();
+    adminPolicy.read();
+    adminPolicy.write();
+    const dirPolicy = new DirectoryApiPolicy();
+    dirPolicy.read();
+    expect(adminPolicy).toBeDefined();
+    expect(dirPolicy).toBeDefined();
   });
 
   test('every admin operation requires a valid token with the right scope', async () => {

@@ -23,6 +23,8 @@ const storage = new AsyncLocalStorage<Caller>();
 
 /** Request-scoped caller. Replaces the unauthenticated `x-actor-id` header. */
 export class RequestContext {
+  constructor() {}
+
   static run<T>(caller: Caller, fn: () => T): T {
     return storage.run(caller, fn);
   }

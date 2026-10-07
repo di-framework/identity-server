@@ -16,6 +16,7 @@ export interface BrowserSession {
   /** `GSIO_LAST_AUTHENTICATED_AT`: epoch ms of the last password or passwordless sign-in. */
   lastAuthenticatedAt: number | null;
   attributes: Record<string, string>;
+  createdAt?: number;
   expiresAt: number;
 }
 

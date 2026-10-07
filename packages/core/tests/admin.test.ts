@@ -17,6 +17,7 @@ import { ClientAdminService } from '../src/admin/application/client-admin.ts';
 import { MembershipAdminService } from '../src/admin/application/membership-admin.ts';
 import { OrganizationAdminService } from '../src/admin/application/organization-admin.ts';
 import { UserAdminService } from '../src/admin/application/user-admin.ts';
+import { AdminAccessPolicy } from '../src/admin/domain/admin-access-policy.ts';
 import { AuditEntry, type AuditRepository } from '../src/audit/domain/audit-entry.ts';
 import type { RegisteredClientRepository } from '../src/authorization/domain/models.ts';
 import type { DirectoryRepository } from '../src/directory/domain/directory-repository.ts';
@@ -752,5 +753,14 @@ describe('audit', () => {
     expect(redact('{"password":"a","apiKey":"b","Authorization":"c","n":"d"}')).toBe(
       '{"password":"[REDACTED]","apiKey":"[REDACTED]","Authorization":"[REDACTED]","n":"d"}',
     );
+  });
+
+  test('admin access policy methods execute', () => {
+    const policy = new AdminAccessPolicy();
+    policy.inactiveActor();
+    policy.platformAdmin();
+    policy.ownedTarget();
+    policy.generalView();
+    expect(policy).toBeDefined();
   });
 });

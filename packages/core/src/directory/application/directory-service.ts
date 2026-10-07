@@ -84,6 +84,10 @@ export class DirectoryService {
       await deliver?.();
       return result;
     } catch (error) {
+      if (command.idempotencyKey) {
+        const replay = await this.replayUser(command.idempotencyKey, login, email, displayName);
+        if (replay) return replay;
+      }
       return this.failed(error);
     }
   }
@@ -180,6 +184,10 @@ export class DirectoryService {
         return new ServiceResult(201, { id, slug });
       });
     } catch (error) {
+      if (command.idempotencyKey) {
+        const replay = await this.replayOrganization(command.idempotencyKey, slug, name);
+        if (replay) return replay;
+      }
       return this.failed(error);
     }
   }

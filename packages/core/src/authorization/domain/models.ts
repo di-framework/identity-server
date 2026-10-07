@@ -37,6 +37,8 @@ export interface StoredToken {
   issuedAt: number;
   expiresAt: number;
   invalidated: boolean;
+  previousHash?: string;
+  rotatedAt?: number;
 }
 
 export interface Authorization {

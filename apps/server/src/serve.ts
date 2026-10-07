@@ -20,14 +20,19 @@ export async function routeRequest(
 
 async function asset(name: string, assets: AssetSource): Promise<Response> {
   if (!ASSET_NAME.test(name)) return new Response(null, { status: 404 });
+  const headers = new Headers({
+    'content-type': contentType(name),
+    'x-content-type-options': 'nosniff',
+    'cache-control': 'public, max-age=31536000, immutable',
+  });
   if (!(assets instanceof URL)) {
     const bytes = assets.get(name);
     if (!bytes) return new Response(null, { status: 404 });
-    return new Response(bytes, { headers: { 'content-type': contentType(name) } });
+    return new Response(bytes, { headers });
   }
   const file = Bun.file(new URL(name, assets));
   if (!(await file.exists())) return new Response(null, { status: 404 });
-  return new Response(file);
+  return new Response(file, { headers });
 }
 
 function contentType(name: string): string {

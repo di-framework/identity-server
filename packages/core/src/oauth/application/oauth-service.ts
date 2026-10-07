@@ -76,6 +76,17 @@ export class OAuthService {
       });
       return new ServiceResult(201, { client_id: clientId, client_secret: secret });
     } catch (error) {
+      if (command.idempotencyKey) {
+        const replay = await this.replay(command.idempotencyKey, {
+          clientId,
+          organizationSlug,
+          redirectUris,
+          scopes,
+          browser,
+          secret,
+        });
+        if (replay) return replay;
+      }
       return this.failed(error);
     }
   }

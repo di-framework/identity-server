@@ -8,6 +8,7 @@ interface Row {
   csrf_token: string;
   last_authenticated_at: unknown;
   attributes: Record<string, string>;
+  created_at: unknown;
   expires_at: unknown;
 }
 
@@ -20,13 +21,18 @@ export class PostgresSessionRepository implements SessionRepository {
       `INSERT INTO browser_sessions (id, user_id, csrf_token, last_authenticated_at, attributes,
          created_at, last_seen_at, expires_at)
        VALUES (?, ?, ?, ?, ?::text::jsonb, ?, ?, ?)`,
-      [...this.values(session), new Date(now), new Date(now), new Date(session.expiresAt)],
+      [
+        ...this.values(session),
+        new Date(session.createdAt ?? now),
+        new Date(now),
+        new Date(session.expiresAt),
+      ],
     );
   }
 
   async find(id: string): Promise<BrowserSession | undefined> {
     const row = await this.db.one<Row>(
-      `SELECT id, user_id::text AS user_id, csrf_token, last_authenticated_at, attributes, expires_at
+      `SELECT id, user_id::text AS user_id, csrf_token, last_authenticated_at, attributes, created_at, expires_at
        FROM browser_sessions WHERE id = ?`,
       [id],
     );
@@ -38,6 +44,7 @@ export class PostgresSessionRepository implements SessionRepository {
       lastAuthenticatedAt:
         row.last_authenticated_at == null ? null : Timestamps.ms(row.last_authenticated_at),
       attributes: row.attributes,
+      createdAt: row.created_at == null ? undefined : Timestamps.ms(row.created_at),
       expiresAt: Timestamps.ms(row.expires_at),
     };
   }

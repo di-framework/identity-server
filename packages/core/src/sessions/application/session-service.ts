@@ -6,6 +6,8 @@ import type { BrowserSession, SessionRepository } from '../domain/session.ts';
 
 /** Servlet session idle timeout in the auth server's `application.yml`. */
 export const SESSION_IDLE_MS = 30 * 60 * 1000;
+/** Absolute session lifetime cap (12 hours) to comply with NIST / OWASP guidelines. */
+export const SESSION_MAX_LIFETIME_MS = 12 * 60 * 60 * 1000;
 
 /** A session plus the cookie value that identifies it. Only the hash is stored. */
 export interface ActiveSession {
@@ -30,6 +32,7 @@ export class SessionService {
       csrf: Hashing.token(),
       lastAuthenticatedAt: null,
       attributes: {},
+      createdAt: now,
       expiresAt: now + SESSION_IDLE_MS,
     };
     await this.sessions.insert(session, now);
@@ -42,11 +45,13 @@ export class SessionService {
     const found = await this.sessions.find(Hashing.sha256Hex(token));
     if (!found) return undefined;
     const now = this.clock.now();
-    if (found.expiresAt <= now) {
+    const maxExpiry =
+      (found.createdAt ?? found.expiresAt - SESSION_IDLE_MS) + SESSION_MAX_LIFETIME_MS;
+    if (found.expiresAt <= now || maxExpiry <= now) {
       await this.sessions.delete(found.id);
       return undefined;
     }
-    const session = { ...found, expiresAt: now + SESSION_IDLE_MS };
+    const session = { ...found, expiresAt: Math.min(now + SESSION_IDLE_MS, maxExpiry) };
     await this.sessions.update(session, now);
     return { token, session };
   }
@@ -57,11 +62,12 @@ export class SessionService {
    */
   async signIn(current: ActiveSession, userId: string, rotate: boolean): Promise<ActiveSession> {
     const now = this.clock.now();
+    const maxExpiry = (current.session.createdAt ?? now) + SESSION_MAX_LIFETIME_MS;
     const base = {
       ...current.session,
       userId,
       lastAuthenticatedAt: now,
-      expiresAt: now + SESSION_IDLE_MS,
+      expiresAt: Math.min(now + SESSION_IDLE_MS, maxExpiry),
     };
     if (!rotate) {
       await this.sessions.update(base, now);

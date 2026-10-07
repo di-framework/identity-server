@@ -211,15 +211,29 @@ export class TokenService {
           nonce: string | null;
           auth_time: number;
         },
+        refresh.hash,
       );
     });
   }
 
-  /** A remembered refresh token presented again: revoke the token family and audit it. */
+  /** A remembered refresh token presented again: revoke the token family and audit it, unless within concurrency grace. */
   private async detectReplay(hash: string): Promise<void> {
     const now = this.clock.now();
     const authorizationId = await this.authorizations.lockReplayedRefresh(hash, now);
     if (!authorizationId) return;
+    const current = await this.authorizations.findById(authorizationId);
+    if (current?.refresh) {
+      const GRACE_PERIOD_MS = 10_000;
+      if (
+        current.refresh.previousHash === hash &&
+        current.refresh.rotatedAt &&
+        now - current.refresh.rotatedAt < GRACE_PERIOD_MS
+      ) {
+        // Concurrent exchange of the immediately preceding token within grace window:
+        // Reject the duplicate request without revoking the newly issued session.
+        return;
+      }
+    }
     await this.authorizations.markRefreshReused(hash, now);
     await this.authorizations.delete(authorizationId);
     await this.audit.append({
@@ -248,6 +262,7 @@ export class TokenService {
     authorization: Authorization,
     scopes: string[],
     attributes: { nonce?: string | null; auth_time?: number },
+    previousRefreshHash?: string,
   ): Promise<TokenResponse> {
     const access = this.issue(TOKEN_SETTINGS.accessTokenTtlSeconds);
     const refresh = client.grantTypes.includes('refresh_token')
@@ -279,10 +294,17 @@ export class TokenService {
       };
     }
     if (refresh) response.refresh_token = refresh.value;
+    const now = this.clock.now();
+    const storedRefresh: StoredToken | null = refresh
+      ? {
+          ...refresh.stored,
+          ...(previousRefreshHash ? { previousHash: previousRefreshHash, rotatedAt: now } : {}),
+        }
+      : null;
     await this.authorizations.save({
       ...authorization,
       access: { ...access.stored, scopes },
-      refresh: refresh?.stored ?? null,
+      refresh: storedRefresh,
       idToken,
     });
     return response;

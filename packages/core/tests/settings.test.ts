@@ -8,6 +8,7 @@ import { withContainer } from './support/container-lock.ts';
 import { databaseUrl, testDatabaseName } from './support/database.ts';
 
 test('defaults match the auth server application.yml', () => {
+  expect(new IdentityModule()).toBeDefined();
   const settings = loadIdentitySettings({});
   expect(settings.server).toEqual({ host: '0.0.0.0', port: 4180 });
   expect(settings.issuer).toBe('http://localhost:4180');

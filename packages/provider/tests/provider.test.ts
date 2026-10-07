@@ -544,5 +544,15 @@ describe('client behavior', () => {
     expect(await (await real(new Request('https://x.example/'))).text()).toBe('ok');
     const defaults = retrying(async () => new Response('ok'));
     expect((await defaults(new Request('https://x.example/'))).status).toBe(200);
+
+    let retryCount = 0;
+    const retryWithDefaultSleep = retrying(
+      async () => {
+        if (++retryCount === 1) return new Response('fail', { status: 503 });
+        return new Response('ok');
+      },
+      { attempts: 2, delayMs: 1 },
+    );
+    expect((await retryWithDefaultSleep(new Request('https://x.example/'))).status).toBe(200);
   });
 });
