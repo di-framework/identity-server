@@ -23,8 +23,9 @@ async function asset(name: string, assets: AssetSource): Promise<Response> {
   const headers = new Headers({
     'content-type': contentType(name),
     'x-content-type-options': 'nosniff',
-    'cache-control': 'public, max-age=31536000, immutable',
+    'cache-control': 'no-cache',
   });
+
   if (!(assets instanceof URL)) {
     const bytes = assets.get(name);
     if (!bytes) return new Response(null, { status: 404 });
