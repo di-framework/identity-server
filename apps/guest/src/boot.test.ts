@@ -319,6 +319,40 @@ test('the guest boots with no connection affinity and serves the Bun routes', as
         );
         expect(settled.status).toBe(200);
         expect(await secretOf('access')).toBe(rehashedAgain);
+
+        // A reconcile that fails after the lease is taken (here: an invalid CLI redirect) leaves
+        // the prints of only the settled clients behind, so the next realm hashes the rotated
+        // access secret again instead of trusting the print of the secret it was rotated from.
+        resetGuest();
+        fresh();
+        const aborted = await handle(
+          new Request('https://identity.test/health'),
+          withCli([
+            ['AUTH_ACCESS_CLIENT_SECRET', 'rotated-secret'],
+            ['AUTH_CLI_REDIRECT_URIS', 'https://evil.test/cb'],
+          ]),
+        );
+        expect(aborted.status).toBe(503);
+        const [prints] = await reserved.unsafe(
+          `SELECT value FROM identity_runtime_secret WHERE name = 'bootstrap_client_fingerprints'`,
+        );
+        expect(Object.keys(JSON.parse(prints.value as string)).sort()).toEqual([
+          'directory',
+          'provisioner',
+        ]);
+        expect(
+          await reserved.unsafe(
+            `SELECT 1 FROM identity_runtime_secret WHERE name = 'bootstrap_lease'`,
+          ),
+        ).toHaveLength(0);
+        resetGuest();
+        fresh();
+        const repaired = await handle(
+          new Request('https://identity.test/health'),
+          withCli([['AUTH_BOOTSTRAP_OWNER_DISPLAY_NAME', 'Owner Four']]),
+        );
+        expect(repaired.status).toBe(200);
+        expect(await secretOf('access')).not.toBe(rehashedAgain);
       } finally {
         resetGuest();
         IdentityModule.bind();

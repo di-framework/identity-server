@@ -90,9 +90,16 @@ async function boot(runtime: GuestRuntime): Promise<void> {
       Object.keys(current).filter((id) => stored[id] !== undefined && stored[id] === current[id]),
     );
     await withBootstrapLease(database, async () => {
+      // Keep only the settled prints while reconcile runs. A realm the host aborts mid-way may
+      // already have rewritten a client row from a secret that is later rolled back; without
+      // this, the old print would match again and settle that row with the wrong hash.
+      const kept = Object.fromEntries(
+        Object.entries(current).filter(([id]) => settledClients.has(id)),
+      );
+      await storeValue(database, CLIENT_FINGERPRINTS, JSON.stringify(kept));
       await reconciler.reconcile({ settledClients });
-      // Client fingerprints first: a realm that dies between the two stores reconciles again
-      // with every client settled, which is cheap.
+      // Client prints before the whole-settings print: a realm that dies between the two stores
+      // reconciles again with every client settled, which is cheap.
       await storeValue(database, CLIENT_FINGERPRINTS, JSON.stringify(current));
       await storeValue(database, BOOTSTRAP_FINGERPRINT, fingerprint);
     });
