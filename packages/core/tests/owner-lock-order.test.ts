@@ -1,10 +1,10 @@
 import { describe, expect, test } from 'bun:test';
 import { useContainer } from '@di-framework/core/container';
+import { applyMigrations } from '@di-framework/identity-migrations';
 import type { SqlDatabase } from '@di-framework/repo';
 import { PostgresDirectoryRepository } from '../src/directory/infrastructure/postgres-directory-repository.ts';
 import { openPostgresDatabase } from '../src/shared/infrastructure/postgres.ts';
 import type { PostgresGateway } from '../src/shared/infrastructure/postgres-gateway.ts';
-import { applyMigrations } from '@di-framework/identity-migrations';
 import { databaseUrl, withThrowawayDatabase } from './support/database.ts';
 
 /** Previous `OTHER_OWNER` pattern from the guest autocommit refactor (cross-locks rows). */
