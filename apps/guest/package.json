@@ -7,6 +7,7 @@
     "@di-framework/bindings": "6.0.8",
     "@di-framework/core": "6.0.3",
     "@di-framework/http": "6.0.3",
-    "@di-framework/repo": "6.0.4"
+    "@di-framework/repo": "6.0.4",
+    "@di-framework/wasm-pqc-subtle": "0.2.10"
   }
 }
