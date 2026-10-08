@@ -1,6 +1,8 @@
 import { beforeAll, describe, expect, test } from 'bun:test';
 import { useContainer } from '@di-framework/core/container';
 import type { SqlDatabase } from '@di-framework/repo';
+import { ClientAuthenticator } from '../src/authorization/application/client-authenticator.ts';
+import { TokenService } from '../src/authorization/application/token-service.ts';
 import type { RegisteredClientRepository } from '../src/authorization/domain/models.ts';
 import {
   BootstrapError,
@@ -353,4 +355,65 @@ test('registers the public CLI client when configured, with loopback redirects o
   await expect(
     useContainer().construct(BootstrapReconciler, { 0: settings }).reconcile(),
   ).rejects.toThrow('CLI client redirect URIs are required');
+});
+
+test('rejects a CLI client id that matches another bootstrap client', async () => {
+  const env = environment({ AUTH_CLI_REDIRECT_URIS: 'http://127.0.0.1/callback' });
+  await reconciler(env).reconcile();
+  const stored = await clients().find(env.AUTH_DIRECTORY_CLIENT_ID);
+  for (const id of [
+    env.AUTH_ACCESS_CLIENT_ID,
+    env.AUTH_DIRECTORY_CLIENT_ID,
+    env.AUTH_PROVISIONER_CLIENT_ID,
+  ]) {
+    const instance = reconciler({ ...env, AUTH_CLI_CLIENT_ID: id });
+    await expect(instance.reconcile()).rejects.toThrow(
+      'CLI client id must differ from the other bootstrap clients',
+    );
+    expect(instance.complete).toBe(false);
+  }
+  expect(await clients().find(env.AUTH_DIRECTORY_CLIENT_ID)).toMatchObject({
+    authenticationMethods: ['client_secret_basic'],
+    grantTypes: ['client_credentials'],
+    scopes: ['directory:read'],
+    secretHash: stored?.secretHash,
+  });
+});
+
+test('adopting an existing confidential client as the CLI client drops client credentials', async () => {
+  const machineId = `machine-${Hashing.token(4)}`;
+  const env = environment({
+    AUTH_CLI_CLIENT_ID: machineId,
+    AUTH_CLI_REDIRECT_URIS: 'http://127.0.0.1/callback',
+  });
+  await clients().insert({
+    clientId: machineId,
+    clientName: machineId,
+    secretHash: await passwords.hash('machine-secret'),
+    authenticationMethods: ['client_secret_basic'],
+    grantTypes: ['client_credentials'],
+    redirectUris: [],
+    scopes: ['directory:read'],
+    settings: { requireProofKey: false, requireAuthorizationConsent: false },
+    organizationSlug: 'kept-org',
+  });
+  await reconciler(env).reconcile();
+  expect(await clients().find(machineId)).toMatchObject({
+    secretHash: null,
+    authenticationMethods: ['none'],
+    grantTypes: ['authorization_code', 'refresh_token'],
+    redirectUris: ['http://127.0.0.1/callback'],
+    scopes: ['openid', 'profile', 'email', 'offline_access'],
+    settings: { requireProofKey: true, requireAuthorizationConsent: true },
+    organizationSlug: null,
+  });
+  const form = new URLSearchParams({
+    grant_type: 'client_credentials',
+    client_id: machineId,
+    scope: 'openid',
+  });
+  const client = await useContainer().resolve(ClientAuthenticator).authenticate(null, form, true);
+  await expect(useContainer().resolve(TokenService).exchange(client, form)).rejects.toMatchObject({
+    code: 'unauthorized_client',
+  });
 });
