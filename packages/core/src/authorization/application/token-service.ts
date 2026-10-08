@@ -102,6 +102,9 @@ export class TokenService {
     client: RegisteredClient,
     form: URLSearchParams,
   ): Promise<TokenResponse> {
+    if (!client.authenticationMethods.some((method) => method.startsWith('client_secret'))) {
+      throw new OAuthError('unauthorized_client');
+    }
     const scopes = this.requestedScopes(client.scopes, form.get('scope'));
     const access = this.issue(TOKEN_SETTINGS.accessTokenTtlSeconds);
     await this.authorizations.save({

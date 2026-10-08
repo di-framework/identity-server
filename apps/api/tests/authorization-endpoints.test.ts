@@ -230,6 +230,21 @@ describe('token endpoint', () => {
     expect(
       (await token({ grant_type: 'client_credentials' }, { authorization: browser.basic })).body,
     ).toEqual({ error: 'unauthorized_client' });
+    const publicMachine = await registerClient({
+      methods: ['none'],
+      grantTypes: ['client_credentials'],
+      requireProofKey: true,
+      scopes: ['openid'],
+    });
+    expect(
+      (
+        await token({
+          grant_type: 'client_credentials',
+          client_id: publicMachine.clientId,
+          scope: 'openid',
+        })
+      ).body,
+    ).toEqual({ error: 'unauthorized_client' });
     const wrongType = await controlPlane.fetch(
       new Request('https://identity.test/oauth2/token', {
         method: 'POST',

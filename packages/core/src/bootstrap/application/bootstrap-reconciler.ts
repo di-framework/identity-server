@@ -76,6 +76,9 @@ export class BootstrapReconciler {
     require(redirects.length > 0, 'Access Control redirect URIs are required');
     for (const uri of redirects) require(absolute(uri), 'Invalid Access Control redirect URI');
     if (clients.cli.id) {
+      const reserved = [clients.access.id, clients.directory.id, clients.provisioner.id];
+      const duplicate = reserved.includes(clients.cli.id);
+      require(!duplicate, 'CLI client id must differ from the other bootstrap clients');
       require(clients.cli.redirectUris.length > 0, 'CLI client redirect URIs are required');
       for (const uri of clients.cli.redirectUris)
         require(loopbackOnly(uri), 'CLI client redirect URIs must be loopback http URIs');
@@ -160,23 +163,24 @@ export class BootstrapReconciler {
   }
 
   /**
-   * New clients get the full registration. Existing clients get a re-hashed secret and replaced
-   * scopes; the browser client also gets its auth methods and redirect URIs replaced. Grant
-   * types and settings of an existing client are left alone.
-   */
-  /**
    * A public native client (RFC 8252): `none` authentication, PKCE required, loopback redirects
-   * matched on any port, consent on first use. Scopes and redirects are replaced on every run.
+   * matched on any port, consent on first use. An existing row is rewritten to that shape,
+   * including its grants and a cleared secret, so it cannot keep `client_credentials`.
    */
   private async ensurePublicClient(id: string, redirects: string[]): Promise<void> {
     const scopes = ['openid', 'profile', 'email', 'offline_access'];
+    const grantTypes = ['authorization_code', 'refresh_token'];
     const unique = [...new Set(redirects)];
+    const settings = { requireProofKey: true, requireAuthorizationConsent: true };
     if (await this.clients.find(id)) {
       await this.clients.update(id, {
+        secretHash: null,
+        grantTypes,
         scopes,
         authenticationMethods: ['none'],
         redirectUris: unique,
-        settings: { requireProofKey: true, requireAuthorizationConsent: true },
+        settings,
+        organizationSlug: null,
       });
       await this.clients.ensureLifecycle(id, null);
       return;
@@ -186,14 +190,19 @@ export class BootstrapReconciler {
       clientName: id,
       secretHash: null,
       authenticationMethods: ['none'],
-      grantTypes: ['authorization_code', 'refresh_token'],
+      grantTypes,
       redirectUris: unique,
       scopes,
-      settings: { requireProofKey: true, requireAuthorizationConsent: true },
+      settings,
       organizationSlug: null,
     });
   }
 
+  /**
+   * New clients get the full registration. Existing clients get a re-hashed secret and replaced
+   * scopes; the browser client also gets its auth methods and redirect URIs replaced. Grant
+   * types and settings of an existing client are left alone.
+   */
   private async ensureClient(input: BootstrapClient): Promise<void> {
     const secretHash = await this.passwords.hash(input.secret);
     const existing = await this.clients.find(input.id);
