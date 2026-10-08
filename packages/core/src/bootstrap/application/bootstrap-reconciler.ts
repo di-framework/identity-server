@@ -24,6 +24,17 @@ interface BootstrapClient {
   browser: boolean;
 }
 
+export interface ReconcileOptions {
+  /**
+   * Confidential client ids whose bootstrap inputs (secret, scopes, redirect URIs) are the same
+   * as at the last successful reconcile. An existing row for one of them is kept as it is, which
+   * skips its Argon2id secret hash; a missing row is still registered in full. The guest passes
+   * the ids whose stored fingerprint matches, so adding a client or rotating one secret does not
+   * re-hash the others.
+   */
+  settledClients?: ReadonlySet<string>;
+}
+
 /**
  * First-deployment state from encrypted configuration (`BootstrapReconciler.kt`): the owner as an
  * active platform admin, the organization with the owner as owner, an optional viewer member,
@@ -54,7 +65,8 @@ export class BootstrapReconciler {
     this.reconciled = true;
   }
 
-  async reconcile(): Promise<void> {
+  async reconcile(options: ReconcileOptions = {}): Promise<void> {
+    const settled = options.settledClients ?? new Set<string>();
     const { bootstrap, clients } = this.settings;
     const { owner, organization } = bootstrap;
     require(Boolean(
@@ -91,27 +103,36 @@ export class BootstrapReconciler {
       const org = await this.ensureOrganization();
       await this.directory.upsertMembership(org, ownerId, 'owner');
       await this.ensureViewer(org);
-      await this.ensureClient({
-        id: clients.access.id,
-        secret: clients.access.secret,
-        scopes: ['openid', 'profile', 'email', 'offline_access'],
-        redirects,
-        browser: true,
-      });
-      await this.ensureClient({
-        id: clients.directory.id,
-        secret: clients.directory.secret,
-        scopes: ['directory:read'],
-        redirects: [],
-        browser: false,
-      });
-      await this.ensureClient({
-        id: clients.provisioner.id,
-        secret: clients.provisioner.secret,
-        scopes: ['admin:read', 'admin:write', 'directory:read'],
-        redirects: [],
-        browser: false,
-      });
+      await this.ensureClient(
+        {
+          id: clients.access.id,
+          secret: clients.access.secret,
+          scopes: ['openid', 'profile', 'email', 'offline_access'],
+          redirects,
+          browser: true,
+        },
+        settled,
+      );
+      await this.ensureClient(
+        {
+          id: clients.directory.id,
+          secret: clients.directory.secret,
+          scopes: ['directory:read'],
+          redirects: [],
+          browser: false,
+        },
+        settled,
+      );
+      await this.ensureClient(
+        {
+          id: clients.provisioner.id,
+          secret: clients.provisioner.secret,
+          scopes: ['admin:read', 'admin:write', 'directory:read'],
+          redirects: [],
+          browser: false,
+        },
+        settled,
+      );
       if (clients.cli.id) await this.ensurePublicClient(clients.cli.id, clients.cli.redirectUris);
     });
     this.reconciled = true;
@@ -203,11 +224,16 @@ export class BootstrapReconciler {
   /**
    * New clients get the full registration. Existing clients get a re-hashed secret and replaced
    * scopes; the browser client also gets its auth methods and redirect URIs replaced. Grant
-   * types and settings of an existing client are left alone.
+   * types and settings of an existing client are left alone. An existing client in `settled`
+   * only gets its lifecycle row checked: nothing about it changed, so nothing is hashed.
    */
-  private async ensureClient(input: BootstrapClient): Promise<void> {
-    const secretHash = await this.passwords.hash(input.secret);
+  private async ensureClient(input: BootstrapClient, settled: ReadonlySet<string>): Promise<void> {
     const existing = await this.clients.find(input.id);
+    if (existing && settled.has(input.id)) {
+      await this.clients.ensureLifecycle(input.id, null);
+      return;
+    }
+    const secretHash = await this.passwords.hash(input.secret);
     const methods = input.browser
       ? ['client_secret_basic', 'client_secret_post']
       : ['client_secret_basic'];

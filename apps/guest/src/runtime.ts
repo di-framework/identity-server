@@ -18,6 +18,23 @@ import type { ConfigStore } from './settings.ts';
 import { loadGuestSettings } from './settings.ts';
 
 const BOOTSTRAP_FINGERPRINT = 'bootstrap_fingerprint';
+const CLIENT_FINGERPRINTS = 'bootstrap_client_fingerprints';
+const BOOTSTRAP_LEASE = 'bootstrap_lease';
+/**
+ * How long one realm may hold the reconcile lease. A cold reconcile hashes up to three client
+ * secrets at about 30 seconds each on QuickJS; the lease outlasts that with room for a busy host.
+ * A realm the host aborts mid-reconcile (its client disconnected) leaves the lease to expire, and
+ * every realm answers 503 until then.
+ */
+const LEASE_MS = 3 * 60_000;
+
+/** A request that arrived while another realm holds the reconcile lease. */
+export class BootstrapBusyError extends Error {
+  constructor(until: string) {
+    super(`bootstrap in progress until ${until}`);
+    this.name = 'BootstrapBusyError';
+  }
+}
 
 export interface GuestRuntime {
   database: IdentityDatabase;
@@ -43,7 +60,8 @@ export async function handle(request: Request, runtime: GuestRuntime): Promise<R
     await ready;
   } catch (error) {
     const message = error instanceof Error ? error.message : 'failed';
-    return Response.json({ ok: false, error: message }, { status: 503 });
+    const headers = error instanceof BootstrapBusyError ? { 'retry-after': '5' } : {};
+    return Response.json({ ok: false, error: message }, { status: 503, headers });
   }
   const response = await routeRequest(request, runtime.assets, runtime.shell);
   await drain();
@@ -63,10 +81,21 @@ async function boot(runtime: GuestRuntime): Promise<void> {
   container.resolve(SIGNING_KEYS);
   const reconciler = container.resolve(BootstrapReconciler);
   const fingerprint = bootstrapFingerprint(settings);
-  if ((await storedFingerprint(database)) === fingerprint) reconciler.markComplete();
-  else {
-    await reconciler.reconcile();
-    await storeFingerprint(database, fingerprint);
+  if ((await storedValue(database, BOOTSTRAP_FINGERPRINT)) === fingerprint) {
+    reconciler.markComplete();
+  } else {
+    const current = clientFingerprints(settings);
+    const stored = parseFingerprints(await storedValue(database, CLIENT_FINGERPRINTS));
+    const settledClients = new Set(
+      Object.keys(current).filter((id) => stored[id] !== undefined && stored[id] === current[id]),
+    );
+    await withBootstrapLease(database, async () => {
+      await reconciler.reconcile({ settledClients });
+      // Client fingerprints first: a realm that dies between the two stores reconciles again
+      // with every client settled, which is cheap.
+      await storeValue(database, CLIENT_FINGERPRINTS, JSON.stringify(current));
+      await storeValue(database, BOOTSTRAP_FINGERPRINT, fingerprint);
+    });
   }
   container.register(Readiness);
   container.register(OperationsEndpoints);
@@ -83,19 +112,81 @@ function bootstrapFingerprint(settings: IdentitySettings): string {
   );
 }
 
-async function storedFingerprint(database: SqlDatabase): Promise<string> {
+/**
+ * One fingerprint per confidential client over everything `ensureClient` writes for it. A client
+ * whose fingerprint is unchanged is passed to reconcile as settled, so adding the CLI client or
+ * rotating one secret hashes only what changed instead of all three secrets.
+ */
+function clientFingerprints(settings: IdentitySettings): Record<string, string> {
+  const { access, directory, provisioner } = settings.clients;
+  const entries = [
+    [access.id, { secret: access.secret, redirectUris: access.redirectUris }],
+    [directory.id, { secret: directory.secret }],
+    [provisioner.id, { secret: provisioner.secret }],
+  ] as const;
+  return Object.fromEntries(
+    entries.map(([id, inputs]) => [id, Hashing.sha256Hex(JSON.stringify({ id, ...inputs }))]),
+  );
+}
+
+function parseFingerprints(stored: string): Record<string, string> {
+  if (!stored) return {};
+  try {
+    const parsed: unknown = JSON.parse(stored);
+    if (parsed == null || typeof parsed !== 'object' || Array.isArray(parsed)) return {};
+    return Object.fromEntries(
+      Object.entries(parsed).filter(
+        (entry): entry is [string, string] => typeof entry[1] === 'string',
+      ),
+    );
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * Lets one realm reconcile at a time. Every request that arrives before the fingerprint is
+ * stored runs in its own realm, and without this each of them would start the same minutes of
+ * Argon2id hashing on the host's CPU. The claim is one statement, as every write on this
+ * database must be: insert the lease, or take over one whose expiry has passed. Losers throw
+ * `BootstrapBusyError` and the request answers 503 at once.
+ */
+async function withBootstrapLease(database: SqlDatabase, fn: () => Promise<void>): Promise<void> {
+  const now = new Date();
+  const until = new Date(now.getTime() + LEASE_MS).toISOString();
+  const claimed = await database.query<{ name: string }>(
+    `INSERT INTO identity_runtime_secret (name, value) VALUES (?, ?)
+     ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value
+     WHERE identity_runtime_secret.value < ?
+     RETURNING name`,
+    [BOOTSTRAP_LEASE, until, now.toISOString()],
+  );
+  if (claimed.length === 0) {
+    throw new BootstrapBusyError(await storedValue(database, BOOTSTRAP_LEASE));
+  }
+  try {
+    await fn();
+  } finally {
+    await database.run('DELETE FROM identity_runtime_secret WHERE name = ? AND value = ?', [
+      BOOTSTRAP_LEASE,
+      until,
+    ]);
+  }
+}
+
+async function storedValue(database: SqlDatabase, name: string): Promise<string> {
   const row = await database.first<{ value: unknown }>(
     'SELECT value FROM identity_runtime_secret WHERE name = ?',
-    [BOOTSTRAP_FINGERPRINT],
+    [name],
   );
   return row?.value == null ? '' : String(row.value);
 }
 
-async function storeFingerprint(database: SqlDatabase, fingerprint: string): Promise<void> {
+async function storeValue(database: SqlDatabase, name: string, value: string): Promise<void> {
   await database.run(
     `INSERT INTO identity_runtime_secret (name, value) VALUES (?, ?)
      ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value`,
-    [BOOTSTRAP_FINGERPRINT, fingerprint],
+    [name, value],
   );
 }
 

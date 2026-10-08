@@ -93,7 +93,11 @@ The first request runs `ensureSchema`, then validates signing keys and reconcile
 
 A component invocation does not keep `NotificationWorker`’s `setTimeout` loop alive. The guest calls `runOnce()` at the end of each request and does not start the timer. The Bun server still calls `start()`.
 
-Each HTTP invocation gets a fresh JavaScript realm, so the in-memory `ready` promise does not survive the request. Without a shortcut, every request re-ran bootstrap and spent about 90 seconds re-hashing the three client secrets. After a successful reconcile the guest stores a SHA-256 fingerprint of the owner password, viewer password, and the three client secrets in `identity_runtime_secret` under `bootstrap_fingerprint`. A later realm with the same fingerprint calls `BootstrapReconciler.markComplete()` and skips the hashes. Changing a secret changes the fingerprint, and the next request reconciles again.
+Each HTTP invocation gets a fresh JavaScript realm, so the in-memory `ready` promise does not survive the request. Without a shortcut, every request re-ran bootstrap and spent about 90 seconds re-hashing the three client secrets. After a successful reconcile the guest stores a SHA-256 fingerprint of the bootstrap people and client settings in `identity_runtime_secret` under `bootstrap_fingerprint`. A later realm with the same fingerprint calls `BootstrapReconciler.markComplete()` and skips the hashes. Changing any of those settings changes the fingerprint, and the next request reconciles again.
+
+That reconcile hashes only what changed. Beside the whole-settings fingerprint the guest stores one per confidential client under `bootstrap_client_fingerprints`, and passes the ids whose fingerprint still matches to `reconcile({ settledClients })`, which keeps their rows as they are. Adding the CLI client or rotating one secret therefore costs one hash at most, not three.
+
+Only one realm reconciles at a time. Before reconcile the guest claims `bootstrap_lease` in `identity_runtime_secret` with a single `INSERT … ON CONFLICT DO UPDATE … WHERE value < now RETURNING` (three minutes, released after the fingerprints are stored). Every other request that arrives meanwhile gets its own realm, loses the claim, and answers 503 with `Retry-After: 5` at once instead of starting the same hashing. Before the lease, a client that polled `/health` every few seconds spawned a realm per poll, each hashing on the host's one CPU, and nothing finished. A realm the host aborts mid-reconcile leaves the lease to expire.
 
 ## 4. HTTP surface
 
@@ -159,6 +163,7 @@ The platform otherwise runs tenant hosts on stock `ghcr.io/wasmcloud/wash:2.8.0`
 | `POST` trapped: future type mismatch | HTTP body completion used the wrong void future | `pickFutureType` selects the HTTP 0.3 error-code future |
 | `POST /login` returned 403 | CSRF token was sent without the `identity_session` cookie from `GET /login` | Proof client stores `Set-Cookie` and sends it back |
 | `GET /ready` and `GET /health` took ~90s and died if the client gave up | Argon2id bootstrap ran in the request, and a disconnected client aborted it | Long first request; later requests use the fingerprint |
+| Every request hung after a settings change, host CPU pegged | Each concurrent request's realm re-ran the full reconcile and re-hashed all three client secrets | `bootstrap_lease` lets one realm reconcile, others answer 503; per-client fingerprints skip unchanged secrets |
 | Login, account, and passwordless returned 500 `value-conversion-failed column 0` | `char(n)` / `bpchar` results | `V14` converts those columns to `varchar` |
 | Account and authorize returned 500 at `banner` / `withQuery` | Polyfill lacked `has` and `set` | Polyfill implements `has`, `set`, `append`, `delete`, `getAll`, and writes back `URL.search` |
 | Authorize returned `invalid_scope` | `+` was left in the scope string | Polyfill decodes `+` as a space |

@@ -417,3 +417,28 @@ test('adopting an existing confidential client as the CLI client drops client cr
     code: 'unauthorized_client',
   });
 });
+
+test('settled clients keep their rows unhashed; a settled id with no row is still registered', async () => {
+  const env = environment();
+  await reconciler(env).reconcile();
+  const before = await clients().find(env.AUTH_ACCESS_CLIENT_ID);
+  const settledClients = new Set([env.AUTH_ACCESS_CLIENT_ID]);
+
+  // Settled: the row is left alone even though the secret in settings differs.
+  await reconciler({ ...env, AUTH_ACCESS_CLIENT_SECRET: 'rotated' }).reconcile({ settledClients });
+  expect((await clients().find(env.AUTH_ACCESS_CLIENT_ID))?.secretHash).toBe(before?.secretHash);
+
+  // Not settled: the secret is hashed again.
+  await reconciler({ ...env, AUTH_ACCESS_CLIENT_SECRET: 'rotated' }).reconcile();
+  const rotated = await clients().find(env.AUTH_ACCESS_CLIENT_ID);
+  expect(rotated?.secretHash).not.toBe(before?.secretHash);
+  expect(await passwords.verify('rotated', rotated?.secretHash)).toBe(true);
+
+  // Settled but missing: registered in full.
+  const fresh = environment();
+  await reconciler(fresh).reconcile({
+    settledClients: new Set([fresh.AUTH_DIRECTORY_CLIENT_ID]),
+  });
+  const directoryClient = await clients().find(fresh.AUTH_DIRECTORY_CLIENT_ID);
+  expect(await passwords.verify('directory-secret', directoryClient?.secretHash)).toBe(true);
+});
