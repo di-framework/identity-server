@@ -91,6 +91,9 @@ function bridge(connections: SQL[]): IdentityDatabase {
     async query(sql: string, params: readonly unknown[] = []) {
       return asTable(await next().unsafe(sql, params.map(fromPg)));
     },
+    async queryBatch(sql: string) {
+      await next().unsafe(sql);
+    },
   } as unknown as IdentityDatabase;
 }
 

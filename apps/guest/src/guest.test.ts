@@ -3,10 +3,10 @@ import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getBindingMetadata } from '@di-framework/bindings';
+import { bindParams, openPostgresDatabase } from '@di-framework/bindings/postgres';
 import { text } from '@di-framework/repo/postgres';
 import { routeRequest } from '../../server/src/serve.ts';
 import { IdentityConfig, IdentityDatabase } from './bindings.ts';
-import { openGuestDatabase } from './database.ts';
 import { readFlywayMigrations } from './flyway.ts';
 import {
   applySchema,
@@ -15,7 +15,6 @@ import {
   migrationStatement,
   resetSchema,
 } from './migrations.ts';
-import { bindParams } from './pg.ts';
 import { handle, resetGuest } from './runtime.ts';
 import { loadGuestSettings } from './settings.ts';
 
@@ -186,7 +185,7 @@ test('the sql adapter binds parameters and never opens a transaction', async () 
       throw { code: '23505', message: 'duplicate key value' };
     },
   });
-  const sql = openGuestDatabase(database);
+  const sql = openPostgresDatabase(database);
   expect(await sql.query<{ tx: string }>('SELECT ? AS tx', ['acme'])).toEqual([{ tx: '9' }]);
   expect(await sql.first<{ tx: string }>('SELECT ? AS tx', ['acme'])).toEqual({ tx: '9' });
   expect(await sql.first('SELECT EMPTY')).toBeNull();

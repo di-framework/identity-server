@@ -4,7 +4,7 @@
   "type": "module",
   "license": "ISC",
   "dependencies": {
-    "@di-framework/bindings": "6.0.5",
+    "@di-framework/bindings": "6.0.8",
     "@di-framework/core": "6.0.3",
     "@di-framework/http": "6.0.3",
     "@di-framework/repo": "6.0.4"

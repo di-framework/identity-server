@@ -51,7 +51,7 @@
     "apps/guest": {
       "name": "@di-framework/identity-guest",
       "dependencies": {
-        "@di-framework/bindings": "6.0.5",
+        "@di-framework/bindings": "6.0.8",
         "@di-framework/core": "6.0.3",
         "@di-framework/http": "6.0.3",
         "@di-framework/repo": "6.0.4",
@@ -148,7 +148,7 @@
 
     "@di-framework/authz": ["@di-framework/authz@6.0.3", "", { "peerDependencies": { "@di-framework/auth": "^6", "@di-framework/core": "^6", "@di-framework/http": "^6", "typescript": "^5" }, "optionalPeers": ["@di-framework/http"] }, "sha512-9a2a0pqlIGHJlhNhd4/RjqShJMQbPymQW9YFNsNFRssHL8WNkyr5wv5IMG2/nJZ3JUFlaFcJBPwL0AI8tAEyDw=="],
 
-    "@di-framework/bindings": ["@di-framework/bindings@6.0.5", "", { "peerDependencies": { "@di-framework/core": "^5", "typescript": "^5" } }, "sha512-T937CXaAyDbDtus71M+AltdytFTLjtjUDds6gR1899xBxtkYUZKGF4k/Zknh2/CxGhJbaj6nlZqAh1STOTt7gw=="],
+    "@di-framework/bindings": ["@di-framework/bindings@6.0.8", "", { "peerDependencies": { "@di-framework/core": "^5", "@di-framework/repo": "^6.0.4", "typescript": "^5" }, "optionalPeers": ["@di-framework/repo"] }, "sha512-Ps166GHW5SJFfm/5eqzvyU+Ju0m4IOyPlmFXOO7xUCQDE0Y+TIFGpeq0tTGfmFkDMvpc9MzpZReeh7dlg5v8Gg=="],
 
     "@di-framework/biome": ["@di-framework/biome@6.0.5", "", { "peerDependencies": { "@biomejs/biome": "^2.5.0" } }, "sha512-veLYlh6TfsM+bFLDiLyC94PZp7bKLmQ3nQu52bh5jLno69tatvhyeTVIhPlOrCTAU7zcjvGUijAYXVVsQcgEMg=="],
 
