@@ -75,6 +75,11 @@ export class BootstrapReconciler {
     const redirects = [...new Set(clients.access.redirectUris)];
     require(redirects.length > 0, 'Access Control redirect URIs are required');
     for (const uri of redirects) require(absolute(uri), 'Invalid Access Control redirect URI');
+    if (clients.cli.id) {
+      require(clients.cli.redirectUris.length > 0, 'CLI client redirect URIs are required');
+      for (const uri of clients.cli.redirectUris)
+        require(loopbackOnly(uri), 'CLI client redirect URIs must be loopback http URIs');
+    }
 
     await this.directory.transaction(async () => {
       const ownerId = await this.ensurePerson(owner, 'platform_admin', true);
@@ -102,6 +107,7 @@ export class BootstrapReconciler {
         redirects: [],
         browser: false,
       });
+      if (clients.cli.id) await this.ensurePublicClient(clients.cli.id, clients.cli.redirectUris);
     });
     this.reconciled = true;
   }
@@ -158,6 +164,36 @@ export class BootstrapReconciler {
    * scopes; the browser client also gets its auth methods and redirect URIs replaced. Grant
    * types and settings of an existing client are left alone.
    */
+  /**
+   * A public native client (RFC 8252): `none` authentication, PKCE required, loopback redirects
+   * matched on any port, consent on first use. Scopes and redirects are replaced on every run.
+   */
+  private async ensurePublicClient(id: string, redirects: string[]): Promise<void> {
+    const scopes = ['openid', 'profile', 'email', 'offline_access'];
+    const unique = [...new Set(redirects)];
+    if (await this.clients.find(id)) {
+      await this.clients.update(id, {
+        scopes,
+        authenticationMethods: ['none'],
+        redirectUris: unique,
+        settings: { requireProofKey: true, requireAuthorizationConsent: true },
+      });
+      await this.clients.ensureLifecycle(id, null);
+      return;
+    }
+    await this.clients.insert({
+      clientId: id,
+      clientName: id,
+      secretHash: null,
+      authenticationMethods: ['none'],
+      grantTypes: ['authorization_code', 'refresh_token'],
+      redirectUris: unique,
+      scopes,
+      settings: { requireProofKey: true, requireAuthorizationConsent: true },
+      organizationSlug: null,
+    });
+  }
+
   private async ensureClient(input: BootstrapClient): Promise<void> {
     const secretHash = await this.passwords.hash(input.secret);
     const existing = await this.clients.find(input.id);
@@ -189,6 +225,16 @@ export class BootstrapReconciler {
 
 function require(condition: boolean, message: string): void {
   if (!condition) throw new BootstrapError(message);
+}
+
+/** The loopback redirect a native client registers; the port is matched at authorize time. */
+function loopbackOnly(uri: string): boolean {
+  try {
+    const url = new URL(uri);
+    return url.protocol === 'http:' && (url.hostname === '127.0.0.1' || url.hostname === '[::1]');
+  } catch {
+    return false;
+  }
 }
 
 /** `java.net.URI.isAbsolute` with no fragment: a scheme is present and there is no `#`. */

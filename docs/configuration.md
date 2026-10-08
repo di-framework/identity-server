@@ -26,6 +26,7 @@ the plain name.
 | `AUTH_ACCESS_CLIENT_ID`, `_SECRET`, `AUTH_ACCESS_REDIRECT_URIS` | required | Browser relying party (code + PKCE + consent, `openid profile email offline_access`). |
 | `AUTH_DIRECTORY_CLIENT_ID`, `_SECRET` | required | `directory:read` machine client. |
 | `AUTH_PROVISIONER_CLIENT_ID`, `_SECRET` | required | `admin:read admin:write directory:read` machine client used by the `gas` provider. |
+| `AUTH_CLI_CLIENT_ID`, `AUTH_CLI_REDIRECT_URIS` | optional, `http://127.0.0.1/callback` | Public native client for CLIs (`none` authentication, PKCE required, `openid profile email offline_access`, refresh tokens). Registered only when the id is set. Loopback redirect URIs match on any port (RFC 8252). |
 | `AUTH_IDENTITY_LINK_CLIENT_ID` | `gsio-auth-client` | Default client id at external identity providers. |
 | `IDENTITY_IDENTITY_LINK__PROVIDERS` | `{}` | JSON map of allowlisted providers: `{"acme":{"issuer","authorizationEndpoint","tokenEndpoint","jwksUri","clientId","clientSecret","scopes","freshAuthenticationParameter"}}`. `google`, `github`, `gitlab`, and `okta` have built-in endpoints. |
 | `GSIO_IDENTITY_NOTIFICATION_DELAY_MS` | `5000` | Security-notification worker delay. `GSIO_IDENTITY_NOTIFICATION_SCHEDULER_ENABLED=false` turns it off. |

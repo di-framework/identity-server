@@ -51,6 +51,8 @@ export interface IdentitySettings {
     access: { id: string; secret: string; redirectUris: string[] };
     directory: { id: string; secret: string };
     provisioner: { id: string; secret: string };
+    /** Public native client (PKCE, no secret) for CLIs; registered only when `id` is set. */
+    cli: { id: string; redirectUris: string[] };
   };
   identityLink: { clientId: string; providers: Record<string, ProviderSettings> };
   notifications: { fixedDelayMs: number; schedulerEnabled: boolean };
@@ -104,6 +106,10 @@ export function loadIdentitySettings(env: Env = process.env): IdentitySettings {
         id: text('AUTH_PROVISIONER_CLIENT_ID'),
         secret: env.AUTH_PROVISIONER_CLIENT_SECRET ?? '',
       },
+      cli: {
+        id: text('AUTH_CLI_CLIENT_ID'),
+        redirectUris: text('AUTH_CLI_REDIRECT_URIS', 'http://127.0.0.1/callback'),
+      },
     },
     identityLink: {
       clientId: text('AUTH_IDENTITY_LINK_CLIENT_ID', 'gsio-auth-client'),
@@ -144,6 +150,7 @@ function normalize(raw: unknown): IdentitySettings {
       access: { id: unknown; secret: unknown; redirectUris: unknown };
       directory: { id: unknown; secret: unknown };
       provisioner: { id: unknown; secret: unknown };
+      cli: { id: unknown; redirectUris: unknown };
     };
     identityLink: { clientId: unknown; providers: unknown };
     notifications: { fixedDelayMs: unknown; schedulerEnabled: unknown };
@@ -186,6 +193,10 @@ function normalize(raw: unknown): IdentitySettings {
       provisioner: {
         id: str(value.clients.provisioner.id),
         secret: str(value.clients.provisioner.secret),
+      },
+      cli: {
+        id: str(value.clients.cli.id),
+        redirectUris: list(value.clients.cli.redirectUris),
       },
     },
     identityLink: {

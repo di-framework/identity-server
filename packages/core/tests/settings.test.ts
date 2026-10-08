@@ -30,6 +30,7 @@ test('defaults match the auth server application.yml', () => {
   expect(settings.identityLink).toEqual({ clientId: 'gsio-auth-client', providers: {} });
   expect(settings.notifications).toEqual({ fixedDelayMs: 5000, schedulerEnabled: true });
   expect(settings.clients.access.redirectUris).toEqual([]);
+  expect(settings.clients.cli).toEqual({ id: '', redirectUris: ['http://127.0.0.1/callback'] });
 });
 
 test('reads every auth-server environment name', () => {
@@ -64,6 +65,8 @@ test('reads every auth-server environment name', () => {
     AUTH_DIRECTORY_CLIENT_SECRET: 'directory-secret',
     AUTH_PROVISIONER_CLIENT_ID: 'provisioner',
     AUTH_PROVISIONER_CLIENT_SECRET: 'provisioner-secret',
+    AUTH_CLI_CLIENT_ID: 'tenant-cli',
+    AUTH_CLI_REDIRECT_URIS: 'http://127.0.0.1/callback, http://[::1]/callback',
     AUTH_IDENTITY_LINK_CLIENT_ID: 'link-client',
     GSIO_IDENTITY_NOTIFICATION_DELAY_MS: '250',
     GSIO_IDENTITY_NOTIFICATION_SCHEDULER_ENABLED: 'false',
@@ -104,6 +107,7 @@ test('reads every auth-server environment name', () => {
     },
     directory: { id: 'directory', secret: 'directory-secret' },
     provisioner: { id: 'provisioner', secret: 'provisioner-secret' },
+    cli: { id: 'tenant-cli', redirectUris: ['http://127.0.0.1/callback', 'http://[::1]/callback'] },
   });
   expect(settings.identityLink.clientId).toBe('link-client');
   expect(settings.notifications).toEqual({ fixedDelayMs: 250, schedulerEnabled: false });

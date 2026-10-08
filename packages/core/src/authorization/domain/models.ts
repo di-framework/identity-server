@@ -79,7 +79,8 @@ export interface AuthorizationRepository {
 export interface NewRegisteredClient {
   clientId: string;
   clientName: string;
-  secretHash: string;
+  /** Null for a public client (`authenticationMethods` contains `none`). */
+  secretHash: string | null;
   authenticationMethods: string[];
   grantTypes: string[];
   redirectUris: string[];

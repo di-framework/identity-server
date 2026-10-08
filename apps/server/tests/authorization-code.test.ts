@@ -704,3 +704,55 @@ describe('authorization code flow', () => {
     expect(await replays()).toBe(replaysBefore);
   });
 });
+
+test('a public client redirects to any loopback port and exchanges without a secret', async () => {
+  const browser = await signedInBrowser();
+  const native = await registerClient({
+    methods: ['none'],
+    grantTypes: ['authorization_code', 'refresh_token'],
+    redirectUris: ['http://127.0.0.1/callback'],
+    scopes: ['openid', 'profile'],
+    requireProofKey: true,
+  });
+  const verifier = Hashing.token();
+  const authorize = (redirect: string) =>
+    `/oauth2/authorize?${new URLSearchParams({
+      response_type: 'code',
+      client_id: native.clientId,
+      redirect_uri: redirect,
+      scope: 'openid profile',
+      state: 'cli-state',
+      code_challenge: Hashing.pkceChallenge(verifier),
+      code_challenge_method: 'S256',
+    })}`;
+  for (const bad of [
+    'http://127.0.0.1:49152/other',
+    'http://localhost:49152/callback',
+    'https://127.0.0.1:49152/callback',
+    'http://127.0.0.1:49152/callback?x=1',
+    'not a url',
+  ]) {
+    const refused = await browser.send('GET', authorize(bad), { json: true });
+    expect(refused.status).toBe(400);
+    expect(await refused.json()).toMatchObject({ message: 'The redirect URI is not valid.' });
+  }
+  const redirect = 'http://127.0.0.1:49152/callback';
+  const location = (await browser.send('GET', authorize(redirect))).headers.get('location') ?? '';
+  expect(location.startsWith(`${redirect}?`)).toBe(true);
+  const code = new URL(location).searchParams.get('code') ?? '';
+  const exchanged = await fetchApp(
+    new Request('https://identity.test/oauth2/token', {
+      method: 'POST',
+      headers: { 'content-type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({
+        grant_type: 'authorization_code',
+        client_id: native.clientId,
+        code,
+        redirect_uri: redirect,
+        code_verifier: verifier,
+      }),
+    }),
+  );
+  expect(exchanged.status).toBe(200);
+  expect(((await exchanged.json()) as { refresh_token?: string }).refresh_token).toBeDefined();
+});

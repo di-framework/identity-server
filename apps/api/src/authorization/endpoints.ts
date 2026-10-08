@@ -64,7 +64,11 @@ export class AuthorizationEndpoints {
 
   private async token(request: Request): Promise<Response> {
     const form = await this.form(request);
-    const client = await this.clients.authenticate(request.headers.get('authorization'), form);
+    const client = await this.clients.authenticate(
+      request.headers.get('authorization'),
+      form,
+      true,
+    );
     return json(await this.tokens.exchange(client, form), 200, NO_STORE);
   }
 
@@ -80,7 +84,11 @@ export class AuthorizationEndpoints {
 
   private async revoke(request: Request): Promise<Response> {
     const form = await this.form(request);
-    const client = await this.clients.authenticate(request.headers.get('authorization'), form);
+    const client = await this.clients.authenticate(
+      request.headers.get('authorization'),
+      form,
+      true,
+    );
     await this.introspector.revoke(client, this.required(form, 'token'));
     return new Response(null, { status: 200, headers: NO_STORE });
   }

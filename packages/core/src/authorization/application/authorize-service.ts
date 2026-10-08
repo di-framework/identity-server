@@ -197,12 +197,36 @@ export class AuthorizeService {
     };
   }
 
-  /** Exact match, or the single registered URI when the request omits it. */
+  /**
+   * Exact match, or the single registered URI when the request omits it. A loopback redirect
+   * (`http://127.0.0.1` or `http://[::1]`) matches a registered loopback URI on any port, as RFC
+   * 8252 section 7.3 asks: a native client listens on whatever port is free.
+   */
   private redirectUri(client: RegisteredClient, requested: string | null): string | undefined {
     if (requested === null)
       return client.redirectUris.length === 1 ? client.redirectUris[0] : undefined;
-    return client.redirectUris.includes(requested) ? requested : undefined;
+    if (client.redirectUris.includes(requested)) return requested;
+    const loopback = parseLoopback(requested);
+    if (!loopback) return undefined;
+    const registered = client.redirectUris.some((uri) => {
+      const candidate = parseLoopback(uri);
+      return candidate?.host === loopback.host && candidate.path === loopback.path;
+    });
+    return registered ? requested : undefined;
   }
+}
+
+/** Host and path of an `http` URI on a loopback address, ignoring its port. */
+function parseLoopback(uri: string): { host: string; path: string } | undefined {
+  let url: URL;
+  try {
+    url = new URL(uri);
+  } catch {
+    return undefined;
+  }
+  if (url.protocol !== 'http:') return undefined;
+  if (url.hostname !== '127.0.0.1' && url.hostname !== '[::1]') return undefined;
+  return { host: url.hostname, path: `${url.pathname}${url.search}` };
 }
 
 function login(params: URLSearchParams): AuthorizeResult {
