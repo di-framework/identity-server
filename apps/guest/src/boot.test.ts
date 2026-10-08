@@ -100,6 +100,7 @@ function bridge(connections: SQL[]): IdentityDatabase {
 function guestConfig(
   scheduler: boolean,
   redirects = 'http://localhost:3000/callback',
+  extra: Array<[string, string]> = [],
 ): Array<[string, string]> {
   return [
     ['ISSUER_URL', 'http://identity.identity.localhost'],
@@ -127,6 +128,8 @@ function guestConfig(
     ['AUTH_PROVISIONER_CLIENT_SECRET', 'provisioner-secret'],
     ['AUTH_ACCESS_REDIRECT_URIS', redirects],
     ['GSIO_IDENTITY_NOTIFICATION_SCHEDULER_ENABLED', scheduler ? 'true' : 'false'],
+    // Last, so a test's override wins when the guest folds the list into settings.
+    ...extra,
   ];
 }
 
@@ -232,6 +235,124 @@ test('the guest boots with no connection affinity and serves the Bun routes', as
           `SELECT redirect_uris FROM oauth2_registered_client WHERE client_id = 'access'`,
         );
         expect(access.redirect_uris).toBe('http://localhost:3000/callback,https://app.test/cb');
+
+        // A lease another realm holds: the fingerprint differs (new CLI client), so this realm
+        // would reconcile, but it answers 503 at once and hashes nothing.
+        const redirects = 'http://localhost:3000/callback,https://app.test/cb';
+        const withCli = (extra: Array<[string, string]> = []) => ({
+          database,
+          config: {
+            getAll: () =>
+              guestConfig(false, redirects, [['AUTH_CLI_CLIENT_ID', 'tenant-cli'], ...extra]),
+          },
+          assets,
+          shell,
+        });
+        const secretOf = async (clientId: string) =>
+          (
+            await reserved.unsafe(
+              `SELECT client_secret FROM oauth2_registered_client WHERE client_id = '${clientId}'`,
+            )
+          )[0]?.client_secret as string | undefined;
+        const held = new Date(Date.now() + 60_000).toISOString();
+        await reserved.unsafe(
+          `INSERT INTO identity_runtime_secret (name, value) VALUES ('bootstrap_lease', $1)`,
+          [held],
+        );
+        resetGuest();
+        fresh();
+        const busy = await handle(new Request('https://identity.test/health'), withCli());
+        expect(busy.status).toBe(503);
+        expect(busy.headers.get('retry-after')).toBe('5');
+        expect(await busy.json()).toEqual({
+          ok: false,
+          error: `bootstrap in progress until ${held}`,
+        });
+        expect(await secretOf('tenant-cli')).toBeUndefined();
+
+        // An expired lease is taken over and released after the store. Stored client
+        // fingerprints that are not JSON settle nothing, so the access secret is hashed again.
+        const accessHash = await secretOf('access');
+        await reserved.unsafe(
+          `UPDATE identity_runtime_secret SET value = $1 WHERE name = 'bootstrap_lease'`,
+          [new Date(Date.now() - 1000).toISOString()],
+        );
+        await reserved.unsafe(
+          `UPDATE identity_runtime_secret SET value = 'not json' WHERE name = 'bootstrap_client_fingerprints'`,
+        );
+        resetGuest();
+        fresh();
+        const taken = await handle(new Request('https://identity.test/health'), withCli());
+        expect(taken.status).toBe(200);
+        expect(
+          await reserved.unsafe(
+            `SELECT 1 FROM identity_runtime_secret WHERE name = 'bootstrap_lease'`,
+          ),
+        ).toHaveLength(0);
+        const [cli] = await reserved.unsafe(
+          `SELECT client_authentication_methods FROM oauth2_registered_client WHERE client_id = 'tenant-cli'`,
+        );
+        expect(cli.client_authentication_methods).toBe('none');
+        const rehashed = await secretOf('access');
+        expect(rehashed).not.toBe(accessHash);
+
+        // Stored fingerprints that are JSON but not an object settle nothing either.
+        await reserved.unsafe(
+          `UPDATE identity_runtime_secret SET value = '[1]' WHERE name = 'bootstrap_client_fingerprints'`,
+        );
+        resetGuest();
+        fresh();
+        const renamed = await handle(
+          new Request('https://identity.test/health'),
+          withCli([['AUTH_BOOTSTRAP_OWNER_DISPLAY_NAME', 'Owner Two']]),
+        );
+        expect(renamed.status).toBe(200);
+        const rehashedAgain = await secretOf('access');
+        expect(rehashedAgain).not.toBe(rehashed);
+
+        // A change outside the clients reconciles with every client settled: no hash changes.
+        resetGuest();
+        fresh();
+        const settled = await handle(
+          new Request('https://identity.test/health'),
+          withCli([['AUTH_BOOTSTRAP_OWNER_DISPLAY_NAME', 'Owner Three']]),
+        );
+        expect(settled.status).toBe(200);
+        expect(await secretOf('access')).toBe(rehashedAgain);
+
+        // A reconcile that fails after the lease is taken (here: an invalid CLI redirect) leaves
+        // the prints of only the settled clients behind, so the next realm hashes the rotated
+        // access secret again instead of trusting the print of the secret it was rotated from.
+        resetGuest();
+        fresh();
+        const aborted = await handle(
+          new Request('https://identity.test/health'),
+          withCli([
+            ['AUTH_ACCESS_CLIENT_SECRET', 'rotated-secret'],
+            ['AUTH_CLI_REDIRECT_URIS', 'https://evil.test/cb'],
+          ]),
+        );
+        expect(aborted.status).toBe(503);
+        const [prints] = await reserved.unsafe(
+          `SELECT value FROM identity_runtime_secret WHERE name = 'bootstrap_client_fingerprints'`,
+        );
+        expect(Object.keys(JSON.parse(prints.value as string)).sort()).toEqual([
+          'directory',
+          'provisioner',
+        ]);
+        expect(
+          await reserved.unsafe(
+            `SELECT 1 FROM identity_runtime_secret WHERE name = 'bootstrap_lease'`,
+          ),
+        ).toHaveLength(0);
+        resetGuest();
+        fresh();
+        const repaired = await handle(
+          new Request('https://identity.test/health'),
+          withCli([['AUTH_BOOTSTRAP_OWNER_DISPLAY_NAME', 'Owner Four']]),
+        );
+        expect(repaired.status).toBe(200);
+        expect(await secretOf('access')).not.toBe(rehashedAgain);
       } finally {
         resetGuest();
         IdentityModule.bind();
