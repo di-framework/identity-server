@@ -8,6 +8,9 @@ import { AUDIT, CLOCK, DIRECTORY, NOTIFICATIONS } from '../../shared/domain/toke
 import { Hashing } from '../../shared/infrastructure/crypto/hashing.ts';
 import type { NotificationAction, NotificationRepository } from '../domain/notification.ts';
 
+/** How long a claimed notification stays out of `due` while its mail is being sent. */
+export const DELIVERY_LEASE_MS = 60_000;
+
 /** `min(30s * 2^min(attempts - 1, 7), 1h)`, with no attempt limit. */
 export function retryDelayMs(attempts: number): number {
   const exponent = Math.min(Math.max(attempts - 1, 0), 7);
@@ -71,14 +74,16 @@ export class SecurityNotificationService {
     });
   }
 
-  /** Sends one due notification under a row lock; failures stay retryable with backoff. */
+  /**
+   * Sends one due notification; failures stay retryable with backoff. Claiming the row is one
+   * statement, so two workers (or two guest invocations) never send the same mail, and the
+   * claim lapses after `DELIVERY_LEASE_MS` if the outcome is never saved.
+   */
   deliver(id: string): Promise<void> {
     return this.directory.transaction(async () => {
-      const notification = await this.notifications.lock(id);
       const now = this.clock.now();
+      const notification = await this.notifications.claim(id, now, now + DELIVERY_LEASE_MS);
       if (!notification) return;
-      if (notification.status !== 'pending' && notification.status !== 'failed') return;
-      if (notification.nextAttemptAt > now) return;
       if (!notification.recipientEmail) {
         await this.notifications.save({
           ...notification,

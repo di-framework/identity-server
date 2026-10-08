@@ -420,12 +420,11 @@ describe('authorization persistence', () => {
     const old = Hashing.sha256Hex('old-refresh');
     await repository.rememberRefresh(old, authorization.id, now + 60_000);
     await repository.rememberRefresh(old, authorization.id, now + 60_000);
-    expect(await repository.lockReplayedRefresh(old, now)).toBe(authorization.id);
-    await repository.markRefreshReused(old, now);
-    expect(await repository.lockReplayedRefresh(old, now)).toBeUndefined();
+    expect(await repository.claimReplayedRefresh(old, now)).toBe(authorization.id);
+    expect(await repository.claimReplayedRefresh(old, now)).toBeUndefined();
     const expired = Hashing.sha256Hex('expired-refresh');
     await repository.rememberRefresh(expired, authorization.id, now - 1);
-    expect(await repository.lockReplayedRefresh(expired, now)).toBeUndefined();
+    expect(await repository.claimReplayedRefresh(expired, now)).toBeUndefined();
 
     await database.run(
       `INSERT INTO oauth2_authorization (id, registered_client_id, principal_name, authorization_grant_type)

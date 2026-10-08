@@ -12,7 +12,7 @@ import { OperationsEndpoints } from '../../api/src/operations/health.ts';
 import type { AssetSource } from '../../server/src/serve.ts';
 import { routeRequest } from '../../server/src/serve.ts';
 import type { IdentityDatabase } from './bindings.ts';
-import { openGuestDatabase, sharesTransaction } from './database.ts';
+import { openGuestDatabase } from './database.ts';
 import { ensureSchema, resetSchema } from './migrations.ts';
 import type { ConfigStore } from './settings.ts';
 import { loadGuestSettings } from './settings.ts';
@@ -71,9 +71,6 @@ async function boot(runtime: GuestRuntime): Promise<void> {
   container.register(Readiness);
   container.register(OperationsEndpoints);
   container.register(ControlPlaneRouter);
-  if (!(await sharesTransaction(database))) {
-    throw new Error('postgres queries do not share a transaction');
-  }
 }
 
 /**

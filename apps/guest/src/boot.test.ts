@@ -68,25 +68,28 @@ function asTable(result: unknown): unknown {
   );
 }
 
-function bridge(reserved: SQL, options: { splitTransactions?: boolean } = {}): IdentityDatabase {
-  let txid = 0;
+/**
+ * The binding as the host serves it: every call takes whichever pooled connection is free, so
+ * consecutive statements of one request land on different connections. Rotating through the
+ * reserved connections reproduces that, including for `BEGIN` / `COMMIT` pairs, which is why
+ * the guest must not rely on them.
+ */
+function bridge(connections: SQL[]): IdentityDatabase {
+  let turn = 0;
+  const next = () => connections[turn++ % connections.length] as SQL;
   return {
     async batch(sql: string) {
-      await reserved.unsafe(sql);
+      await next().unsafe(sql);
     },
     async rows(sql: string, params: readonly { val: string }[] = []) {
-      const result = await reserved.unsafe(
+      const result = await next().unsafe(
         sql,
         params.map((param) => param.val),
       );
       return Array.isArray(result) ? (result as Record<string, unknown>[]) : [];
     },
     async query(sql: string, params: readonly unknown[] = []) {
-      if (options.splitTransactions && sql.includes('txid_current')) {
-        txid += 1;
-        return table(['tx'], [[textCell(String(txid))]]);
-      }
-      return asTable(await reserved.unsafe(sql, params.map(fromPg)));
+      return asTable(await next().unsafe(sql, params.map(fromPg)));
     },
   } as unknown as IdentityDatabase;
 }
@@ -124,11 +127,15 @@ function guestConfig(
   ];
 }
 
-test('the guest boots on one connection and serves the Bun routes', async () => {
+test('the guest boots with no connection affinity and serves the Bun routes', async () => {
   await withContainer(() =>
     withThrowawayDatabase('identity_guest_http', async () => {
       const sql = new SQL(databaseUrl('identity_guest_http'));
       const reserved = await sql.reserve();
+      const other = await sql.reserve();
+      // Two connections, used in turn: a `BEGIN` on one would never pair with a `COMMIT` on the
+      // other, so this boot and every write below prove the guest does without them.
+      const database = bridge([reserved, other]);
       const shell = '<!doctype html><div id="root" data-guest="shell"></div>';
       const fresh = () => {
         useContainer().register(BootstrapReconciler);
@@ -137,22 +144,8 @@ test('the guest boots on one connection and serves the Bun routes', async () => 
       const assets = new Map<string, Uint8Array>([['main.js', new Uint8Array([1, 2, 3])]]);
       try {
         fresh();
-        const refused = await handle(new Request('https://identity.test/ready'), {
-          database: bridge(reserved, { splitTransactions: true }),
-          config: { getAll: () => guestConfig(false) },
-          assets,
-          shell,
-        });
-        expect(refused.status).toBe(503);
-        expect(await refused.json()).toEqual({
-          ok: false,
-          error: 'postgres queries do not share a transaction',
-        });
-
-        resetGuest();
-        fresh();
         const ready = await handle(new Request('https://identity.test/ready'), {
-          database: bridge(reserved),
+          database,
           config: { getAll: () => guestConfig(false) },
           assets,
           shell,
@@ -169,14 +162,14 @@ test('the guest boots on one connection and serves the Bun routes', async () => 
           },
         });
         const health = await handle(new Request('https://identity.test/health'), {
-          database: bridge(reserved),
+          database,
           config: { getAll: () => guestConfig(false) },
           assets,
           shell,
         });
         expect(health.status).toBe(200);
         const login = await handle(new Request('https://identity.test/login'), {
-          database: bridge(reserved),
+          database,
           config: { getAll: () => guestConfig(false) },
           assets,
           shell,
@@ -184,7 +177,7 @@ test('the guest boots on one connection and serves the Bun routes', async () => 
         expect(login.status).toBe(200);
         expect(await login.text()).toContain('data-guest="shell"');
         const script = await handle(new Request('https://identity.test/assets/main.js'), {
-          database: bridge(reserved),
+          database,
           config: { getAll: () => guestConfig(false) },
           assets,
           shell,
@@ -197,7 +190,7 @@ test('the guest boots on one connection and serves the Bun routes', async () => 
             body: JSON.stringify({ slug: 'acme', name: 'Acme' }),
           }),
           {
-            database: bridge(reserved),
+            database,
             config: { getAll: () => guestConfig(false) },
             assets,
             shell,
@@ -213,7 +206,7 @@ test('the guest boots on one connection and serves the Bun routes', async () => 
           },
         } as unknown as NotificationWorker);
         const drained = await handle(new Request('https://identity.test/health'), {
-          database: bridge(reserved),
+          database,
           config: { getAll: () => guestConfig(true) },
           assets,
           shell,
@@ -224,7 +217,7 @@ test('the guest boots on one connection and serves the Bun routes', async () => 
         resetGuest();
         fresh();
         const redirected = await handle(new Request('https://identity.test/health'), {
-          database: bridge(reserved),
+          database,
           config: {
             getAll: () => guestConfig(false, 'http://localhost:3000/callback,https://app.test/cb'),
           },
@@ -250,6 +243,7 @@ test('the guest boots on one connection and serves the Bun routes', async () => 
         }
         useContainer().register(NotificationWorker);
         reserved.release();
+        other.release();
         await sql.end();
         await useTestDatabase();
       }

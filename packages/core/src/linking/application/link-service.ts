@@ -156,16 +156,15 @@ export class LinkService {
     });
   }
 
-  /** Single-use: the confirmation is deleted before it is checked. */
+  /** Single-use: the confirmation is deleted, in the same statement that reads it, before it is checked. */
   private async consume(
     caller: AccountCaller,
     token: string,
     expected?: { issuer: string; subject: string },
   ): Promise<IdentityLink | ServiceResult> {
     if (!TOKEN_PATTERN.test(token)) return new ServiceResult(400);
-    const confirmation = await this.links.findConfirmation(Hashing.sha256Hex(token));
+    const confirmation = await this.links.takeConfirmation(Hashing.sha256Hex(token));
     if (!confirmation) return new ServiceResult(400);
-    await this.links.deleteConfirmation(confirmation.tokenHash);
     if (
       confirmation.userId !== caller.userId ||
       confirmation.sessionHash !== Hashing.sha256Hex(caller.sessionId ?? '') ||
@@ -202,11 +201,9 @@ export class LinkService {
 
       const link = await this.links.lockForUser(user.id, issuer, subject);
       if (!link) return new ServiceResult(404);
-      const remaining = await this.links.countOther(user.id, link.id);
-      const hasPassword = Boolean(user.passwordHash?.trim());
-      const hasVerifiedEmail = user.emailVerified && Boolean(user.email?.trim());
-      if (!hasPassword && !hasVerifiedEmail && remaining === 0) return new ServiceResult(409);
-      await this.links.delete(link.id);
+      // The remaining-method rule is checked by the delete statement itself, so it holds on a
+      // database that runs every statement on its own.
+      if (!(await this.links.deleteUnlessLastMethod(link.id))) return new ServiceResult(409);
       await this.authorizations.deleteByPrincipal(user.id);
       await this.notifications.enqueue('unlinked', user.id, link, caller.sessionId ?? null);
       return link;

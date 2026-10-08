@@ -46,50 +46,51 @@ export class PostgresOAuthRepository implements OAuthRepository {
    * `client_secret_basic` only, and the `browser` flag picks grant types, PKCE, and consent.
    */
   insert(client: NewOAuthClient): Promise<void> {
-    return this.db.transaction(async () => {
-      await this.db.write(
-        `INSERT INTO oauth2_registered_client (
+    // One statement writes both rows, so the registration is atomic without a transaction.
+    return this.db.write(
+      `WITH registered AS (
+         INSERT INTO oauth2_registered_client (
            id, client_id, client_secret, client_name, client_authentication_methods,
            authorization_grant_types, redirect_uris, scopes, client_settings, token_settings
-         ) VALUES (?, ?, ?, ?, 'client_secret_basic', ?, ?, ?, ?, ?)`,
-        [
-          crypto.randomUUID(),
-          client.clientId,
-          client.secretHash,
-          client.clientId,
-          this.grants(client.browser),
-          ClientColumns.list(client.redirectUris),
-          ClientColumns.list(client.scopes),
-          this.settings(client.browser),
-          ClientColumns.tokenSettings(),
-        ],
-      );
-      await this.db.write(
-        `INSERT INTO oauth_client_lifecycle (client_id, organization_slug) VALUES (?, ?)`,
-        [client.clientId, client.organizationSlug],
-      );
-    });
+         ) VALUES (?, ?, ?, ?, 'client_secret_basic', ?, ?, ?, ?, ?)
+         RETURNING client_id
+       )
+       INSERT INTO oauth_client_lifecycle (client_id, organization_slug)
+       SELECT client_id, ?::varchar FROM registered`,
+      [
+        crypto.randomUUID(),
+        client.clientId,
+        client.secretHash,
+        client.clientId,
+        this.grants(client.browser),
+        ClientColumns.list(client.redirectUris),
+        ClientColumns.list(client.scopes),
+        this.settings(client.browser),
+        ClientColumns.tokenSettings(),
+        client.organizationSlug,
+      ],
+    );
   }
 
   update(client: Omit<NewOAuthClient, 'secretHash'>): Promise<void> {
-    return this.db.transaction(async () => {
-      await this.db.write(
-        `UPDATE oauth2_registered_client
+    return this.db.write(
+      `WITH registered AS (
+         UPDATE oauth2_registered_client
          SET authorization_grant_types = ?, redirect_uris = ?, scopes = ?, client_settings = ?
-         WHERE client_id = ?`,
-        [
-          this.grants(client.browser),
-          ClientColumns.list(client.redirectUris),
-          ClientColumns.list(client.scopes),
-          this.settings(client.browser),
-          client.clientId,
-        ],
-      );
-      await this.db.write(
-        `UPDATE oauth_client_lifecycle SET organization_slug = ? WHERE client_id = ?`,
-        [client.organizationSlug, client.clientId],
-      );
-    });
+         WHERE client_id = ?
+         RETURNING client_id
+       )
+       UPDATE oauth_client_lifecycle SET organization_slug = ? WHERE client_id = ?`,
+      [
+        this.grants(client.browser),
+        ClientColumns.list(client.redirectUris),
+        ClientColumns.list(client.scopes),
+        this.settings(client.browser),
+        client.clientId,
+        client.organizationSlug,
+        client.clientId,
+      ],
+    );
   }
 
   rotateSecret(clientId: string, secretHash: string): Promise<void> {

@@ -160,15 +160,23 @@ export class PostgresLinkRepository implements LinkRepository {
     };
   }
 
-  countOther(userId: string, linkId: string): Promise<number> {
-    return this.db.count(
-      `SELECT count(*)::int AS count FROM identity_links WHERE user_id = ? AND id <> ?`,
-      [userId, linkId],
-    );
-  }
-
   delete(id: string): Promise<void> {
     return this.db.write(`DELETE FROM identity_links WHERE id = ?`, [id]);
+  }
+
+  async deleteUnlessLastMethod(id: string): Promise<boolean> {
+    const result = await this.db.run(
+      `DELETE FROM identity_links AS l
+       USING users AS u
+       WHERE l.id = ? AND u.id = l.user_id
+         AND (COALESCE(btrim(u.password_hash), '') <> ''
+              OR (u.email_verified AND COALESCE(btrim(u.email), '') <> '')
+              OR EXISTS (SELECT 1 FROM identity_links AS x
+                         WHERE x.user_id = l.user_id AND x.id <> l.id FOR UPDATE))
+       RETURNING 1`,
+      [id],
+    );
+    return (result.changes ?? 0) > 0;
   }
 
   insertConfirmation(confirmation: NewConfirmation): Promise<void> {
@@ -187,10 +195,10 @@ export class PostgresLinkRepository implements LinkRepository {
     );
   }
 
-  async findConfirmation(tokenHash: string): Promise<UnlinkConfirmation | undefined> {
+  async takeConfirmation(tokenHash: string): Promise<UnlinkConfirmation | undefined> {
     const row = await this.db.one<ConfirmationRow>(
-      `SELECT token_hash, user_id::text AS user_id, session_hash, issuer, subject, expires_at
-       FROM identity_unlink_confirmations WHERE token_hash = ?`,
+      `DELETE FROM identity_unlink_confirmations WHERE token_hash = ?
+       RETURNING token_hash, user_id::text AS user_id, session_hash, issuer, subject, expires_at`,
       [tokenHash],
     );
     return row ? this.confirmation(row) : undefined;
@@ -205,12 +213,6 @@ export class PostgresLinkRepository implements LinkRepository {
       row.subject,
       Timestamps.ms(row.expires_at),
     );
-  }
-
-  deleteConfirmation(tokenHash: string): Promise<void> {
-    return this.db.write(`DELETE FROM identity_unlink_confirmations WHERE token_hash = ?`, [
-      tokenHash,
-    ]);
   }
 
   private link(row: LinkRow): IdentityLink {

@@ -6,7 +6,7 @@ import { getBindingMetadata } from '@di-framework/bindings';
 import { text } from '@di-framework/repo/postgres';
 import { routeRequest } from '../../server/src/serve.ts';
 import { IdentityConfig, IdentityDatabase } from './bindings.ts';
-import { openGuestDatabase, sharesTransaction } from './database.ts';
+import { openGuestDatabase } from './database.ts';
 import { readFlywayMigrations } from './flyway.ts';
 import {
   applySchema,
@@ -171,57 +171,43 @@ test('uuid and integer parameters go inline so Postgres types them from context'
   expect(() => bindParams('SELECT ?', ['a', 'b'])).toThrow('placeholder count 1 does not match 2');
 });
 
-test('the sql adapter binds parameters and rolls a transaction back', async () => {
+test('the sql adapter binds parameters and never opens a transaction', async () => {
   const calls: string[] = [];
   const database = guest({
     queryBatch: async (sql) => {
       calls.push(sql);
-      if (sql === 'ROLLBACK') throw new Error('rollback failed');
     },
     query: async (sql, params) => {
       calls.push(`${sql} ${JSON.stringify(params)}`);
-      if (sql.includes('txid_current'))
-        return table(['tx'], [[cell(calls.length < 4 ? '9' : '8')]]);
       if (sql.includes('AS tx')) return table(['tx'], [[cell('9')]]);
       if (sql.includes('RETURNING')) return table(['one'], [[cell('1')]]);
       if (sql.includes('ALREADY')) throw new Error('PostgreSQL already failed');
+      if (sql.includes('EMPTY')) return table(['one'], []);
       throw { code: '23505', message: 'duplicate key value' };
     },
   });
   const sql = openGuestDatabase(database);
   expect(await sql.query<{ tx: string }>('SELECT ? AS tx', ['acme'])).toEqual([{ tx: '9' }]);
+  expect(await sql.first<{ tx: string }>('SELECT ? AS tx', ['acme'])).toEqual({ tx: '9' });
+  expect(await sql.first('SELECT EMPTY')).toBeNull();
   expect((await sql.run('DELETE FROM t WHERE id = ? RETURNING 1', ['a'])).changes).toBe(1);
   await expect(sql.run('INSERT INTO t VALUES (?)', ['a'])).rejects.toMatchObject({ code: '23505' });
   await expect(sql.query('SELECT ALREADY')).rejects.toThrow('PostgreSQL already failed');
+  await sql.exec('CREATE TABLE t (id text)');
+  // `transaction` runs the callback on the same autocommit handle; nesting joins it.
+  expect(
+    await sql.transaction(async (tx) => {
+      expect(tx).toBe(sql);
+      return tx.transaction(async (inner) => inner.first<{ tx: string }>('SELECT ? AS tx', ['x']));
+    }),
+  ).toEqual({ tx: '9' });
   await expect(
-    sql.transaction(async (tx) => {
-      await tx.query('SELECT txid_current()::text AS tx');
+    sql.transaction(async () => {
       throw new Error('nope');
     }),
   ).rejects.toThrow('nope');
-  expect(calls).toContain('BEGIN');
-  expect(calls).toContain('ROLLBACK');
-  const same = {
-    async transaction(fn: (db: { first: () => Promise<{ tx: string }> }) => Promise<unknown>) {
-      return fn({ first: async () => ({ tx: '4' }) });
-    },
-  };
-  const different = {
-    async transaction(fn: (db: { first: () => Promise<{ tx: string }> }) => Promise<unknown>) {
-      let n = 0;
-      return fn({
-        first: async () => ({ tx: String(++n) }),
-      });
-    },
-  };
-  expect(await sharesTransaction(same as never)).toBe(true);
-  expect(await sharesTransaction(different as never)).toBe(false);
-  expect(
-    await sharesTransaction({
-      transaction: async (fn: (db: { first: () => Promise<{ tx: null }> }) => Promise<unknown>) =>
-        fn({ first: async () => ({ tx: null }) }),
-    } as never),
-  ).toBe(false);
+  expect(calls.filter((call) => /^(BEGIN|COMMIT|ROLLBACK)/i.test(call))).toEqual([]);
+  expect(calls).toContain('CREATE TABLE t (id text)');
 });
 
 test('runtime secrets override wasi config', async () => {

@@ -1,45 +1,38 @@
-import { createSqlDatabase, type SqlDatabase } from '@di-framework/repo';
+import type { SqlDatabase } from '@di-framework/repo';
 import { postgresError, readRows } from '@di-framework/repo/postgres';
 import type { IdentityDatabase } from './bindings.ts';
 import { bindParams } from './pg.ts';
 
 /**
- * `SqlDatabase` over the wasmCloud Postgres binding. `createSqlDatabase` serializes statements
- * and brackets `transaction` with `BEGIN` / `COMMIT`. That is one transaction only when the
- * provider runs those calls on one connection.
+ * `SqlDatabase` over the wasmCloud Postgres binding, in autocommit.
+ *
+ * `wasmcloud:postgres@0.2.0` has no connection or transaction handle: each `query` and
+ * `query-batch` call may run on any pooled connection of the host, so a `BEGIN` sent in one call
+ * does not cover the next. The guest therefore never opens a transaction. Every statement
+ * commits on its own, `transaction(fn)` runs `fn` on this same handle, and `FOR UPDATE` and
+ * advisory locks last only for their statement. The repositories keep their invariants with
+ * single statements (conditional `UPDATE … RETURNING`, data-modifying CTEs), which the Bun
+ * server also runs, inside its real transactions. A multi-statement `exec` script still runs as
+ * one `query-batch`, which Postgres executes as one implicit transaction on one connection.
  */
 export function openGuestDatabase(database: IdentityDatabase): SqlDatabase {
-  return createSqlDatabase(
-    {
-      async run(sql, params) {
-        const rows = await statements(database, sql, params);
-        return { changes: rows.length };
-      },
-      query(sql, params) {
-        return statements(database, sql, params);
-      },
-      async exec(sql) {
-        await database.batch(sql);
-      },
+  const handle: SqlDatabase = {
+    async run(sql, params = []) {
+      const rows = await statements(database, sql, params);
+      return { changes: rows.length };
     },
-    { beginStatement: 'BEGIN' },
-  );
-}
-
-/** True when two reads inside one transaction observe the same `txid_current()`. */
-export async function sharesTransaction(database: SqlDatabase): Promise<boolean> {
-  let first = '';
-  let second = '';
-  await database.transaction(async (tx) => {
-    first = await txid(tx);
-    second = await txid(tx);
-  });
-  return first !== '' && first === second;
-}
-
-async function txid(database: SqlDatabase): Promise<string> {
-  const row = await database.first<{ tx: unknown }>('SELECT txid_current()::text AS tx');
-  return row?.tx == null ? '' : String(row.tx);
+    async query<T>(sql: string, params: unknown[] = []) {
+      return (await statements(database, sql, params)) as T[];
+    },
+    async first<T>(sql: string, params: unknown[] = []) {
+      return ((await statements(database, sql, params))[0] ?? null) as T | null;
+    },
+    async exec(sql) {
+      await database.batch(sql);
+    },
+    transaction: (fn) => fn(handle),
+  };
+  return handle;
 }
 
 async function statements(

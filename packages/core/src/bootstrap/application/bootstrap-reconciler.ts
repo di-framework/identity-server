@@ -84,6 +84,8 @@ export class BootstrapReconciler {
         require(loopbackOnly(uri), 'CLI client redirect URIs must be loopback http URIs');
     }
 
+    // Atomic on a pooled server. On a database that runs every statement on its own, a run that
+    // stops partway leaves rows the next run repairs; every step is an idempotent upsert.
     await this.directory.transaction(async () => {
       const ownerId = await this.ensurePerson(owner, 'platform_admin', true);
       const org = await this.ensureOrganization();
