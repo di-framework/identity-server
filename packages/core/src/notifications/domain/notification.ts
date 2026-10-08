@@ -23,7 +23,12 @@ export interface SecurityNotification {
 export interface NotificationRepository {
   /** `ON CONFLICT (event_key) DO NOTHING`; true when a row was inserted. */
   insertIfAbsent(notification: SecurityNotification): Promise<boolean>;
-  lock(id: string): Promise<SecurityNotification | undefined>;
+  /**
+   * Takes a due pending or failed row for delivery by moving its next attempt to `until`, in
+   * one statement, so two workers never send the same mail. Undefined when the row is not due,
+   * already taken, or in another status. The lease lapses if the outcome is never saved.
+   */
+  claim(id: string, now: number, until: number): Promise<SecurityNotification | undefined>;
   save(notification: SecurityNotification): Promise<void>;
   /** Ids of the oldest 50 pending or failed rows whose next attempt is due. */
   due(now: number, limit: number): Promise<string[]>;

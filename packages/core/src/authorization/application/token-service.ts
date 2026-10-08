@@ -16,6 +16,7 @@ import type { IdentitySettings } from '../../shared/infrastructure/identity-sett
 import {
   type Authorization,
   type AuthorizationRepository,
+  type ConsumedToken,
   OAuthError,
   type RegisteredClient,
   type StoredToken,
@@ -124,8 +125,10 @@ export class TokenService {
   }
 
   /**
-   * Runs `fn` in one transaction. An `OAuthError` it returns is thrown after commit, so
-   * revocations made before refusing (code replay, refresh reuse) are kept.
+   * Runs `fn` in one transaction where the database offers one. An `OAuthError` it returns is
+   * thrown after commit, so revocations made before refusing (code replay, refresh reuse) are
+   * kept. Single use of a code or refresh token does not depend on the transaction: `tokens`
+   * commits the grant with one conditional statement.
    */
   private async committed(fn: () => Promise<TokenResponse | OAuthError>): Promise<TokenResponse> {
     const result = await this.directory.transaction(fn);
@@ -179,6 +182,7 @@ export class TokenService {
         { ...authorization, code: { ...code, invalidated: true } },
         authorization.authorizedScopes,
         attributes,
+        { code: code.hash },
       );
     });
   }
@@ -214,16 +218,15 @@ export class TokenService {
           nonce: string | null;
           auth_time: number;
         },
+        { refresh: refresh.hash },
       );
     });
   }
 
   /** A remembered refresh token presented again: revoke the token family and audit it. */
   private async detectReplay(hash: string): Promise<void> {
-    const now = this.clock.now();
-    const authorizationId = await this.authorizations.lockReplayedRefresh(hash, now);
+    const authorizationId = await this.authorizations.claimReplayedRefresh(hash, this.clock.now());
     if (!authorizationId) return;
-    await this.authorizations.markRefreshReused(hash, now);
     await this.authorizations.delete(authorizationId);
     await this.audit.append({
       action: 'oauth.refresh_reuse_detected',
@@ -245,13 +248,19 @@ export class TokenService {
     return new OAuthError('invalid_grant');
   }
 
-  /** New access token, a rotated refresh token, and an ID token when `openid` was granted. */
+  /**
+   * New access token, a rotated refresh token, and an ID token when `openid` was granted. The
+   * grant is stored only if `consumed` is still consumable; when another request got there
+   * first, the loser is treated as the replay it is: a code replay revokes the authorization, a
+   * refresh replay revokes the token family.
+   */
   private async tokens(
     client: RegisteredClient,
     authorization: Authorization,
     scopes: string[],
     attributes: { nonce?: string | null; auth_time?: number },
-  ): Promise<TokenResponse> {
+    consumed: ConsumedToken,
+  ): Promise<TokenResponse | OAuthError> {
     const access = this.issue(TOKEN_SETTINGS.accessTokenTtlSeconds);
     const refresh = client.grantTypes.includes('refresh_token')
       ? this.issue(TOKEN_SETTINGS.refreshTokenTtlSeconds)
@@ -282,13 +291,19 @@ export class TokenService {
       };
     }
     if (refresh) response.refresh_token = refresh.value;
-    await this.authorizations.save({
-      ...authorization,
-      access: { ...access.stored, scopes },
-      refresh: refresh?.stored ?? null,
-      idToken,
-    });
-    return response;
+    const committed = await this.authorizations.commitGrant(
+      {
+        ...authorization,
+        access: { ...access.stored, scopes },
+        refresh: refresh?.stored ?? null,
+        idToken,
+      },
+      consumed,
+    );
+    if (committed) return response;
+    if ('code' in consumed) await this.authorizations.delete(authorization.id);
+    else await this.detectReplay(consumed.refresh);
+    return new OAuthError('invalid_grant');
   }
 
   static response(accessToken: string, scopes: string[]): TokenResponse {

@@ -58,13 +58,14 @@ export class PostgresNotificationRepository implements NotificationRepository {
     return (result.changes ?? 0) > 0;
   }
 
-  async lock(id: string): Promise<SecurityNotification | undefined> {
+  async claim(id: string, now: number, until: number): Promise<SecurityNotification | undefined> {
     const row = await this.db.one<Row>(
-      `SELECT id::text AS id, event_key, user_id::text AS user_id, action, recipient_email, provider_name,
-         issuer, identity_hint, correlation_id, status, attempts, next_attempt_at, created_at, sent_at,
-         last_error
-       FROM identity_security_notifications WHERE id = ? FOR UPDATE`,
-      [id],
+      `UPDATE identity_security_notifications SET next_attempt_at = ?
+       WHERE id = ? AND status IN ('pending', 'failed') AND next_attempt_at <= ?
+       RETURNING id::text AS id, event_key, user_id::text AS user_id, action, recipient_email,
+         provider_name, issuer, identity_hint, correlation_id, status, attempts, next_attempt_at,
+         created_at, sent_at, last_error`,
+      [new Date(until), id, new Date(now)],
     );
     if (!row) return undefined;
     return {

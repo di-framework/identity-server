@@ -57,8 +57,20 @@ export interface Authorization {
 
 export type TokenKind = 'code' | 'access' | 'refresh';
 
+/**
+ * The token a grant consumed: the authorization code it exchanged, or the refresh token it
+ * rotated. `commitGrant` stores the issued tokens only while that token is still consumable.
+ */
+export type ConsumedToken = { code: string } | { refresh: string };
+
 export interface AuthorizationRepository {
   save(authorization: Authorization): Promise<void>;
+  /**
+   * Stores the tokens a grant issued, in one statement, only if the code is still unused or the
+   * refresh token is still the current one. False when a concurrent grant consumed it first. This
+   * is what keeps codes and refresh tokens single-use without a transaction or a row lock.
+   */
+  commitGrant(authorization: Authorization, consumed: ConsumedToken): Promise<boolean>;
   findById(id: string): Promise<Authorization | undefined>;
   /** Finds by token hash. `lock` takes `FOR UPDATE` inside the caller's transaction. */
   findByToken(kind: TokenKind, hash: string, lock?: boolean): Promise<Authorization | undefined>;
@@ -71,9 +83,11 @@ export interface AuthorizationRepository {
   saveConsent(registeredClientId: string, principalName: string, scopes: string[]): Promise<void>;
   /** `ON CONFLICT DO NOTHING` insert of a rotated refresh token hash. */
   rememberRefresh(hash: string, authorizationId: string, expiresAt: number): Promise<void>;
-  /** Locks an unexpired, unused history row and returns its authorization id. */
-  lockReplayedRefresh(hash: string, now: number): Promise<string | undefined>;
-  markRefreshReused(hash: string, now: number): Promise<void>;
+  /**
+   * Marks an unexpired, unused history row as reused and returns its authorization id, in one
+   * statement, so exactly one request detects a given replay.
+   */
+  claimReplayedRefresh(hash: string, now: number): Promise<string | undefined>;
 }
 
 export interface NewRegisteredClient {

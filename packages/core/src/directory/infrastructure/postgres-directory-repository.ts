@@ -66,6 +66,15 @@ interface MemberRow {
 const USER_COLUMNS = `id::text AS id, login, email, display_name, email_verified, status,
   password_hash, system_role, avatar_url`;
 
+/**
+ * Another owner of membership `m`'s organization, locked `FOR UPDATE`. A statement guarded by
+ * this waits for a concurrent change to that owner and then re-evaluates it, which is what keeps
+ * the last-owner rule true without a surrounding transaction.
+ */
+const OTHER_OWNER = `SELECT 1 FROM organization_memberships AS x
+  WHERE x.organization_id = m.organization_id AND x.user_id <> m.user_id AND x.role = 'owner'
+  FOR UPDATE`;
+
 @Container()
 export class PostgresDirectoryRepository implements DirectoryRepository {
   constructor(@Component(PostgresGateway) private readonly db: PostgresGateway) {}
@@ -261,6 +270,53 @@ export class PostgresDirectoryRepository implements DirectoryRepository {
        WHERE m.organization_id = o.id AND o.slug = ? AND m.user_id = ?
        RETURNING 1`,
       [slug, userId],
+    );
+    return (result.changes ?? 0) > 0;
+  }
+
+  async demoteOwner(slug: string, userId: string): Promise<boolean> {
+    const result = await this.db.run(
+      `UPDATE organization_memberships AS m SET role = 'member'
+       FROM organizations AS o
+       WHERE o.id = m.organization_id AND o.slug = ? AND m.user_id = ? AND m.role = 'owner'
+         AND EXISTS (${OTHER_OWNER})
+       RETURNING 1`,
+      [slug, userId],
+    );
+    return (result.changes ?? 0) > 0;
+  }
+
+  async deleteMembershipUnlessLastOwner(slug: string, userId: string): Promise<boolean> {
+    const result = await this.db.run(
+      `DELETE FROM organization_memberships AS m
+       USING organizations AS o
+       WHERE m.organization_id = o.id AND o.slug = ? AND m.user_id = ?
+         AND (m.role <> 'owner' OR EXISTS (${OTHER_OWNER}))
+       RETURNING 1`,
+      [slug, userId],
+    );
+    return (result.changes ?? 0) > 0;
+  }
+
+  async archiveUnlessLast(id: string): Promise<boolean> {
+    // The locked sub-selects make concurrent archives and owner changes wait for each other
+    // and re-check the row they waited on, so the two counts cannot both pass at once.
+    const result = await this.db.run(
+      `UPDATE users AS u SET status = 'archived', updated_at = now()
+       WHERE u.id = ?
+         AND (u.system_role <> 'platform_admin'
+              OR (SELECT count(*) FROM (
+                    SELECT 1 FROM users AS x
+                    WHERE x.system_role = 'platform_admin' AND x.status = 'active' FOR UPDATE
+                  ) AS active_admins) > 1)
+         AND NOT EXISTS (
+           SELECT 1 FROM organization_memberships AS m
+           JOIN organizations AS o ON o.id = m.organization_id
+           WHERE m.user_id = u.id AND m.role = 'owner' AND o.archived_at IS NULL
+             AND NOT EXISTS (${OTHER_OWNER})
+         )
+       RETURNING 1`,
+      [id],
     );
     return (result.changes ?? 0) > 0;
   }

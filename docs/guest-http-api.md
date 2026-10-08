@@ -34,7 +34,7 @@ Deployment topology is `di-framework.deploy.toml`. Target `identity` uses tenant
 
 `wasmcloud:postgres@0.2.0` exposes `query` and `queryBatch`, not a pooled connection. `packages/core` still expects `SqlDatabase.transaction` to hold one connection across `BEGIN` / work / `COMMIT`, including `SELECT … FOR UPDATE`.
 
-Before writing repositories as single statements, a live check confirmed that two `SELECT txid_current()` calls inside one guest transaction see the same transaction id. `apps/guest/src/database.ts` wraps `IdentityDatabase` with `createSqlDatabase`. `sharesTransaction()` runs on boot and refuses to serve if the provider splits the transaction.
+`apps/guest/src/database.ts` wraps `IdentityDatabase` as a `SqlDatabase` that runs in autocommit: it never sends `BEGIN` or `COMMIT`, and `transaction(fn)` runs `fn` on the same handle. See [Transaction semantics on wasmCloud](#transaction-semantics-on-wasmcloud) for why, and for how the repositories keep their invariants without one.
 
 `apps/guest/src/pg.ts` encodes parameters as the provider’s `pg-value` variants (uuid, bool, int, timestamptz, bytea, jsonb) and decodes result cells back to JSON values. SQL `?` placeholders become `$n` through the existing `toPostgresParams`.
 
@@ -46,6 +46,27 @@ Row counts that the Bun driver reports as `changes` are not available from this 
 - `postgres-notification-repository.ts` (notification insert)
 
 `packages/core/src/shared/infrastructure/postgres.ts` loads `bun` through a variable `import()`. The guest bundle never opens that pool. The bundler warning about an unresolved specifier `pecifie` is that variable seen mid-token; the Wasm component does not call it.
+
+### Transaction semantics on wasmCloud
+
+`wasmcloud:postgres@0.2.0` has no connection or transaction handle. Each `query` and `query-batch` call is routed by the host's Postgres plugin to whichever pooled connection is free, and the guest's binding is a named import (`identity-database-query`), which the plugin serves from a per-credential pool with no affinity at all. A `BEGIN` sent as one call therefore does not cover the `SELECT` sent as the next, and a `COMMIT` can land on a connection that never saw the `BEGIN`.
+
+The first guest version bracketed `transaction()` with `BEGIN` / `COMMIT` and refused to boot (`sharesTransaction()`, HTTP 503) when two `txid_current()` reads disagreed. Sequential requests passed only because a single connection happened to serve them. The first overlapping requests split a transaction across two connections, which left one connection `idle in transaction` in the host's pool forever (the plugin recycles connections without a reset), so every later boot read two different transaction ids and the workload answered 503 until its host pod was restarted.
+
+The guest now runs in autocommit and never opens a transaction:
+
+- Every statement commits on its own. `FOR UPDATE` and `pg_advisory_xact_lock` last for that statement only, so they serialize nothing on the guest. They stay in the code because the Bun server, whose `openPostgresDatabase` pins one connection per `transaction()`, still relies on them.
+- Anything that must be atomic or single-use is one statement, and the Bun server runs the same statement inside its transaction:
+  - `AuthorizationRepository.commitGrant` stores the tokens of a code or refresh grant with `UPDATE … WHERE` the code is still unused or the refresh token is still current. The loser of a concurrent exchange is treated as the replay it is (code: the authorization is deleted; refresh: `claimReplayedRefresh` revokes the family and audits).
+  - `ChallengeRepository.claim` consumes a passwordless token with a conditional `UPDATE`; `insertUnlessRecent` applies the one-per-minute rule in the insert itself.
+  - `DirectoryRepository.demoteOwner`, `deleteMembershipUnlessLastOwner`, and `archiveUnlessLast` check the last-owner and last-platform-admin rules in the statement, locking the other owners' rows with a `FOR UPDATE` sub-select so two concurrent changes wait for each other and re-check.
+  - `LinkRepository.takeConfirmation` is a `DELETE … RETURNING`, and `deleteUnlessLastMethod` keeps the account's last sign-in method in the statement.
+  - `NotificationRepository.claim` takes a due row by moving its next attempt forward, so two invocations draining the outbox never send the same mail.
+  - Client registration and update write `oauth2_registered_client` and `oauth_client_lifecycle` in one data-modifying CTE.
+- Not atomic on the guest, by design: bootstrap reconcile (idempotent upserts, repaired by the next run, the fingerprint is stored only after success), admin invite and the JSON `createUser` / `createOrganization` (a failure after the first insert leaves a row the next attempt reports as a conflict), and the audit rows written after a change (a change can commit with its audit row missing).
+- `query-batch` scripts (schema migrations) are still one implicit transaction: the simple query protocol runs a multi-statement string on one connection and rolls all of it back on error.
+
+`packages/core/tests/autocommit.test.ts` runs the single-use and last-owner invariants against the Bun pool with `transaction()` disabled, which is what the guest sees. `apps/guest/src/boot.test.ts` boots the guest over two connections used in turn.
 
 ## 2. Signing keys and passwords
 

@@ -81,7 +81,8 @@ export class MembershipAdminService {
     await this.policy.check(actorId, 'MEMBERSHIP_ROLE_CHANGE', { orgSlug: form.orgSlug });
     const back = (query: string) =>
       redirect(`/admin/memberships?orgSlug=${formEncode(form.orgSlug)}&${query}`);
-    // The organization row lock serializes owner-count checks with membership changes.
+    // The organization row lock serializes owner-count checks on a pooled server. The demotion
+    // itself is one guarded statement, so the last-owner rule holds without a transaction too.
     return this.directory.transaction(async () => {
       await this.directory.lockOrganization(form.orgSlug);
       const organization = await this.directory.findOrganization(form.orgSlug);
@@ -90,14 +91,13 @@ export class MembershipAdminService {
         : undefined;
       if (!organization || !membership) return failure(404, 'Not Found', '');
       const role = form.newRole === 'owner' ? 'owner' : 'member';
-      if (
-        membership.role === 'owner' &&
-        role === 'member' &&
-        !(await this.policy.canRemoveOrDemoteOrgOwner(form.orgSlug, form.userId))
-      ) {
-        return back(`error=${formEncode('Cannot demote last owner')}`);
+      if (membership.role === 'owner' && role === 'member') {
+        if (!(await this.directory.demoteOwner(form.orgSlug, form.userId))) {
+          return back(`error=${formEncode('Cannot demote last owner')}`);
+        }
+      } else {
+        await this.directory.upsertMembership(organization.id, form.userId, role);
       }
-      await this.directory.upsertMembership(organization.id, form.userId, role);
       await this.audit.append({
         action: 'admin.membership.role_change',
         actor: actorId,
@@ -125,13 +125,9 @@ export class MembershipAdminService {
         ? await this.directory.findMembership(organization.slug, form.userId)
         : undefined;
       if (!organization || !membership) return failure(404, 'Not Found', '');
-      if (
-        membership.role === 'owner' &&
-        !(await this.policy.canRemoveOrDemoteOrgOwner(form.orgSlug, form.userId))
-      ) {
+      if (!(await this.directory.deleteMembershipUnlessLastOwner(form.orgSlug, form.userId))) {
         return back(`error=${formEncode('Cannot remove last owner')}`);
       }
-      await this.directory.deleteMembership(form.orgSlug, form.userId);
       await this.audit.append({
         action: 'admin.membership.remove',
         actor: actorId,

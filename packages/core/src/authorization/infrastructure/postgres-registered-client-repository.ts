@@ -93,30 +93,31 @@ export class PostgresRegisteredClientRepository implements RegisteredClientRepos
   }
 
   insert(client: NewRegisteredClient): Promise<void> {
-    return this.db.transaction(async () => {
-      await this.db.write(
-        `INSERT INTO oauth2_registered_client (
+    // One statement writes both rows, so the registration is atomic without a transaction.
+    return this.db.write(
+      `WITH registered AS (
+         INSERT INTO oauth2_registered_client (
            id, client_id, client_secret, client_name, client_authentication_methods,
            authorization_grant_types, redirect_uris, scopes, client_settings, token_settings
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-        [
-          crypto.randomUUID(),
-          client.clientId,
-          client.secretHash,
-          client.clientName,
-          ClientColumns.list(client.authenticationMethods),
-          ClientColumns.list(client.grantTypes),
-          ClientColumns.list(client.redirectUris),
-          ClientColumns.list(client.scopes),
-          ClientColumns.settings(client.settings),
-          ClientColumns.tokenSettings(),
-        ],
-      );
-      await this.db.write(
-        `INSERT INTO oauth_client_lifecycle (client_id, organization_slug) VALUES (?, ?)`,
-        [client.clientId, client.organizationSlug],
-      );
-    });
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         RETURNING client_id
+       )
+       INSERT INTO oauth_client_lifecycle (client_id, organization_slug)
+       SELECT client_id, ?::varchar FROM registered`,
+      [
+        crypto.randomUUID(),
+        client.clientId,
+        client.secretHash,
+        client.clientName,
+        ClientColumns.list(client.authenticationMethods),
+        ClientColumns.list(client.grantTypes),
+        ClientColumns.list(client.redirectUris),
+        ClientColumns.list(client.scopes),
+        ClientColumns.settings(client.settings),
+        ClientColumns.tokenSettings(),
+        client.organizationSlug,
+      ],
+    );
   }
 
   async update(
@@ -143,20 +144,31 @@ export class PostgresRegisteredClientRepository implements RegisteredClientRepos
     if (changes.scopes !== undefined) add('scopes', ClientColumns.list(changes.scopes));
     if (changes.settings !== undefined)
       add('client_settings', ClientColumns.settings(changes.settings));
-    await this.db.transaction(async () => {
-      if (sets.length > 0) {
-        await this.db.write(
-          `UPDATE oauth2_registered_client SET ${sets.join(', ')} WHERE client_id = ?`,
-          [...params, clientId],
-        );
-      }
-      if (changes.organizationSlug !== undefined) {
-        await this.db.write(
-          `UPDATE oauth_client_lifecycle SET organization_slug = ? WHERE client_id = ?`,
-          [changes.organizationSlug, clientId],
-        );
-      }
-    });
+    const statements: { sql: string; params: unknown[] }[] = [];
+    if (sets.length > 0) {
+      statements.push({
+        sql: `UPDATE oauth2_registered_client SET ${sets.join(', ')} WHERE client_id = ?`,
+        params: [...params, clientId],
+      });
+    }
+    if (changes.organizationSlug !== undefined) {
+      statements.push({
+        sql: `UPDATE oauth_client_lifecycle SET organization_slug = ? WHERE client_id = ?`,
+        params: [changes.organizationSlug, clientId],
+      });
+    }
+    const [first, second] = statements;
+    if (!first) return;
+    // Both updates go in one statement (a data-modifying CTE), so they are atomic without a
+    // transaction.
+    if (second) {
+      await this.db.write(`WITH registered AS (${first.sql} RETURNING client_id) ${second.sql}`, [
+        ...first.params,
+        ...second.params,
+      ]);
+      return;
+    }
+    await this.db.write(first.sql, first.params);
   }
 
   ensureLifecycle(clientId: string, organizationSlug: string | null): Promise<void> {

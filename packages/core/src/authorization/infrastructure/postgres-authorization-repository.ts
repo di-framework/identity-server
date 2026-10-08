@@ -3,6 +3,7 @@ import { PostgresGateway, Timestamps } from '../../shared/infrastructure/postgre
 import type {
   Authorization,
   AuthorizationRepository,
+  ConsumedToken,
   StoredToken,
   TokenKind,
 } from '../domain/models.ts';
@@ -48,70 +49,97 @@ const COLUMNS: Record<TokenKind, string> = {
   refresh: 'refresh_token_value',
 };
 
+/** Columns `save` and `commitGrant` both write, in the order `tokenColumns` lists the values. */
+const TOKEN_COLUMNS = [
+  'authorized_scopes',
+  'attributes',
+  'state',
+  'authorization_code_value',
+  'authorization_code_issued_at',
+  'authorization_code_expires_at',
+  'authorization_code_metadata',
+  'access_token_value',
+  'access_token_issued_at',
+  'access_token_expires_at',
+  'access_token_metadata',
+  'access_token_type',
+  'access_token_scopes',
+  'refresh_token_value',
+  'refresh_token_issued_at',
+  'refresh_token_expires_at',
+  'refresh_token_metadata',
+  'oidc_id_token_value',
+  'oidc_id_token_issued_at',
+  'oidc_id_token_expires_at',
+  'oidc_id_token_metadata',
+  'oidc_id_token_claims',
+] as const;
+
+function tokenColumns(authorization: Authorization): unknown[] {
+  const token = (value: StoredToken | null) => [
+    value?.hash ?? null,
+    value ? new Date(value.issuedAt) : null,
+    value ? new Date(value.expiresAt) : null,
+    value ? JSON.stringify({ invalidated: value.invalidated }) : null,
+  ];
+  return [
+    authorization.authorizedScopes.join(' '),
+    JSON.stringify(authorization.attributes),
+    authorization.state,
+    ...token(authorization.code),
+    ...token(authorization.access),
+    authorization.access ? 'Bearer' : null,
+    authorization.access ? authorization.access.scopes.join(' ') : null,
+    ...token(authorization.refresh),
+    ...token(authorization.idToken),
+    authorization.idToken ? JSON.stringify(authorization.idToken.claims) : null,
+  ];
+}
+
 @Container()
 export class PostgresAuthorizationRepository implements AuthorizationRepository {
   constructor(@Component(PostgresGateway) private readonly db: PostgresGateway) {}
 
   save(authorization: Authorization): Promise<void> {
-    const token = (value: StoredToken | null) => [
-      value?.hash ?? null,
-      value ? new Date(value.issuedAt) : null,
-      value ? new Date(value.expiresAt) : null,
-      value ? JSON.stringify({ invalidated: value.invalidated }) : null,
-    ];
-
     return this.db.write(
       `INSERT INTO oauth2_authorization (
-         id, registered_client_id, principal_name, authorization_grant_type, authorized_scopes,
-         attributes, state,
-         authorization_code_value, authorization_code_issued_at, authorization_code_expires_at,
-         authorization_code_metadata,
-         access_token_value, access_token_issued_at, access_token_expires_at, access_token_metadata,
-         access_token_type, access_token_scopes,
-         refresh_token_value, refresh_token_issued_at, refresh_token_expires_at, refresh_token_metadata,
-         oidc_id_token_value, oidc_id_token_issued_at, oidc_id_token_expires_at, oidc_id_token_metadata,
-         oidc_id_token_claims
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         id, registered_client_id, principal_name, authorization_grant_type, ${TOKEN_COLUMNS.join(', ')}
+       ) VALUES (?, ?, ?, ?, ${TOKEN_COLUMNS.map(() => '?').join(', ')})
        ON CONFLICT (id) DO UPDATE SET
-         authorized_scopes = EXCLUDED.authorized_scopes,
-         attributes = EXCLUDED.attributes,
-         state = EXCLUDED.state,
-         authorization_code_value = EXCLUDED.authorization_code_value,
-         authorization_code_issued_at = EXCLUDED.authorization_code_issued_at,
-         authorization_code_expires_at = EXCLUDED.authorization_code_expires_at,
-         authorization_code_metadata = EXCLUDED.authorization_code_metadata,
-         access_token_value = EXCLUDED.access_token_value,
-         access_token_issued_at = EXCLUDED.access_token_issued_at,
-         access_token_expires_at = EXCLUDED.access_token_expires_at,
-         access_token_metadata = EXCLUDED.access_token_metadata,
-         access_token_type = EXCLUDED.access_token_type,
-         access_token_scopes = EXCLUDED.access_token_scopes,
-         refresh_token_value = EXCLUDED.refresh_token_value,
-         refresh_token_issued_at = EXCLUDED.refresh_token_issued_at,
-         refresh_token_expires_at = EXCLUDED.refresh_token_expires_at,
-         refresh_token_metadata = EXCLUDED.refresh_token_metadata,
-         oidc_id_token_value = EXCLUDED.oidc_id_token_value,
-         oidc_id_token_issued_at = EXCLUDED.oidc_id_token_issued_at,
-         oidc_id_token_expires_at = EXCLUDED.oidc_id_token_expires_at,
-         oidc_id_token_metadata = EXCLUDED.oidc_id_token_metadata,
-         oidc_id_token_claims = EXCLUDED.oidc_id_token_claims`,
+         ${TOKEN_COLUMNS.map((column) => `${column} = EXCLUDED.${column}`).join(',\n         ')}`,
       [
         authorization.id,
         authorization.registeredClientId,
         authorization.principalName,
         authorization.grantType,
-        authorization.authorizedScopes.join(' '),
-        JSON.stringify(authorization.attributes),
-        authorization.state,
-        ...token(authorization.code),
-        ...token(authorization.access),
-        authorization.access ? 'Bearer' : null,
-        authorization.access ? authorization.access.scopes.join(' ') : null,
-        ...token(authorization.refresh),
-        ...token(authorization.idToken),
-        authorization.idToken ? JSON.stringify(authorization.idToken.claims) : null,
+        ...tokenColumns(authorization),
       ],
     );
+  }
+
+  /**
+   * The metadata column holds the JSON `save` writes, so an unused code is one whose metadata
+   * does not say `"invalidated":true`. A rotated refresh token is one whose hash is no longer
+   * the row's `refresh_token_value`.
+   */
+  async commitGrant(authorization: Authorization, consumed: ConsumedToken): Promise<boolean> {
+    const guard =
+      'code' in consumed
+        ? `authorization_code_value = ?
+           AND position('"invalidated":true' IN COALESCE(authorization_code_metadata, '')) = 0`
+        : 'refresh_token_value = ?';
+    const result = await this.db.run(
+      `UPDATE oauth2_authorization SET
+         ${TOKEN_COLUMNS.map((column) => `${column} = ?`).join(',\n         ')}
+       WHERE id = ? AND ${guard}
+       RETURNING 1`,
+      [
+        ...tokenColumns(authorization),
+        authorization.id,
+        'code' in consumed ? consumed.code : consumed.refresh,
+      ],
+    );
+    return (result.changes ?? 0) > 0;
   }
 
   async findById(id: string): Promise<Authorization | undefined> {
@@ -180,20 +208,14 @@ export class PostgresAuthorizationRepository implements AuthorizationRepository 
     );
   }
 
-  async lockReplayedRefresh(hash: string, now: number): Promise<string | undefined> {
+  async claimReplayedRefresh(hash: string, now: number): Promise<string | undefined> {
     const row = await this.db.one<{ authorization_id: string }>(
-      `SELECT authorization_id FROM oauth_refresh_token_history
-       WHERE token_hash = ? AND reused_at IS NULL AND expires_at > ? FOR UPDATE`,
-      [hash, new Date(now)],
+      `UPDATE oauth_refresh_token_history SET reused_at = ?
+       WHERE token_hash = ? AND reused_at IS NULL AND expires_at > ?
+       RETURNING authorization_id`,
+      [new Date(now), hash, new Date(now)],
     );
     return row?.authorization_id;
-  }
-
-  markRefreshReused(hash: string, now: number): Promise<void> {
-    return this.db.write(
-      `UPDATE oauth_refresh_token_history SET reused_at = ? WHERE token_hash = ?`,
-      [new Date(now), hash],
-    );
   }
 
   private authorization(row: Row): Authorization {

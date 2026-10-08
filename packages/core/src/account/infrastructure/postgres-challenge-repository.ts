@@ -22,18 +22,19 @@ export class PostgresChallengeRepository implements ChallengeRepository {
     ]);
   }
 
-  countSince(email: string, purpose: ChallengePurpose, since: number): Promise<number> {
-    return this.db.count(
-      `SELECT count(*)::int AS count FROM email_challenges
-       WHERE email = ? AND purpose = ? AND created_at > ?`,
-      [email, purpose, new Date(since)],
-    );
-  }
-
-  insert(challenge: EmailChallenge, now: number): Promise<void> {
-    return this.db.write(
+  async insertUnlessRecent(
+    challenge: EmailChallenge,
+    now: number,
+    since: number,
+  ): Promise<boolean> {
+    // The select list is cast so the parameter types do not depend on the insert target.
+    const result = await this.db.run(
       `INSERT INTO email_challenges (id, user_id, email, token_hash, purpose, expires_at, consumed_at, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+       SELECT ?::uuid, ?::uuid, ?::varchar, ?::varchar, ?::varchar, ?::timestamptz, ?::timestamptz, ?::timestamptz
+       WHERE NOT EXISTS (
+         SELECT 1 FROM email_challenges WHERE email = ? AND purpose = ? AND created_at > ?
+       )
+       RETURNING 1`,
       [
         challenge.id,
         challenge.userId,
@@ -43,8 +44,12 @@ export class PostgresChallengeRepository implements ChallengeRepository {
         new Date(challenge.expiresAt),
         challenge.consumedAt == null ? null : new Date(challenge.consumedAt),
         new Date(now),
+        challenge.email,
+        challenge.purpose,
+        new Date(since),
       ],
     );
+    return (result.changes ?? 0) > 0;
   }
 
   async lockByHash(tokenHash: string): Promise<EmailChallenge | undefined> {
@@ -63,6 +68,16 @@ export class PostgresChallengeRepository implements ChallengeRepository {
       expiresAt: Timestamps.ms(row.expires_at),
       consumedAt: row.consumed_at == null ? null : Timestamps.ms(row.consumed_at),
     };
+  }
+
+  async claim(id: string, now: number): Promise<boolean> {
+    const result = await this.db.run(
+      `UPDATE email_challenges SET consumed_at = ?
+       WHERE id = ? AND consumed_at IS NULL AND expires_at > ?
+       RETURNING 1`,
+      [new Date(now), id, new Date(now)],
+    );
+    return (result.changes ?? 0) > 0;
   }
 
   markConsumed(id: string, now: number): Promise<void> {

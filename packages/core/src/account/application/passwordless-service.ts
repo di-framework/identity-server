@@ -59,7 +59,11 @@ export class PasswordlessService {
     return this.stage(user, 'invite');
   }
 
-  /** Consumes a challenge under a row lock, then activates the user and verifies the email. */
+  /**
+   * Consumes a challenge, then activates the user and verifies the email. The row lock
+   * serializes callers on a pooled server; `claim` is one conditional statement, so the token is
+   * single-use on a database that runs every statement on its own.
+   */
   consume(token: string): Promise<ConsumedChallenge | undefined> {
     if (!TOKEN_PATTERN.test(token)) return Promise.resolve(undefined);
     return this.directory.transaction(async () => {
@@ -69,7 +73,7 @@ export class PasswordlessService {
         return undefined;
       const user = challenge.userId ? await this.directory.findUser(challenge.userId) : undefined;
       if (!user || (user.status !== 'pending' && user.status !== 'active')) return undefined;
-      await this.challenges.markConsumed(challenge.id, now);
+      if (!(await this.challenges.claim(challenge.id, now))) return undefined;
       await this.directory.updateAccount(user.id, { status: 'active', emailVerified: true });
       await this.audit.append({
         action: 'passwordless.consumed',
@@ -84,8 +88,9 @@ export class PasswordlessService {
 
   /**
    * Inserts a challenge unless one was issued for this email and purpose in the last minute. The
-   * check and insert run under a transaction-scoped lock on the email and purpose, so concurrent
-   * requests issue at most one challenge.
+   * check and insert are one statement, so a database without transactions still issues one
+   * challenge per request; the transaction-scoped lock on the email and purpose additionally
+   * serializes concurrent requests on a pooled server.
    */
   private stage(user: UserAccount, purpose: ChallengePurpose): Promise<Delivery> {
     const email = user.email;
@@ -93,11 +98,9 @@ export class PasswordlessService {
     return this.directory.transaction(async () => {
       await this.challenges.lockIssuance(email, purpose);
       const now = this.clock.now();
-      if ((await this.challenges.countSince(email, purpose, now - CHALLENGE_INTERVAL_MS)) > 0)
-        return NOTHING;
       const token = Hashing.token();
       const id = crypto.randomUUID();
-      await this.challenges.insert(
+      const inserted = await this.challenges.insertUnlessRecent(
         {
           id,
           userId: user.id,
@@ -108,7 +111,9 @@ export class PasswordlessService {
           consumedAt: null,
         },
         now,
+        now - CHALLENGE_INTERVAL_MS,
       );
+      if (!inserted) return NOTHING;
       return () => this.deliver(user.id, email, id, token);
     });
   }

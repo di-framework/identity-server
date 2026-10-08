@@ -59,18 +59,23 @@ export interface LinkRepository {
   list(userId: string): Promise<IdentityLink[]>;
   find(userId: string, issuer: string, subject: string): Promise<IdentityLink | undefined>;
   findById(id: string): Promise<IdentityLink | undefined>;
-  countOther(userId: string, linkId: string): Promise<number>;
   delete(id: string): Promise<void>;
+  /**
+   * Deletes a link in one statement unless it is the account's last way to sign in: no
+   * password, no verified email, and no other link. The other links are locked, so two
+   * concurrent unlinks cannot both pass. False when nothing was deleted.
+   */
+  deleteUnlessLastMethod(id: string): Promise<boolean>;
   insert(link: NewIdentityLink): Promise<IdentityLink>;
   /** `(issuer, subject)` row with `FOR UPDATE`, in any account. */
   lockByIdentity(issuer: string, subject: string): Promise<IdentityLink | undefined>;
   /** A user's link with `FOR UPDATE`. */
   lockForUser(userId: string, issuer: string, subject: string): Promise<IdentityLink | undefined>;
   insertConfirmation(confirmation: NewConfirmation): Promise<void>;
-  findConfirmation(tokenHash: string): Promise<UnlinkConfirmation | undefined>;
+  /** Deletes and returns a confirmation, so a confirmation token is single-use. */
+  takeConfirmation(tokenHash: string): Promise<UnlinkConfirmation | undefined>;
   /** Newest confirmation for a user and session. */
   latestConfirmation(userId: string, sessionHash: string): Promise<UnlinkConfirmation | undefined>;
-  deleteConfirmation(tokenHash: string): Promise<void>;
   insertFlow(flow: LinkFlow): Promise<void>;
   /** Deletes and returns a flow, so a state token is single-use. */
   takeFlow(tokenHash: string): Promise<LinkFlow | undefined>;

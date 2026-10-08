@@ -65,7 +65,19 @@ export interface DirectoryRepository {
   countMembershipsForSlug(slug: string): Promise<number>;
   findMembership(slug: string, userId: string): Promise<Membership | undefined>;
   upsertMembership(organizationId: string, userId: string, role: string): Promise<void>;
+  /**
+   * Makes an owner a member unless they are the organization's only owner, in one statement
+   * that also locks the other owners' rows. False when nothing changed.
+   */
+  demoteOwner(slug: string, userId: string): Promise<boolean>;
   deleteMembership(slug: string, userId: string): Promise<boolean>;
+  /** `deleteMembership`, refused in the same statement when it would remove the only owner. */
+  deleteMembershipUnlessLastOwner(slug: string, userId: string): Promise<boolean>;
+  /**
+   * Archives a user in one statement, unless they are the last active platform administrator
+   * or the only owner of an active organization. False when nothing changed.
+   */
+  archiveUnlessLast(id: string): Promise<boolean>;
   listMembers(slug: string, afterId: string | undefined, limit: number): Promise<DirectoryMember[]>;
   findOrganizationById(id: string): Promise<Organization | undefined>;
   archiveOrganization(slug: string, at: number): Promise<void>;

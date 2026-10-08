@@ -129,8 +129,9 @@ export class UserAdminService {
   async archive(actorId: string, id: string): Promise<AdminResult<never>> {
     if (!UUID_PATTERN.test(id)) return invalidId();
     await this.policy.check(actorId, 'USER_ARCHIVE', { userId: id });
-    // Lock the platform-admin set and every organization the user owns, in slug order, so the
-    // last-admin and last-owner checks hold against concurrent archives and membership changes.
+    // On a pooled server the platform-admin set and every organization the user owns are locked,
+    // in slug order, so the checks below are serialized. The archive itself is one guarded
+    // statement, so the last-admin and last-owner rules also hold without a transaction.
     return this.directory.transaction(async () => {
       await this.directory.lockPlatformAdmins();
       const owned = (await this.directory.membershipsForUser(id))
@@ -142,7 +143,11 @@ export class UserAdminService {
       if (!user) return failure(404, 'Not Found', '');
       const blocked = await this.archiveBlock(id);
       if (blocked) return redirect(`/admin/users/${id}?error=${formEncode(blocked)}`);
-      await this.directory.updateAccount(id, { status: 'archived' });
+      if (!(await this.directory.archiveUnlessLast(id))) {
+        // A concurrent archive or owner change got there first; report the rule it hit.
+        const reason = (await this.archiveBlock(id)) ?? 'Cannot archive user';
+        return redirect(`/admin/users/${id}?error=${formEncode(reason)}`);
+      }
       await this.audit.append({
         action: 'admin.user.archive',
         actor: actorId,
