@@ -11,9 +11,11 @@ import type {
   RegisteredClientRepository,
 } from '@di-framework/identity/src/authorization/domain/models.ts';
 import { ClientColumns } from '@di-framework/identity/src/authorization/infrastructure/postgres-registered-client-repository.ts';
+import type { DirectoryRepository } from '@di-framework/identity/src/directory/domain/directory-repository.ts';
 import type { OAuthRepository } from '@di-framework/identity/src/oauth/domain/oauth-client.ts';
 import {
   AUTHORIZATIONS,
+  DIRECTORY,
   OAUTH,
   REGISTERED_CLIENTS,
 } from '@di-framework/identity/src/shared/domain/tokens.ts';
@@ -81,7 +83,7 @@ describe('discovery and keys', () => {
       revocation_endpoint: 'https://identity.test/oauth2/revoke',
       id_token_signing_alg_values_supported: ['RS256'],
       code_challenge_methods_supported: ['S256'],
-      token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post'],
+      token_endpoint_auth_methods_supported: ['client_secret_basic', 'client_secret_post', 'none'],
     });
     const server = (await (
       await controlPlane.fetch(
@@ -497,5 +499,117 @@ describe('authorization persistence', () => {
       `SELECT id FROM oauth2_authorization WHERE principal_name = 'nobody-else'`,
     );
     expect((await authorizations().findById(bare?.id ?? ''))?.attributes).toEqual({});
+  });
+});
+
+describe('public clients', () => {
+  test('exchange a code with PKCE and no secret, refresh, revoke, but cannot introspect', async () => {
+    const native = await registerClient({
+      methods: ['none'],
+      grantTypes: ['authorization_code', 'refresh_token'],
+      scopes: ['openid', 'profile'],
+      redirectUris: ['http://127.0.0.1/callback'],
+      requireProofKey: true,
+    });
+    const registered = await clients().find(native.clientId);
+    const userId = crypto.randomUUID();
+    await useContainer()
+      .resolve<DirectoryRepository>(DIRECTORY)
+      .insertAccount({
+        id: userId,
+        login: `native-${userId.slice(0, 8)}`,
+        email: `native-${userId.slice(0, 8)}@example.com`,
+        displayName: 'Native User',
+        passwordHash: null,
+        emailVerified: true,
+        systemRole: 'user',
+        status: 'active',
+      });
+    const verifier = Hashing.token();
+    const code = Hashing.token();
+    const redirect = 'http://127.0.0.1:50123/callback';
+    const now = Date.now();
+    await authorizations().save(
+      authorizationFor(registered?.id ?? '', {
+        grantType: 'authorization_code',
+        principalName: userId,
+        authorizedScopes: ['openid', 'profile'],
+        attributes: {
+          redirect_uri: redirect,
+          requested_redirect_uri: redirect,
+          code_challenge: Hashing.pkceChallenge(verifier),
+          nonce: null,
+          auth_time: now,
+        },
+        code: {
+          hash: Hashing.sha256Hex(code),
+          issuedAt: now,
+          expiresAt: now + 60_000,
+          invalidated: false,
+        },
+      }),
+    );
+    const exchanged = await token({
+      grant_type: 'authorization_code',
+      client_id: native.clientId,
+      code,
+      redirect_uri: redirect,
+      code_verifier: verifier,
+    });
+    expect(exchanged.response.status).toBe(200);
+    expect(exchanged.body).toMatchObject({ token_type: 'Bearer', scope: 'openid profile' });
+    const refresh = String(exchanged.body.refresh_token);
+    expect(refresh).toMatch(/^[A-Za-z0-9_-]{43}$/);
+
+    // A secret from a public client is a method it is not registered for.
+    const withSecret = await token({
+      grant_type: 'refresh_token',
+      client_id: native.clientId,
+      client_secret: 'anything',
+      refresh_token: refresh,
+    });
+    expect(withSecret.response.status).toBe(401);
+    const refreshed = await token({
+      grant_type: 'refresh_token',
+      client_id: native.clientId,
+      refresh_token: refresh,
+    });
+    expect(refreshed.response.status).toBe(200);
+
+    const introspected = await controlPlane.fetch(
+      formRequest('/oauth2/introspect', {
+        token: String(refreshed.body.access_token),
+        client_id: native.clientId,
+      }),
+    );
+    expect(introspected.status).toBe(401);
+    expect(await introspected.json()).toEqual({ error: 'invalid_client' });
+
+    const revoked = await controlPlane.fetch(
+      formRequest('/oauth2/revoke', {
+        token: String(refreshed.body.refresh_token),
+        client_id: native.clientId,
+      }),
+    );
+    expect(revoked.status).toBe(200);
+    const afterRevoke = await token({
+      grant_type: 'refresh_token',
+      client_id: native.clientId,
+      refresh_token: String(refreshed.body.refresh_token),
+    });
+    expect(afterRevoke.response.status).toBe(400);
+
+    // `none` without PKCE is refused: nothing would protect the grant.
+    const loose = await registerClient({
+      methods: ['none'],
+      grantTypes: ['authorization_code', 'refresh_token'],
+      requireProofKey: false,
+    });
+    const refused = await token({
+      grant_type: 'refresh_token',
+      client_id: loose.clientId,
+      refresh_token: 'x',
+    });
+    expect(refused.response.status).toBe(401);
   });
 });

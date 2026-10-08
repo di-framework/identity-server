@@ -320,3 +320,37 @@ describe('readiness', () => {
     });
   });
 });
+
+test('registers the public CLI client when configured, with loopback redirects only', async () => {
+  const cliId = `cli-${Hashing.token(4)}`;
+  const env = environment({
+    AUTH_CLI_CLIENT_ID: cliId,
+    AUTH_CLI_REDIRECT_URIS: 'http://127.0.0.1/callback, http://127.0.0.1/callback',
+  });
+  await reconciler(env).reconcile();
+  expect(await clients().find(cliId)).toMatchObject({
+    clientId: cliId,
+    secretHash: null,
+    authenticationMethods: ['none'],
+    grantTypes: ['authorization_code', 'refresh_token'],
+    redirectUris: ['http://127.0.0.1/callback'],
+    scopes: ['openid', 'profile', 'email', 'offline_access'],
+    settings: { requireProofKey: true, requireAuthorizationConsent: true },
+    organizationSlug: null,
+    revokedAt: null,
+  });
+  await reconciler({ ...env, AUTH_CLI_REDIRECT_URIS: 'http://[::1]/cb' }).reconcile();
+  expect((await clients().find(cliId))?.redirectUris).toEqual(['http://[::1]/cb']);
+  for (const bad of ['https://cli.example/cb', 'nope', 'http://localhost/cb']) {
+    await expect(reconciler({ ...env, AUTH_CLI_REDIRECT_URIS: bad }).reconcile()).rejects.toThrow(
+      'loopback',
+    );
+  }
+  // The environment loader substitutes the default for a blank value; an empty list only
+  // arrives through explicit settings.
+  const settings = loadIdentitySettings(env);
+  settings.clients.cli.redirectUris = [];
+  await expect(
+    useContainer().construct(BootstrapReconciler, { 0: settings }).reconcile(),
+  ).rejects.toThrow('CLI client redirect URIs are required');
+});
