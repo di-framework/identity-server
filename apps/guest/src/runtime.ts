@@ -1,3 +1,4 @@
+import { openPostgresDatabase } from '@di-framework/bindings/postgres';
 import { useContainer } from '@di-framework/core/container';
 import type { SqlDatabase } from '@di-framework/repo';
 import { BootstrapReconciler } from '../../../packages/core/src/bootstrap/application/bootstrap-reconciler.ts';
@@ -12,7 +13,6 @@ import { OperationsEndpoints } from '../../api/src/operations/health.ts';
 import type { AssetSource } from '../../server/src/serve.ts';
 import { routeRequest } from '../../server/src/serve.ts';
 import type { IdentityDatabase } from './bindings.ts';
-import { openGuestDatabase } from './database.ts';
 import { ensureSchema, resetSchema } from './migrations.ts';
 import type { ConfigStore } from './settings.ts';
 import { loadGuestSettings } from './settings.ts';
@@ -52,7 +52,7 @@ export async function handle(request: Request, runtime: GuestRuntime): Promise<R
 
 async function boot(runtime: GuestRuntime): Promise<void> {
   await ensureSchema(runtime.database);
-  const database = openGuestDatabase(runtime.database);
+  const database = openPostgresDatabase(runtime.database);
   const settings = await loadGuestSettings(runtime.config, database);
   IdentityModule.configure(settings);
   IdentityModule.connect(database);

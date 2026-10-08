@@ -34,9 +34,9 @@ Deployment topology is `di-framework.deploy.toml`. Target `identity` uses tenant
 
 `wasmcloud:postgres@0.2.0` exposes `query` and `queryBatch`, not a pooled connection. `packages/core` still expects `SqlDatabase.transaction` to hold one connection across `BEGIN` / work / `COMMIT`, including `SELECT … FOR UPDATE`.
 
-`apps/guest/src/database.ts` wraps `IdentityDatabase` as a `SqlDatabase` that runs in autocommit: it never sends `BEGIN` or `COMMIT`, and `transaction(fn)` runs `fn` on the same handle. See [Transaction semantics on wasmCloud](#transaction-semantics-on-wasmcloud) for why, and for how the repositories keep their invariants without one.
+`openPostgresDatabase` from `@di-framework/bindings/postgres` wraps `IdentityDatabase` as a `SqlDatabase` that runs in autocommit: it never sends `BEGIN` or `COMMIT`, and `transaction(fn)` runs `fn` on the same handle. See [Transaction semantics on wasmCloud](#transaction-semantics-on-wasmcloud) for why, and for how the repositories keep their invariants without one.
 
-`apps/guest/src/pg.ts` encodes parameters as the provider’s `pg-value` variants (uuid, bool, int, timestamptz, bytea, jsonb) and decodes result cells back to JSON values. SQL `?` placeholders become `$n` through the existing `toPostgresParams`.
+That module encodes parameters as the provider’s `pg-value` variants (uuid, bool, int, timestamptz, bytea, jsonb) and decodes result cells back to JSON values. SQL `?` placeholders become `$n`. UUID strings and safe integers are inlined so Postgres types them from context.
 
 Row counts that the Bun driver reports as `changes` are not available from this provider. Deletes and conflict inserts that need a count now use `RETURNING 1`:
 
@@ -55,7 +55,7 @@ The first guest version bracketed `transaction()` with `BEGIN` / `COMMIT` and re
 
 The guest now runs in autocommit and never opens a transaction:
 
-- Every statement commits on its own. `FOR UPDATE` and `pg_advisory_xact_lock` last for that statement only, so they serialize nothing on the guest. They stay in the code because the Bun server, whose `openPostgresDatabase` pins one connection per `transaction()`, still relies on them.
+- Every statement commits on its own. `FOR UPDATE` and `pg_advisory_xact_lock` last for that statement only, so they serialize nothing on the guest. They stay in the code because the Bun server still relies on them. `packages/core/src/shared/infrastructure/postgres.ts` reserves one connection for each `transaction()`.
 - Anything that must be atomic or single-use is one statement, and the Bun server runs the same statement inside its transaction:
   - `AuthorizationRepository.commitGrant` stores the tokens of a code or refresh grant with `UPDATE … WHERE` the code is still unused or the refresh token is still current. The loser of a concurrent exchange is treated as the replay it is (code: the authorization is deleted; refresh: `claimReplayedRefresh` revokes the family and audits).
   - `ChallengeRepository.claim` consumes a passwordless token with a conditional `UPDATE`; `insertUnlessRecent` applies the one-per-minute rule in the insert itself.
