@@ -67,13 +67,21 @@ const USER_COLUMNS = `id::text AS id, login, email, display_name, email_verified
   password_hash, system_role, avatar_url`;
 
 /**
- * Another owner of membership `m`'s organization, locked `FOR UPDATE`. A statement guarded by
- * this waits for a concurrent change to that owner and then re-evaluates it, which is what keeps
- * the last-owner rule true without a surrounding transaction.
+ * Locks every owner row of membership `m`'s organization in `user_id` order, then counts them.
+ * Including the target row and a fixed lock order prevents cross-lock deadlocks when two
+ * statements demote or remove different owners at the same time.
  */
-const OTHER_OWNER = `SELECT 1 FROM organization_memberships AS x
-  WHERE x.organization_id = m.organization_id AND x.user_id <> m.user_id AND x.role = 'owner'
-  FOR UPDATE`;
+const OWNER_COUNT = `(SELECT count(*) FROM (
+    SELECT 1 FROM organization_memberships AS x
+    WHERE x.organization_id = m.organization_id AND x.role = 'owner'
+    ORDER BY x.user_id FOR UPDATE
+  ) AS owners)`;
+
+const ACTIVE_PLATFORM_ADMIN_COUNT = `(SELECT count(*) FROM (
+    SELECT 1 FROM users AS x
+    WHERE x.system_role = 'platform_admin' AND x.status = 'active'
+    ORDER BY x.id FOR UPDATE
+  ) AS active_admins)`;
 
 @Container()
 export class PostgresDirectoryRepository implements DirectoryRepository {
@@ -279,7 +287,7 @@ export class PostgresDirectoryRepository implements DirectoryRepository {
       `UPDATE organization_memberships AS m SET role = 'member'
        FROM organizations AS o
        WHERE o.id = m.organization_id AND o.slug = ? AND m.user_id = ? AND m.role = 'owner'
-         AND EXISTS (${OTHER_OWNER})
+         AND ${OWNER_COUNT} > 1
        RETURNING 1`,
       [slug, userId],
     );
@@ -291,7 +299,7 @@ export class PostgresDirectoryRepository implements DirectoryRepository {
       `DELETE FROM organization_memberships AS m
        USING organizations AS o
        WHERE m.organization_id = o.id AND o.slug = ? AND m.user_id = ?
-         AND (m.role <> 'owner' OR EXISTS (${OTHER_OWNER}))
+         AND (m.role <> 'owner' OR ${OWNER_COUNT} > 1)
        RETURNING 1`,
       [slug, userId],
     );
@@ -304,16 +312,12 @@ export class PostgresDirectoryRepository implements DirectoryRepository {
     const result = await this.db.run(
       `UPDATE users AS u SET status = 'archived', updated_at = now()
        WHERE u.id = ?
-         AND (u.system_role <> 'platform_admin'
-              OR (SELECT count(*) FROM (
-                    SELECT 1 FROM users AS x
-                    WHERE x.system_role = 'platform_admin' AND x.status = 'active' FOR UPDATE
-                  ) AS active_admins) > 1)
+         AND (u.system_role <> 'platform_admin' OR ${ACTIVE_PLATFORM_ADMIN_COUNT} > 1)
          AND NOT EXISTS (
            SELECT 1 FROM organization_memberships AS m
            JOIN organizations AS o ON o.id = m.organization_id
            WHERE m.user_id = u.id AND m.role = 'owner' AND o.archived_at IS NULL
-             AND NOT EXISTS (${OTHER_OWNER})
+             AND ${OWNER_COUNT} <= 1
          )
        RETURNING 1`,
       [id],
