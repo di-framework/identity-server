@@ -55,6 +55,7 @@
         "@di-framework/core": "6.0.3",
         "@di-framework/http": "6.0.3",
         "@di-framework/repo": "6.0.4",
+        "@di-framework/wasm-pqc-subtle": "0.2.10",
       },
     },
     "apps/server": {
@@ -183,6 +184,8 @@
     "@di-framework/identity-server": ["@di-framework/identity-server@workspace:apps/server"],
 
     "@di-framework/repo": ["@di-framework/repo@6.0.4", "", { "peerDependencies": { "@di-framework/core": "^6", "typescript": "^5" } }, "sha512-AFUsi9MruXxV1+aSjVDkjJpvUBeL4jptGauNlhlzp+HNKe94OXXOPW4XUfd4hPEMVoehUhi3Sqf6qBBgqo++OA=="],
+
+    "@di-framework/wasm-pqc-subtle": ["@di-framework/wasm-pqc-subtle@0.2.10", "", {}, "sha512-EMO+H8uaegCHVqsAwYFToE7+1wq/7wUesQbmy/5B53pOkBmrvxNxuur92XNjwBcvruyXSss1Uk0s8gYwPrk34g=="],
 
     "@exodus/schemasafe": ["@exodus/schemasafe@1.3.0", "", {}, "sha512-5Aap/GaRupgNx/feGBwLLTVv8OQFfv3pq2lPRzPg9R+IOBnDgghTGW7l7EuVXOvg5cc/xSAlRW8rBrjIC3Nvqw=="],
 

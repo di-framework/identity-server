@@ -3,7 +3,14 @@ import { createHash, createHmac } from 'node:crypto';
 import { ClientSecrets } from '../src/shared/domain/client-secrets.ts';
 import { manualClock, systemClock } from '../src/shared/domain/clock.ts';
 import { Hashing, TOKEN_PATTERN } from '../src/shared/infrastructure/crypto/hashing.ts';
-import { PasswordHasher } from '../src/shared/infrastructure/crypto/passwords.ts';
+import {
+  type ComponentArgon2,
+  componentPasswordApi,
+  PasswordHasher,
+  registerPasswordApi,
+  resolvePasswordApi,
+  verifyPassword,
+} from '../src/shared/infrastructure/crypto/passwords.ts';
 import {
   SigningKeyError,
   SigningKeys,
@@ -63,6 +70,66 @@ describe('passwords', () => {
     expect(await hasher.verify('x', null)).toBe(false);
     expect(await hasher.verify('x', 'deadbeef')).toBe(false);
     expect(await hasher.verify('x', '$argon2id$garbage')).toBe(false);
+  });
+});
+
+describe('component password hasher', () => {
+  const calls: unknown[][] = [];
+  const fakeArgon2: ComponentArgon2 = {
+    hash(password, params) {
+      calls.push(['hash', [...password], params]);
+      return '$argon2id$v=19$m=16384,t=2,p=1$c2FsdA$aGFzaA';
+    },
+    verify(password, phc) {
+      calls.push(['verify', [...password], phc]);
+      if (phc === 'not a phc') throw { payload: { tag: 'invalid-encoding', val: 'bad' } };
+      return phc.endsWith('aGFzaA');
+    },
+  };
+
+  test('passes Spring parameters and UTF-8 bytes to the component', async () => {
+    calls.length = 0;
+    const api = componentPasswordApi(fakeArgon2);
+    const phc = await api.hash('pässword', {
+      algorithm: 'argon2id',
+      memoryCost: 16384,
+      timeCost: 2,
+    });
+    expect(phc).toBe('$argon2id$v=19$m=16384,t=2,p=1$c2FsdA$aGFzaA');
+    expect(calls[0]).toEqual([
+      'hash',
+      [...new TextEncoder().encode('pässword')],
+      { memoryKib: 16384, iterations: 2, parallelism: 1, outputLength: null },
+    ]);
+    expect(await api.verify('pässword', phc)).toBe(true);
+    expect(await api.verify('x', '$argon2id$other')).toBe(false);
+  });
+
+  test('a registered component hasher serves a runtime without Bun.password', async () => {
+    const api = componentPasswordApi(fakeArgon2);
+    registerPasswordApi(api);
+    try {
+      expect(resolvePasswordApi({})).toBe(api);
+      expect(resolvePasswordApi()).toBe(Bun.password as never);
+      const bunLess = { Bun: {} };
+      expect(resolvePasswordApi(bunLess)).toBe(api);
+    } finally {
+      registerPasswordApi(undefined);
+    }
+    expect(resolvePasswordApi({})).toBeUndefined();
+  });
+
+  test('a malformed PHC string verifies false instead of throwing', async () => {
+    const api = componentPasswordApi({
+      ...fakeArgon2,
+      verify() {
+        throw { payload: { tag: 'invalid-encoding', val: 'bad' } };
+      },
+    });
+    await expect(api.verify('x', '$argon2id$broken')).rejects.toMatchObject({
+      payload: { tag: 'invalid-encoding' },
+    });
+    expect(await verifyPassword('x', '$argon2id$broken', api)).toBe(false);
   });
 });
 
