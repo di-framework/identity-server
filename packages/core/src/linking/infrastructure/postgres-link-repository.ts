@@ -171,8 +171,11 @@ export class PostgresLinkRepository implements LinkRepository {
        WHERE l.id = ? AND u.id = l.user_id
          AND (COALESCE(btrim(u.password_hash), '') <> ''
               OR (u.email_verified AND COALESCE(btrim(u.email), '') <> '')
-              OR EXISTS (SELECT 1 FROM identity_links AS x
-                         WHERE x.user_id = l.user_id AND x.id <> l.id FOR UPDATE))
+              OR (SELECT count(*) FROM (
+                    SELECT 1 FROM identity_links AS x
+                    WHERE x.user_id = l.user_id
+                    ORDER BY x.id FOR UPDATE
+                  ) AS links) > 1)
        RETURNING 1`,
       [id],
     );
