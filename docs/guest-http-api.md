@@ -81,7 +81,7 @@ New pure-JavaScript modules, with no nested Wasm:
 
 `PasswordHasher` uses `Bun.password` when it exists and the JavaScript hasher otherwise, so PHC strings still match the Bun server. `SigningKeys.load` still fail-closes unless the active private JWK is RS256 or ML-DSA-65. `CursorCodec` no longer uses `Buffer`, so directory cursors work in the guest.
 
-On QuickJS, one Argon2id hash or verify of those parameters takes about 30 seconds. Bootstrap hashes three client secrets, so a cold reconcile is about 90 seconds.
+On QuickJS, one Argon2id hash or verify of those parameters takes about 30 seconds in the pure JavaScript hasher. The guest therefore registers the `argon2` interface of the composed `pqc-subtle:crypto@0.1.0` component (`@di-framework/wasm-pqc-subtle/component`, plugged in by the platform build) through `registerPasswordApi` in `apps/guest/src/app.ts`, which hashes in native Wasm in milliseconds with the same PHC shape. The JavaScript hasher remains the fallback when neither `Bun.password` nor a registered hasher exists.
 
 ## 3. Settings and readiness
 
