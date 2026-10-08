@@ -9,6 +9,7 @@ import {
   PasswordHasher,
   registerPasswordApi,
   resolvePasswordApi,
+  verifyPassword,
 } from '../src/shared/infrastructure/crypto/passwords.ts';
 import {
   SigningKeyError,
@@ -119,18 +120,16 @@ describe('component password hasher', () => {
   });
 
   test('a malformed PHC string verifies false instead of throwing', async () => {
-    const hasher = new PasswordHasher();
-    registerPasswordApi(componentPasswordApi(fakeArgon2));
-    try {
-      // Bun.password still wins in this process; drive the component path directly.
-      const api = componentPasswordApi(fakeArgon2);
-      await expect(api.verify('x', 'not a phc')).rejects.toMatchObject({
-        payload: { tag: 'invalid-encoding' },
-      });
-      expect(await hasher.verify('x', 'plain')).toBe(false);
-    } finally {
-      registerPasswordApi(undefined);
-    }
+    const api = componentPasswordApi({
+      ...fakeArgon2,
+      verify() {
+        throw { payload: { tag: 'invalid-encoding', val: 'bad' } };
+      },
+    });
+    await expect(api.verify('x', '$argon2id$broken')).rejects.toMatchObject({
+      payload: { tag: 'invalid-encoding' },
+    });
+    expect(await verifyPassword('x', '$argon2id$broken', api)).toBe(false);
   });
 });
 
