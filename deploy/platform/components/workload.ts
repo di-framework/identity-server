@@ -31,6 +31,12 @@ export interface CliWorkloadInputs {
     remotePort: number;
   };
   sourceDigest: string;
+  /**
+   * A control Secret to delete before each deploy. The CLI rewrites `<workload>-control` with only
+   * its control token, and a tenant developer's replace is refused while the Secret holds more
+   * keys (the runtime secrets written after the previous deploy).
+   */
+  resetControlSecret?: { kubeconfig: string; context?: string; namespace: string; name: string };
 }
 
 interface CliWorkloadState extends CliWorkloadInputs {
@@ -47,7 +53,7 @@ type DeepInput<T> = pulumi.Input<
 type CliWorkloadArgs = { [K in keyof CliWorkloadInputs]: DeepInput<CliWorkloadInputs[K]> };
 
 /** Paths and tools can differ between machines without changing what is deployed. */
-const LOCAL_ONLY = ['workspaceRoot', 'cli', 'registryForward'];
+const LOCAL_ONLY = ['workspaceRoot', 'cli', 'registryForward', 'resetControlSecret'];
 const REPLACE_ON_CHANGE = ['application', 'target'];
 
 export class CliWorkload extends pulumi.dynamic.Resource {
@@ -99,6 +105,29 @@ const workloadProvider: pulumi.dynamic.ResourceProvider = {
 };
 
 async function deploy(inputs: CliWorkloadInputs): Promise<CliWorkloadState> {
+  const reset = inputs.resetControlSecret;
+  if (reset) {
+    // A plain delete: tenant developers may delete Secrets but not read them.
+    const deleted = await runProcess(
+      'kubectl',
+      [
+        '--kubeconfig',
+        reset.kubeconfig,
+        ...(reset.context ? ['--context', reset.context] : []),
+        '--namespace',
+        reset.namespace,
+        'delete',
+        'secret',
+        reset.name,
+        '--ignore-not-found',
+        '--wait=false',
+      ],
+      { log: `di-framework-reset-${reset.name}.log` },
+    );
+    if (deleted.code !== 0) {
+      throw new Error(`deleting ${reset.name} failed; log: ${deleted.log}\n${deleted.tail}`);
+    }
+  }
   const forward = inputs.registryForward ? await portForward(inputs.registryForward) : undefined;
   try {
     const data = await runCli(inputs, [

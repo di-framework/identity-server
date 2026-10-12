@@ -174,24 +174,27 @@ async function apply(): Promise<void> {
     .update(String(Date.now()))
     .digest('hex')
     .slice(0, 16);
-  const patch = JSON.stringify([
-    {
-      op: 'add',
-      path: `/spec/template/spec/components/0/localResources/environment/config/${REVISION_KEY}`,
-      value: revision,
-    },
-  ]);
-  const patched = await kubectl([
-    '--namespace',
-    namespace,
-    'patch',
-    'workloaddeployment',
-    workload,
-    '--type',
-    'json',
-    '-p',
-    patch,
-  ]);
+  // The CLI renders environment config for every pglite workload; add the map itself if not.
+  const environment = '/spec/template/spec/components/0/localResources/environment';
+  const attempts = [
+    [{ op: 'add', path: `${environment}/config/${REVISION_KEY}`, value: revision }],
+    [{ op: 'add', path: `${environment}/config`, value: { [REVISION_KEY]: revision } }],
+  ];
+  let patched = { code: 1, stderr: '' };
+  for (const patch of attempts) {
+    patched = await kubectl([
+      '--namespace',
+      namespace,
+      'patch',
+      'workloaddeployment',
+      workload,
+      '--type',
+      'json',
+      '-p',
+      JSON.stringify(patch),
+    ]);
+    if (patched.code === 0) break;
+  }
   if (patched.code !== 0) {
     fail(`rolling workloaddeployment/${workload} failed: ${patched.stderr.trim().slice(0, 300)}`);
   }

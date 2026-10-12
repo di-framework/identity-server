@@ -113,36 +113,43 @@ async function write(inputs: RuntimeSecretsInputs): Promise<void> {
     if (replaced.code !== 0) throw new Error(`replacing ${name} failed; log: ${replaced.log}`);
   }
 
+  // A new revision on every write, like `deploy/guest/runtime-secrets.ts apply`: the Secret
+  // always gets a fresh control token, so the workload always rolls.
   const revision = crypto
     .createHash('sha256')
     .update(JSON.stringify(Object.entries(inputs.values).sort()))
     .update(inputs.deployment)
+    .update(String(Date.now()))
     .digest('hex')
     .slice(0, 16);
-  const patched = await runProcess(
-    'kubectl',
-    [
-      ...kubectlBase(inputs),
-      '--namespace',
-      inputs.tenantNamespace,
-      'patch',
-      'workloaddeployment',
-      inputs.workload,
-      '--type',
-      'json',
-      '-p',
-      JSON.stringify([
-        {
-          op: 'add',
-          path: `/spec/template/spec/components/0/localResources/environment/config/${REVISION_KEY}`,
-          value: revision,
-        },
-      ]),
-    ],
-    { log: `runtime-secrets-${inputs.workload}-roll.log` },
-  );
-  if (patched.code !== 0) {
-    throw new Error(`rolling ${inputs.workload} failed; log: ${patched.log}\n${patched.tail}`);
+  // The CLI renders environment config for every pglite workload; add the map itself if not.
+  const environment = '/spec/template/spec/components/0/localResources/environment';
+  const attempts = [
+    [{ op: 'add', path: `${environment}/config/${REVISION_KEY}`, value: revision }],
+    [{ op: 'add', path: `${environment}/config`, value: { [REVISION_KEY]: revision } }],
+  ];
+  let patched: Awaited<ReturnType<typeof runProcess>> | undefined;
+  for (const patch of attempts) {
+    patched = await runProcess(
+      'kubectl',
+      [
+        ...kubectlBase(inputs),
+        '--namespace',
+        inputs.tenantNamespace,
+        'patch',
+        'workloaddeployment',
+        inputs.workload,
+        '--type',
+        'json',
+        '-p',
+        JSON.stringify(patch),
+      ],
+      { log: `runtime-secrets-${inputs.workload}-roll.log` },
+    );
+    if (patched.code === 0) break;
+  }
+  if (patched?.code !== 0) {
+    throw new Error(`rolling ${inputs.workload} failed; log: ${patched?.log}\n${patched?.tail}`);
   }
 
   const forward = await portForward({

@@ -290,6 +290,12 @@ const identity = new CliWorkload(
       IDENTITY_REGISTRY_PULL: registryPull,
     },
     registryForward,
+    resetControlSecret: {
+      kubeconfig: kube.kubeconfig,
+      context,
+      namespace: `di-tenant-${TENANT}`,
+      name: `${APPLICATION}-control`,
+    },
     // Everything the guest component bundles: the guest, the API, the server, core,
     // the client assets, and the dependency and deploy manifests.
     sourceDigest: sourceDigest(workspaceRoot, [
