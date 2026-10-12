@@ -414,4 +414,28 @@ describe('one resolved kube target for the preflight and for kube', () => {
     expect(resolveKubeTarget({}, host).instance).toBe('identity');
     expect(resolveKubeTarget({ kubeInstance: '  ' }, host).instance).toBe('identity');
   });
+
+  test('values are trimmed, so a padded authproto is refused by the name check itself', () => {
+    const target = resolveKubeTarget(
+      { kubeInstance: ' authproto ', kubeStateDir: ' state ', kubeconfig: ' ', context: ' ctx ' },
+      host,
+    );
+    expect(target).toMatchObject({
+      instance: 'authproto',
+      stateDir: '/project/deploy/platform/state',
+      kubeconfig: undefined,
+      context: 'ctx',
+    });
+    const calls: string[] = [];
+    expect(() =>
+      preflightCluster(target, {
+        exists: () => true,
+        kubectl: (kubeconfig) => {
+          calls.push(kubeconfig);
+          return { code: 0, stdout: '', stderr: '' };
+        },
+      }),
+    ).toThrow('kubeInstance authproto runs the Postgres-era identity guest');
+    expect(calls).toEqual([]);
+  });
 });

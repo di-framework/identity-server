@@ -397,7 +397,7 @@ export function resolveKubeTarget(
     env: Readonly<Record<string, string | undefined>>;
   },
 ): KubeTarget {
-  const set = (value: string | undefined) => (value?.trim() ? value : undefined);
+  const set = (value: string | undefined) => value?.trim() || undefined;
   const configuredStateDir = set(config.kubeStateDir);
   const kubeconfig = set(config.kubeconfig);
   const stateDir = configuredStateDir === undefined ? undefined : host.resolve(configuredStateDir);
