@@ -7,9 +7,23 @@ import {
   loadMigrations,
   migrationsDirectory,
 } from '@di-framework/identity-migrations';
-import { User, UserRepository } from '../src/directory/infrastructure/user-repository.ts';
+import { Id, Model } from '@di-framework/repo';
 import { PostgresAdapter, toPostgresParams } from '../src/shared/infrastructure/postgres.ts';
 import { withThrowawayDatabase } from './support/database.ts';
+
+/**
+ * An `organizations` row for exercising `PostgresAdapter`. Production code has no entity mapping
+ * of `users`: its PII columns are encrypted once column encryption is enabled, so every user
+ * read and write goes through `PostgresDirectoryRepository`.
+ */
+@Model()
+class OrganizationRow {
+  @Id()
+  id!: string;
+
+  slug!: string;
+  name!: string;
+}
 
 test('rewrites repo placeholders to postgres bindings', () => {
   expect(toPostgresParams('SELECT * FROM t WHERE id = ? AND binding = ?', ['a', 'b'])).toEqual({
@@ -42,10 +56,13 @@ test('discovers the reused Flyway migrations in version order', async () => {
     ['15', 'concurrency indexes'],
     ['16', 'runtime secrets to secret'],
     ['17', 'clear session secrets'],
+    ['18', 'column encryption'],
+    ['19', 'validate column encryption checks'],
+    ['20', 'pin column encryption search path'],
   ]);
 });
 
-test('applies the reused migrations and reads a user through UserRepository', async () => {
+test('applies the reused migrations and reads a row through PostgresAdapter', async () => {
   await withThrowawayDatabase('identity_migrate_test', async (db) => {
     const applied = await applyMigrations(db);
     expect(applied.pending).toEqual([]);
@@ -67,37 +84,27 @@ test('applies the reused migrations and reads a user through UserRepository', as
       '15',
       '16',
       '17',
+      '18',
+      '19',
+      '20',
     ]);
 
     const again = await applyMigrations(db);
     expect(again.applied).toEqual([]);
     expect(again.pending).toEqual([]);
 
-    const users = new UserRepository(db);
     const id = crypto.randomUUID();
-    const user = new User();
-    user.id = id;
-    user.login = 'ada';
-    user.normalized_login = 'ada';
-    user.email = 'ada@example.com';
-    user.normalized_email = 'ada@example.com';
-    user.password_hash = null;
-    user.display_name = 'Ada';
-    user.avatar_url = null;
-    user.email_verified = true;
-    user.status = 'active';
-    await users.save(user);
-    const found = await users.findById(id);
-    expect(found?.login).toBe('ada');
-    expect(found?.display_name).toBe('Ada');
-    expect(found?.email_verified).toBe(true);
-    expect(found?.status).toBe('active');
-
-    const adapter = new PostgresAdapter<User, string>(db, { table: 'users' });
+    const adapter = new PostgresAdapter<OrganizationRow, string>(db, { table: 'organizations' });
+    const organization = new OrganizationRow();
+    organization.id = id;
+    organization.slug = 'ada';
+    organization.name = 'Ada';
+    await adapter.save(organization);
+    expect((await adapter.findById(id))?.name).toBe('Ada');
     await adapter.transaction(async (tx) => {
-      expect((await tx.findById(id))?.login).toBe('ada');
+      expect((await tx.findById(id))?.slug).toBe('ada');
     });
-    expect((await adapter.findAll()).some((user) => user.id === id)).toBe(true);
+    expect((await adapter.findAll()).some((row) => row.id === id)).toBe(true);
   });
 }, 30_000);
 
@@ -130,6 +137,9 @@ test('V12 unwraps metadata and session attributes stored as JSON string scalars'
         '15',
         '16',
         '17',
+        '18',
+        '19',
+        '20',
       ]);
       expect(
         await db.first<Record<string, unknown>>(
@@ -181,6 +191,9 @@ test('V16 removes runtime secrets from identity_runtime_secret and keeps bootstr
       expect((await applyMigrations(db)).applied.map((record) => record.version)).toEqual([
         '16',
         '17',
+        '18',
+        '19',
+        '20',
       ]);
       expect(await db.query('SELECT name FROM identity_runtime_secret ORDER BY name')).toEqual([
         { name: 'bootstrap_client_fingerprints' },
@@ -224,13 +237,109 @@ test('V17 removes raw secrets from existing browser session attributes', async (
                 (?, 'csrf', '["IDENTITY_CLIENT_SECRET_REVEAL"]'::jsonb, now())`,
         ['c'.repeat(64), 'd'.repeat(64)],
       );
-      expect((await applyMigrations(db)).applied.map((record) => record.version)).toEqual(['17']);
+      expect((await applyMigrations(db)).applied.map((record) => record.version)).toEqual([
+        '17',
+        '18',
+        '19',
+        '20',
+      ]);
       expect(await db.query('SELECT id, attributes FROM browser_sessions ORDER BY id')).toEqual([
         { id: 'a'.repeat(64), attributes: { SPRING_SECURITY_SAVED_REQUEST: '/admin' } },
         { id: 'b'.repeat(64), attributes: { SPRING_SECURITY_SAVED_REQUEST: '/account' } },
         { id: 'c'.repeat(64), attributes: 'GSIO_IDENTITY_LINK_PENDING_TOKEN' },
         { id: 'd'.repeat(64), attributes: ['IDENTITY_CLIENT_SECRET_REVEAL'] },
       ]);
+    });
+  } finally {
+    rmSync(earlier, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test('V18 prepares column encryption on a populated database without changing a row', async () => {
+  const earlier = mkdtempSync(join(tmpdir(), 'identity-v17-'));
+  const root = join(earlier, 'migrations');
+  cpSync(migrationsDirectory, root, { recursive: true });
+  for (const name of readdirSync(root)) {
+    const version = /^V(\d+)__/.exec(name);
+    if (version && Number(version[1]) >= 18) rmSync(join(root, name));
+  }
+  try {
+    await withThrowawayDatabase('identity_v18_test', async (db) => {
+      await applyMigrations(db, root);
+      const user = crypto.randomUUID();
+      const seed = [
+        [
+          `INSERT INTO users (id, login, normalized_login, email, normalized_email, display_name, avatar_url)
+           VALUES (?, 'pat', 'pat', 'Pat@Example.com', 'pat@example.com', 'Pat', 'https://a.example/p.png')`,
+          [user],
+        ],
+        [
+          `INSERT INTO identity_links (id, user_id, issuer, subject, provider_name, provider_email)
+           VALUES (?, ?, 'https://idp.example', 'sub-1', 'acme', 'pat@idp.example')`,
+          [crypto.randomUUID(), user],
+        ],
+        [
+          `INSERT INTO email_challenges (id, user_id, email, token_hash, purpose, expires_at)
+           VALUES (?, ?, 'Pat@Example.com', ?, 'sign_in', now())`,
+          [crypto.randomUUID(), user, 'c'.repeat(64)],
+        ],
+        [
+          `INSERT INTO browser_sessions (id, csrf_token, attributes, expires_at)
+           VALUES (?, 'csrf', '{"saved":"/x"}', now())`,
+          ['d'.repeat(64)],
+        ],
+        [
+          `INSERT INTO auth_audit_records (id, action, before_metadata, after_metadata)
+           VALUES (?, 'seed', '{"a":1}', '{"b":2}')`,
+          [crypto.randomUUID()],
+        ],
+      ] as const;
+      for (const [text, params] of seed) await db.run(text, [...params]);
+      const snapshot = async () => ({
+        users: await db.query(
+          'SELECT id::text, email, normalized_email, display_name, avatar_url FROM users',
+        ),
+        links: await db.query('SELECT subject, provider_email FROM identity_links'),
+        challenges: await db.query('SELECT email FROM email_challenges'),
+        sessions: await db.query('SELECT attributes FROM browser_sessions'),
+        audit: await db.query('SELECT before_metadata, after_metadata FROM auth_audit_records'),
+      });
+      const before = await snapshot();
+      expect((await applyMigrations(db)).applied.map((record) => record.version)).toEqual([
+        '18',
+        '19',
+        '20',
+      ]);
+      expect(await snapshot()).toEqual(before);
+      expect(
+        await db.first<Record<string, unknown>>(
+          `SELECT enabled, (SELECT count(*)::int FROM users WHERE email_enc IS NOT NULL
+             OR normalized_email_bidx IS NOT NULL) AS encrypted
+           FROM identity_column_encryption`,
+        ),
+      ).toEqual({ enabled: false, encrypted: 0 });
+      expect(
+        await db.first<Record<string, unknown>>(
+          `SELECT count(*)::int AS n FROM pg_extension WHERE extname = 'pgcrypto'`,
+        ),
+      ).toEqual({ n: 1 });
+      // Disabled, plaintext is written as before, and users_email_key still refuses a duplicate
+      // raw address even from a writer that leaves normalized_email unset.
+      const insert = (login: string, email: string, normalized: string | null) =>
+        db.run(
+          `INSERT INTO users (id, login, normalized_login, email, normalized_email, display_name)
+           VALUES (?, ?, ?, ?, ?, 'Pat 2')`,
+          [crypto.randomUUID(), login, login, email, normalized],
+        );
+      const duplicate = await insert('pat2', 'Pat@Example.com', null).catch(
+        (error: unknown) => error,
+      );
+      expect(String((duplicate as Error).message)).toContain('users_email_key');
+      const normalized = await insert('pat3', 'PAT@example.com', 'pat@example.com').catch(
+        (error: unknown) => error,
+      );
+      expect(String((normalized as Error).message)).toContain('users_normalized_email_key');
+      await insert('pat4', 'other@example.com', 'other@example.com');
     });
   } finally {
     rmSync(earlier, { recursive: true, force: true });

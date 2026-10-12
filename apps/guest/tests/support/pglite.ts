@@ -7,6 +7,7 @@ import type {
 import { createWasmPgliteDatabase } from '@di-framework/pglite-component';
 import type { SqlDatabase } from '@di-framework/repo';
 import { PGlite } from '@electric-sql/pglite';
+import { pgcrypto } from '@electric-sql/pglite/contrib/pgcrypto';
 
 /**
  * A stand-in for the `di-framework:pglite/database@0.2.0` import, backed by `@electric-sql/pglite`
@@ -17,7 +18,9 @@ import { PGlite } from '@electric-sql/pglite';
  * the adapter's placeholder rewrite, parameter variants, result mapping, mutex, transactions and
  * savepoints are all exercised. Like the provider it allows one open connection per database
  * root, pins `TimeZone=UTC` and `DateStyle=ISO`, and sends text, JSON and timestamp parameters
- * untyped (OID 0) so PostgreSQL infers their types from context.
+ * untyped (OID 0) so PostgreSQL infers their types from context. pgcrypto is loaded, as the provider
+ * ships it for column encryption (`pgcrypto: false` models a provider build without it); `bytea`
+ * travels as the WIT `blob` variant in both directions.
  */
 
 const RAW: Record<number, (value: string) => string> = {};
@@ -43,6 +46,8 @@ export interface PgliteFixture {
  */
 export interface PgliteFixtureOptions {
   integers?: 'bigint' | 'number';
+  /** Load the pgcrypto extension (default true). */
+  pgcrypto?: boolean;
 }
 
 export function pgliteFixture(
@@ -50,6 +55,7 @@ export function pgliteFixture(
   options: PgliteFixtureOptions = {},
 ): PgliteFixture {
   const integers = options.integers ?? 'bigint';
+  const extensions = options.pgcrypto === false ? {} : { pgcrypto };
   const engines = new Map<string, PGlite>();
   const open = new Set<string>();
   const opened: string[] = [];
@@ -65,6 +71,7 @@ export function pgliteFixture(
       if (!engine) {
         engine = new PGlite({
           ...(dataDir ? { dataDir: dataDir(root) } : {}),
+          extensions,
           parsers: RAW,
           serializers: RAW,
         } as never);

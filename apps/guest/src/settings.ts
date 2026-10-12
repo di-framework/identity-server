@@ -26,6 +26,11 @@ export const RUNTIME_SECRET_SETTINGS = [
   'AUTH_PROVISIONER_CLIENT_SECRET',
   'AUTH_CLI_CLIENT_ID',
   'AUTH_CLI_REDIRECT_URIS',
+  // Opt-in column encryption (docs/configuration.md#column-encryption). The two keys are separate
+  // from each other and from the pglite filesystem key DI_PGLITE_KEY.
+  'IDENTITY_COLUMN_ENCRYPTION',
+  'IDENTITY_COLUMN_KEY',
+  'IDENTITY_BIDX_KEY',
 ] as const;
 
 /**

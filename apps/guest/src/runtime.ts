@@ -5,7 +5,15 @@ import { Readiness } from '../../../packages/core/src/bootstrap/application/read
 import { IdentityModule } from '../../../packages/core/src/composition.ts';
 import { NotificationWorker } from '../../../packages/core/src/notifications/application/security-notifications.ts';
 import { SIGNING_KEYS } from '../../../packages/core/src/shared/domain/tokens.ts';
+import {
+  ColumnEncryption,
+  ColumnEncryptionUnavailable,
+} from '../../../packages/core/src/shared/infrastructure/column-encryption.ts';
 import { Hashing } from '../../../packages/core/src/shared/infrastructure/crypto/hashing.ts';
+import {
+  describeError,
+  redactStatement,
+} from '../../../packages/core/src/shared/infrastructure/error-redaction.ts';
 import type { IdentitySettings } from '../../../packages/core/src/shared/infrastructure/identity-settings.ts';
 import { ControlPlaneRouter } from '../../api/src/control-plane.ts';
 import { OperationsEndpoints } from '../../api/src/operations/health.ts';
@@ -14,7 +22,7 @@ import { routeRequest } from '../../server/src/serve.ts';
 import type { GuestEnv } from './database.ts';
 import { ensureSchema, resetSchema } from './migrations.ts';
 import type { ConfigStore } from './settings.ts';
-import { loadGuestSettings } from './settings.ts';
+import { loadGuestSettings, MissingRuntimeSecretsError } from './settings.ts';
 
 const BOOTSTRAP_FINGERPRINT = 'bootstrap_fingerprint';
 const CLIENT_FINGERPRINTS = 'bootstrap_client_fingerprints';
@@ -62,13 +70,26 @@ export async function handle(request: Request, runtime: GuestRuntime): Promise<R
     });
     await ready;
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'failed';
+    // Unauthenticated: a generic body and a coarse reason. The details (missing setting names,
+    // key mismatches, driver messages that might echo a value) go to the log only.
+    console.error(`identity boot failed: ${describeError(redactStatement(error))}`);
     const headers = error instanceof BootstrapBusyError ? { 'retry-after': '5' } : {};
-    return Response.json({ ok: false, error: message }, { status: 503, headers });
+    return Response.json(
+      { ok: false, error: 'service unavailable', reason: bootFailure(error) },
+      { status: 503, headers: { ...headers, 'cache-control': 'no-store' } },
+    );
   }
   const response = await routeRequest(request, runtime.assets, runtime.shell);
   await drain();
   return response;
+}
+
+/** A stable, value-free label for why boot failed. */
+export function bootFailure(error: unknown): string {
+  if (error instanceof BootstrapBusyError) return 'bootstrap-in-progress';
+  if (error instanceof MissingRuntimeSecretsError) return 'runtime-settings-missing';
+  if (error instanceof ColumnEncryptionUnavailable) return 'column-encryption-unavailable';
+  return 'boot-failed';
 }
 
 async function boot(runtime: GuestRuntime): Promise<void> {
@@ -82,6 +103,9 @@ async function boot(runtime: GuestRuntime): Promise<void> {
   const container = useContainer();
   container.register(BootstrapReconciler);
   container.resolve(SIGNING_KEYS);
+  // Opt in, or fail closed (503) when encryption is enabled and the keys are missing or wrong,
+  // before bootstrap writes any user row.
+  await container.resolve(ColumnEncryption).cipher();
   const reconciler = container.resolve(BootstrapReconciler);
   const fingerprint = bootstrapFingerprint(settings);
   if ((await storedValue(database, BOOTSTRAP_FINGERPRINT)) === fingerprint) {

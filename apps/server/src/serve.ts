@@ -1,3 +1,8 @@
+import { IdentityError } from '../../../packages/core/src/shared/domain/identity-error.ts';
+import {
+  describeError,
+  redactStatement,
+} from '../../../packages/core/src/shared/infrastructure/error-redaction.ts';
 import { controlPlane } from '../../api/src/control-plane.ts';
 import { handle } from '../../client/src/server/handler.ts';
 
@@ -13,9 +18,19 @@ export async function routeRequest(
   shell?: string,
 ): Promise<Response> {
   const { pathname } = new URL(request.url);
-  if (controlPlane.handles(pathname)) return controlPlane.fetch(request);
   if (pathname.startsWith('/assets/')) return asset(pathname.slice('/assets/'.length), assets);
-  return handle(request, undefined, shell);
+  try {
+    if (controlPlane.handles(pathname)) return await controlPlane.fetch(request);
+    return await handle(request, undefined, shell);
+  } catch (error) {
+    // The body names no setting, key or value; the log line has the message and code only.
+    console.error(`request ${pathname} failed: ${describeError(redactStatement(error))}`);
+    const unavailable = error instanceof IdentityError && error.status === 503;
+    return Response.json(
+      { ok: false, error: unavailable ? 'service unavailable' : 'internal error' },
+      { status: unavailable ? 503 : 500, headers: { 'cache-control': 'no-store' } },
+    );
+  }
 }
 
 async function asset(name: string, assets: AssetSource): Promise<Response> {

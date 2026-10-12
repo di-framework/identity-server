@@ -1,7 +1,12 @@
-import { expect, test } from 'bun:test';
+import { expect, spyOn, test } from 'bun:test';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { useContainer } from '@di-framework/core/container';
+import {
+  ColumnEncryption,
+  ColumnEncryptionUnavailable,
+} from '../../../packages/core/src/shared/infrastructure/column-encryption.ts';
 import { useTestDatabase } from '../../../packages/core/tests/support/database.ts';
 import { routeRequest } from '../src/serve.ts';
 
@@ -32,4 +37,38 @@ test('serves the JSON API, OAuth metadata, browser pages, and assets from one ro
   expect(
     (await routeRequest(new Request('https://identity.test/assets/nested/file.js'), assets)).status,
   ).toBe(404);
+});
+
+test('column encryption that is enabled but unusable answers 503; other errors are a generic 500', async () => {
+  await useTestDatabase();
+  const encryption = useContainer().resolve(ColumnEncryption);
+  const fail = (error: Error) => {
+    (encryption as unknown as { cipher: () => Promise<never> }).cipher = () =>
+      Promise.reject(error);
+  };
+  const lines: string[] = [];
+  const log = spyOn(console, 'error').mockImplementation((line: unknown) => {
+    lines.push(String(line));
+  });
+  try {
+    fail(
+      new ColumnEncryptionUnavailable(
+        'column encryption is enabled but IDENTITY_COLUMN_KEY is not set',
+      ),
+    );
+    const page = await routeRequest(new Request('https://identity.test/login'), new Map());
+    expect(page.status).toBe(503);
+    expect(page.headers.get('cache-control')).toBe('no-store');
+    // Generic body: which setting is missing goes to the log only.
+    expect(await page.json()).toEqual({ ok: false, error: 'service unavailable' });
+    fail(new Error('boom'));
+    const failed = await routeRequest(new Request('https://identity.test/login'), new Map());
+    expect(failed.status).toBe(500);
+    expect(await failed.json()).toEqual({ ok: false, error: 'internal error' });
+    expect(lines.join('\n')).toContain('IDENTITY_COLUMN_KEY is not set');
+    expect(lines.join('\n')).toContain('request /login failed: boom');
+  } finally {
+    log.mockRestore();
+    delete (encryption as unknown as { cipher?: unknown }).cipher;
+  }
 });

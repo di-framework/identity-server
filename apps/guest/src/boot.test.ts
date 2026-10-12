@@ -1,4 +1,4 @@
-import { afterAll, expect, test } from 'bun:test';
+import { afterAll, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -231,13 +231,20 @@ test('the guest boots on one pglite connection and serves the Bun routes and flo
         [held],
       );
       freshRealm();
+      const busyLines: string[] = [];
+      const busyLog = spyOn(console, 'error').mockImplementation((line: unknown) => {
+        busyLines.push(String(line));
+      });
       const busy = await handle(new Request('https://identity.test/health'), withCli());
+      busyLog.mockRestore();
       expect(busy.status).toBe(503);
       expect(busy.headers.get('retry-after')).toBe('5');
       expect(await busy.json()).toEqual({
         ok: false,
-        error: `bootstrap in progress until ${held}`,
+        error: 'service unavailable',
+        reason: 'bootstrap-in-progress',
       });
+      expect(busyLines).toEqual([`identity boot failed: bootstrap in progress until ${held}`]);
       expect(await secretOf('tenant-cli')).toBeUndefined();
 
       // An expired lease is taken over and released after the store. Stored client
@@ -435,3 +442,115 @@ test('transactions serialize on the single pglite connection instead of blocking
     await fixture.shutdown();
   }
 });
+
+const COLUMN_KEY = Buffer.alloc(32, 3).toString('base64');
+const BIDX_KEY = Buffer.alloc(32, 4).toString('base64');
+const encryptionOn: Array<[string, string]> = [
+  ['IDENTITY_COLUMN_ENCRYPTION', 'enabled'],
+  ['IDENTITY_COLUMN_KEY', COLUMN_KEY],
+  ['IDENTITY_BIDX_KEY', BIDX_KEY],
+];
+
+test('column encryption on pglite with pgcrypto: opt in, flows on ciphertext, fail closed', async () => {
+  await withContainer(async () => {
+    const fixture = pgliteFixture();
+    const database = pgliteDatabase(fixture.module, () => ({
+      [DATABASE_ROOT_ENV]: '/data/encrypted',
+    }));
+    const db = await database();
+    try {
+      freshRealm();
+      const serve = (request: Request) =>
+        handle(request, runtimeFor(database, guestConfig(false, undefined, encryptionOn)));
+      const report = await identityFlows(flowInputs(serve, 'enc'));
+      expect(report.organization).toMatchObject({ created: 201, duplicate: 409, read: 200 });
+      expect(report.login).toMatchObject({ signIn: 303, consent: 303, token: 200, userinfo: 200 });
+      expect(
+        await db.first<Record<string, unknown>>('SELECT enabled FROM identity_column_encryption'),
+      ).toEqual({ enabled: true });
+
+      // The bootstrap owner was written after the opt-in: ciphertext only, as a WIT blob.
+      const owner = await db.first<Record<string, unknown>>(
+        `SELECT email, normalized_email, display_name, email_enc, normalized_email_bidx
+         FROM users WHERE login = 'owner'`,
+      );
+      expect(owner).toMatchObject({ email: null, normalized_email: null, display_name: null });
+      expect(owner?.email_enc).toBeInstanceOf(Uint8Array);
+      expect(owner?.normalized_email_bidx).toBeInstanceOf(Uint8Array);
+      // bytea round trip through the adapter: the blob goes back as a parameter and decrypts.
+      expect(
+        await db.first<Record<string, unknown>>(
+          'SELECT pgp_sym_decrypt(?::bytea, ?::text) AS email',
+          [owner?.email_enc, COLUMN_KEY],
+        ),
+      ).toEqual({ email: 'owner@identity.local' });
+      for (const [table, plain, enc] of [
+        ['browser_sessions', 'attributes', 'attributes_enc'],
+        ['auth_audit_records', 'after_metadata', 'after_metadata_enc'],
+        ['oauth2_authorization', 'oidc_id_token_claims', 'oidc_id_token_claims_enc'],
+      ] as const) {
+        const counts = await db.first<{ plain: unknown; enc: unknown }>(
+          `SELECT count(${plain})::int AS plain, count(${enc})::int AS enc FROM ${table}`,
+        );
+        expect([table, Number(counts?.plain), Number(counts?.enc) > 0]).toEqual([table, 0, true]);
+      }
+
+      // A restart without the keys answers 503.
+      const logged: string[] = [];
+      const log = spyOn(console, 'error').mockImplementation((line: unknown) => {
+        logged.push(String(line));
+      });
+      freshRealm();
+      const locked = await handle(
+        new Request('https://identity.test/health'),
+        runtimeFor(database, guestConfig(false)),
+      );
+      log.mockRestore();
+      expect(locked.status).toBe(503);
+      // The unauthenticated body is generic; the detail goes to the log only.
+      expect(await locked.json()).toEqual({
+        ok: false,
+        error: 'service unavailable',
+        reason: 'column-encryption-unavailable',
+      });
+      expect(logged.join('\n')).toContain(
+        'column encryption is enabled but IDENTITY_COLUMN_KEY and IDENTITY_BIDX_KEY are not set',
+      );
+    } finally {
+      await fixture.shutdown();
+      await restoreContainer();
+    }
+  });
+}, 120_000);
+
+test('a provider without pgcrypto runs unencrypted and refuses the opt-in', async () => {
+  await withContainer(async () => {
+    const fixture = pgliteFixture(undefined, { pgcrypto: false });
+    const database = pgliteDatabase(fixture.module, () => ({
+      [DATABASE_ROOT_ENV]: '/data/no-pgcrypto',
+    }));
+    try {
+      freshRealm();
+      const plain = await handle(
+        new Request('https://identity.test/ready'),
+        runtimeFor(database, guestConfig(false)),
+      );
+      expect(plain.status).toBe(200);
+      const logged: string[] = [];
+      const log = spyOn(console, 'error').mockImplementation((line: unknown) => {
+        logged.push(String(line));
+      });
+      freshRealm();
+      const refused = await handle(
+        new Request('https://identity.test/ready'),
+        runtimeFor(database, guestConfig(false, undefined, encryptionOn)),
+      );
+      log.mockRestore();
+      expect(refused.status).toBe(503);
+      expect(logged.join('\n')).toContain('needs the pgcrypto extension');
+    } finally {
+      await fixture.shutdown();
+      await restoreContainer();
+    }
+  });
+}, 120_000);

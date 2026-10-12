@@ -14,6 +14,7 @@ the plain name.
 | `AUTH_PUBLIC_ORIGIN` | the issuer | Browser-visible origin for passwordless links and the identity-link callback. |
 | `SERVER_SERVLET_SESSION_COOKIE_SECURE` | `true` | Sets `Secure` on the session and passwordless cookies. Use `false` only for local HTTP. |
 | `DATABASE_URL` | `postgres://identity:identity@127.0.0.1:5432/identity` | Postgres URL (`IDENTITY_DATABASE__URL` also works). `IDENTITY_DATABASE__POOL_MAX` sets the pool size (8). |
+| `MIGRATION_DATABASE_URL` | empty | Optional owner-role URL for [role separation](#database-role-separation): migrations run as this role, and the `DATABASE_URL` role gets DML and EXECUTE only. |
 | `AUTH_ACTIVE_PRIVATE_JWK` | required | Private signing JWK with a `kid`. Startup fails without it. |
 | `AUTH_PREVIOUS_PUBLIC_JWK_SET` | empty | `{"keys":[...]}` of public keys kept on JWKS during rotation. Private material fails startup. |
 | `AUTH_SIGNING_ALGORITHM` | `RS256` | `RS256` (RSA key) or `ML-DSA-65` (RFC 9964 AKP key). |
@@ -30,6 +31,8 @@ the plain name.
 | `AUTH_IDENTITY_LINK_CLIENT_ID` | `gsio-auth-client` | Default client id at external identity providers. |
 | `IDENTITY_IDENTITY_LINK__PROVIDERS` | `{}` | JSON map of allowlisted providers: `{"acme":{"issuer","authorizationEndpoint","tokenEndpoint","jwksUri","clientId","clientSecret","scopes","freshAuthenticationParameter"}}`. `google`, `github`, `gitlab`, and `okta` have built-in endpoints. |
 | `GSIO_IDENTITY_NOTIFICATION_DELAY_MS` | `5000` | Security-notification worker delay. `GSIO_IDENTITY_NOTIFICATION_SCHEDULER_ENABLED=false` turns it off. |
+| `IDENTITY_COLUMN_ENCRYPTION` | `disabled` | `enabled` opts in to pgcrypto column encryption (see [Column encryption](#column-encryption)). Any other value fails startup. |
+| `IDENTITY_COLUMN_KEY`, `IDENTITY_BIDX_KEY` | empty | Column encryption key and blind-index key: 32 random bytes each, base64, different from each other. Required once encryption is enabled. |
 
 Generate a signing key with:
 
@@ -40,10 +43,237 @@ bun scripts/generate-jwk.ts ML-DSA-65  # only after relying parties accept ML-DS
 
 ## Startup
 
-`apps/server` connects Postgres, applies the migrations, validates the signing keys, reconciles the
+`apps/server` connects Postgres, applies the migrations, validates the signing keys, loads the
+column encryption state (enabling it when opted in), reconciles the
 bootstrap owner, organization, and the three clients, starts the notification worker, then
 listens. Any failure exits the process before it accepts traffic. Bootstrap is safe on every start:
 it creates what is missing, re-hashes the client secrets, and never renames the organization.
+
+## Column encryption
+
+Optional at-rest encryption of PII and secrets with pgcrypto, for **new writes only**
+(identity-server#56, di-framework/platform#138).
+
+| Column | Protection |
+| --- | --- |
+| `users.email`, `users.display_name`, `users.avatar_url` | `pgp_sym_encrypt` into `<column>_enc`. `users_email_key` stays: new rows write `email` NULL, which never collides. |
+| `users.normalized_email` | HMAC-SHA256 blind index `normalized_email_bidx` (UNIQUE); the three email lookups use it. The address itself is in `email_enc`. |
+| `email_challenges.email` | encrypted, plus `email_bidx` of the trimmed lower-cased address for the issuance rate limit (index on `email_bidx, purpose, created_at`) |
+| `identity_links.subject` | encrypted, plus `subject_bidx` (`UNIQUE (issuer, subject_bidx)`); the three subject lookups use it |
+| `identity_links.provider_email`, `identity_link_flows.nonce`, `identity_link_flows.code_verifier`, `identity_unlink_confirmations.subject`, `identity_security_notifications.recipient_email`, `oauth2_authorization.oidc_id_token_claims`, `browser_sessions.attributes`, `auth_audit_records.before_metadata`, `auth_audit_records.after_metadata` | encrypted |
+
+Logins (`login`, `normalized_login`) stay plaintext. Token, secret and password columns already
+hold SHA-256 or Argon2id hashes and are unchanged.
+
+**Opting in.** `V18__column_encryption.sql` always runs. It creates the pgcrypto extension (or, on
+an engine without it, logs a notice and carries on), adds the nullable `_enc` and `_bidx`
+columns and indexes, and adds the one-row `identity_column_encryption` table with
+`enabled = false`. Its CHECK constraints are added `NOT VALID`, so V18 itself scans no rows.
+`V19__validate_column_encryption_checks.sql` validates them in a separate migration, which only
+takes SHARE UPDATE EXCLUSIVE locks and so blocks neither reads nor writes.
+`V20__pin_column_encryption_search_path.sql` pins name resolution in both trigger functions
+(`SET search_path = pg_catalog, pg_temp`, and the latch table named by schema), so a caller's
+`search_path` or a temp table cannot change what they read.
+Nothing is encrypted yet. To opt in, put both keys and `IDENTITY_COLUMN_ENCRYPTION=enabled` in
+the settings (for the guest, in `identity-control`; see below) and restart. At startup
+(`IdentityModule.prepare`, or the guest's boot before bootstrap) the service:
+
+1. runs `CREATE EXTENSION IF NOT EXISTS pgcrypto` and looks up the schema pgcrypto lives in, so
+   its functions are called schema-qualified, whatever the `search_path`;
+2. proves the engine works with the real keys, by running an encrypt/decrypt round trip and an
+   HMAC that it compares with its own;
+3. only then sets `enabled = true` and records an HMAC check value for each key, never the keys.
+
+**Enabling is one-way.** The `identity_column_encryption_guard` trigger refuses (SQLSTATE
+`IDC02`) any of these: turning `enabled` off, changing or clearing a recorded key check,
+deleting the row, or truncating the table. The service and the plaintext-reject trigger also
+treat recorded key checks as enabled, even if `enabled` were forced off.
+
+**What the in-database latch does and does not stop.** These triggers stop mistakes. Against a
+SQL writer that **does not own the tables** (for example, a session using the service role's
+credentials under [role separation](#database-role-separation)), they stop exactly two things:
+downgrading or rekeying the latch, and writing a new non-NULL value to a protected plaintext
+column. Since V20 that also holds when the writer creates its own
+`pg_temp.identity_column_encryption` or changes its `search_path`: the trigger functions read only
+the real latch table. They do not stop the table owner or a superuser. Either one can
+`ALTER TABLE … DISABLE TRIGGER`, `DROP TRIGGER`, or replace the trigger functions, and then
+downgrade the latch or write plaintext.
+
+They are not access control for the data. A writer with DML on the tables can still change or
+delete rows, change the columns that are not encrypted, write NULL or arbitrary bytes to an `_enc`
+or `_bidx` column, and copy ciphertext from one row to another. Without the keys, it cannot read
+or produce valid ciphertext.
+
+- **Bun server on Postgres:** use [role separation](#database-role-separation). The service's
+  own role then is not the owner, and the latch holds against the service role and anything that
+  borrows its credentials.
+- **Without role separation** (a single `DATABASE_URL` role that owns the schema), the service's
+  own credentials can undo the latch.
+- **wasmCloud guest on pglite:** the guest's database user is effectively a superuser of its
+  embedded engine. There, the latch only protects against mistakes, and the protection that counts
+  is the key custody below. Keep
+`IDENTITY_COLUMN_ENCRYPTION=enabled` and both keys in the settings after opting in. The switch
+is what opts a fresh database in (for example, a restore into an empty one). On an
+already-enabled database the keys are what count, and removing the switch does not turn
+encryption off.
+
+**Once enabled, it fails closed.**
+- Startup needs both keys, and they must match the recorded checks. A missing or different key
+  stops the Bun server at startup. The guest answers every request with 503 and the generic body
+  `{"ok":false,"error":"service unavailable","reason":"column-encryption-unavailable"}`. A
+  request that reaches an unusable cipher also answers 503, with `service unavailable`. Which setting is missing, or which key differs, appears only in the
+  log. Nothing falls back to plaintext.
+- In the database, the `identity_reject_plaintext` trigger refuses (SQLSTATE `IDC01`, which the
+  service maps to 503) any INSERT or UPDATE that writes a new non-NULL value to a protected
+  plaintext column.
+- An instance that loaded the disabled state before another instance opted in reacts in two
+  ways. On an `IDC01` refusal it drops its cached state at once, and it also re-reads a disabled
+  state every 30 seconds (`DISABLED_REFRESH_MS`). Within at most one refusal or 30 seconds it
+  therefore reads encrypted rows correctly, provided it has the keys. Roll the keys out to every
+  instance before any instance opts in.
+- The trigger costs about 5 µs per written row on the server: an `EXPLAIN ANALYZE` of 20,000
+  `browser_sessions` updates on Postgres 16 measured 4.9 µs per row while disabled and 5.6 µs
+  per row while enabled, against 5.4 µs for the update itself. That is small next to the ~0.4 ms
+  round trip of each statement.
+- An engine without pgcrypto cannot be enabled: startup fails with
+  `column encryption needs the pgcrypto extension`. The pglite provider gets pgcrypto in a
+  separate di-framework/platform change. Until that ships, the guest runs unencrypted and should
+  not be opted in.
+
+**Existing rows are not rewritten.** Rows written before the opt-in keep their plaintext. Reads
+return `coalesce(pgp_sym_decrypt(<column>_enc, key), <column>)`. Lookups match the blind index
+or the legacy plaintext column. A new user or link is refused (409) while a legacy row has the
+same normalized email or `(issuer, subject)`, so uniqueness holds across both kinds of row. When
+a legacy row is updated, only the columns that the update writes are encrypted; for example, a
+display name change encrypts the display name but leaves the legacy email plaintext. **Legacy
+plaintext stays in the table until a later re-encrypt (backfill) pass, which is a follow-up. It
+also stays in WAL, dead tuples (until VACUUM) and every backup taken before then.** Treat
+backups from before the opt-in as holding plaintext PII.
+
+**Statements.** A key is always a bound statement parameter and never part of SQL text, for
+example `<schema>.pgp_sym_encrypt(?::text, ?::text, 'cipher-algo=aes256, s2k-mode=1,
+s2k-digest-algo=sha256')` and `<schema>.hmac(?::text, ?::text, 'sha256')`. Statements are
+composed with the `sql` tag (`packages/core/src/shared/infrastructure/sql.ts`), which only ever
+turns values into `?` bindings. `packages/core/tests/column-encryption.test.ts` records every
+statement and asserts this. MDC integrity is on, and compression is off. S2K is salted but not
+iterated, because the key is 32 random bytes and not a password. Ciphertext length still follows
+plaintext length (an email's length is visible, for example).
+
+### Threat model and logging
+
+Column encryption protects copies of the data at rest that do not include the keys: the data
+directory, `pg_dump` output, base backups, and WAL written after the opt-in. It does **not**
+protect against someone who controls the live database server or the service process. The keys
+travel to the server with every statement, so such a person can capture them, for example by
+turning on statement logging. It also does not cover plaintext from before the opt-in (see
+above).
+
+The keys are bound values, so they reach any log that records bound values:
+
+- **Postgres (Bun server).** With `log_min_duration_statement`, `log_statement` or
+  `auto_explain`, Postgres logs `DETAIL: parameters: $1 = '…'`, which includes keys and plaintext.
+  For the application role, turn off parameter logging:
+  `ALTER ROLE identity SET log_parameter_max_length = 0;` and
+  `ALTER ROLE identity SET log_parameter_max_length_on_error = 0;`. Do not enable statement
+  logging with parameters for that role. Connect to Postgres over TLS (`sslmode=verify-full`),
+  because the keys cross the network on every statement.
+- **The service.** Driver errors can carry the statement and its values (PGlite's
+  `DatabaseError` keeps `params` and `query`). `PostgresGateway` strips `params`, `parameters`,
+  `query` and `values` from every database error before rethrowing it. The control-plane and
+  route error handlers log only `message (code)`, and HTTP error bodies are generic.
+- **The production guest.** The platform pglite provider already redacts statement values from
+  its error descriptions.
+
+### Key custody
+
+- `IDENTITY_COLUMN_KEY` (encryption) and `IDENTITY_BIDX_KEY` (blind index) are two independent
+  32-byte random values, base64 encoded. They are separate from each other and from the pglite
+  filesystem key `DI_PGLITE_KEY`, so a leak of one does not expose the others.
+- They live only in the runtime settings: `identity-control` for the guest, the stack's secret
+  state for `deploy/platform` (`random.RandomBytes`), and the process environment for the Bun
+  server. They are never stored in the database, and the service never logs them. Database
+  server logs are configured separately; see [Threat model and logging](#threat-model-and-logging).
+- The two keys must differ. The settings loader refuses equal keys, and so do the runtime
+  secrets tools.
+- **Losing `IDENTITY_COLUMN_KEY` makes every encrypted column unreadable, and losing
+  `IDENTITY_BIDX_KEY` breaks every lookup by email or subject.** Back both up with the same care
+  as the database backups, but store them separately from those backups.
+- Key rotation is not supported yet. Re-encrypting under a new key is the same follow-up pass as
+  the backfill. `runtime-secrets.ts column-keys` never replaces an existing key.
+- Generating keys: `bun deploy/guest/runtime-secrets.ts generate ... [--column-encryption]`
+  writes both keys into a new values file. For an existing file, run
+  `bun deploy/guest/runtime-secrets.ts column-keys --values <file> [--enable]`, which adds any
+  missing key and with `--enable` sets the switch, then `apply`. `apply` refuses a values file
+  that enables encryption without both keys, with malformed keys, or with two equal keys. With
+  Pulumi, set `columnEncryption: true` in the stack config. The keys are generated either way.
+- The new control-Secret keys are `IDENTITY_COLUMN_ENCRYPTION`, `IDENTITY_COLUMN_KEY` and
+  `IDENTITY_BIDX_KEY`. The cli-extensions control-secret key declaration must list them too
+  (coordinated with that change).
+
+## Database role separation
+
+For the Bun server on Postgres, set `MIGRATION_DATABASE_URL` to a role that owns the identity
+schema, and `DATABASE_URL` to a separate login role that owns nothing. At startup the server
+then does this:
+
+1. It applies the migrations as the owner role.
+2. It grants the service role exactly this (`grantServiceRole` in `packages/migrations`):
+   - `USAGE` on the schema;
+   - `SELECT, INSERT, UPDATE, DELETE` on the tables, but read-only on the migration runner's
+     `_migrations` and `_migrations_lock`;
+   - `USAGE, SELECT` on sequences;
+   - `EXECUTE` on functions.
+
+   It first revokes everything else, so `TRUNCATE`, `REFERENCES`, `TRIGGER` and leftover grants
+   go. The grants are re-applied on every start, which also covers new tables.
+3. It serves on the service role.
+
+Startup refuses a service role that is the owner, a superuser, or the owner of any table in the
+schema. As the service role, `ALTER TABLE … DISABLE TRIGGER`, `DROP TRIGGER`,
+`CREATE OR REPLACE FUNCTION` on the trigger functions, `TRUNCATE`, writes to `_migrations`, and
+downgrading or deleting the latch row all fail. A plaintext write to a protected column is refused
+with `IDC01`, also from a session that has created a `pg_temp.identity_column_encryption` shadow
+table claiming encryption is off (V20). `packages/core/tests/role-separation.test.ts` checks each
+of these on PostgreSQL 16.
+
+Two caveats about DDL:
+
+- `CREATE TABLE` in `public` fails for the service role only because PostgreSQL 15 and later no
+  longer grant `CREATE` on `public` to `PUBLIC`. On PostgreSQL 14 and earlier, run
+  `REVOKE CREATE ON SCHEMA public FROM PUBLIC;` yourself. The trigger functions do not depend on
+  it, because V20 pins their name resolution.
+- The service role can still create temporary tables, since `PUBLIC` has `TEMPORARY` on the
+  database by default. Since V20 this does not affect the triggers. To remove it anyway, run
+  `REVOKE TEMPORARY ON DATABASE identity FROM PUBLIC;`. The service does not use temporary tables.
+
+```sql
+-- once, as a superuser
+CREATE ROLE identity_owner LOGIN PASSWORD '…';      -- MIGRATION_DATABASE_URL uses this role
+CREATE ROLE identity_service LOGIN PASSWORD '…';    -- DATABASE_URL uses this role
+
+-- a new database:
+CREATE DATABASE identity OWNER identity_owner;
+
+-- an existing database, where the single role `identity` has been migrating and serving so far
+-- and owns the tables. Connected to that database, hand everything it owns to the owner role:
+REASSIGN OWNED BY identity TO identity_owner;
+```
+
+In the existing-database case, `identity` is the role that used to be the only one. After the
+`REASSIGN OWNED` it owns nothing, and you have two options:
+
+- Point `DATABASE_URL` at `identity_service`, as above, and then retire or lock the `identity`
+  login.
+- Skip `CREATE ROLE identity_service` and keep `DATABASE_URL` on `identity`, which is now the
+  service role. This only works if `identity` is not a superuser. For example, the `POSTGRES_USER`
+  of the official image and of `compose.yml` is a superuser, and startup refuses it.
+
+Either way, `DATABASE_URL` must name the role that owns nothing, and `MIGRATION_DATABASE_URL`
+must name `identity_owner`.
+
+With `MIGRATION_DATABASE_URL` unset, the server keeps the earlier behaviour: one role migrates and
+serves, so it owns the tables and could undo the latch. The pglite guest has no roles; see
+[Column encryption](#column-encryption).
 
 ## Endpoints
 
@@ -89,14 +319,27 @@ places and never from its database:
   `AUTH_PREVIOUS_PUBLIC_JWK_SET`, `SMTP_HOST`, `SMTP_USERNAME`, `SMTP_PASSWORD`,
   `AUTH_ACCESS_REDIRECT_URIS`, `AUTH_BOOTSTRAP_OWNER_PASSWORD`, `AUTH_BOOTSTRAP_VIEWER_PASSWORD`,
   `AUTH_ACCESS_CLIENT_SECRET`, `AUTH_DIRECTORY_CLIENT_SECRET`, `AUTH_PROVISIONER_CLIENT_SECRET`,
-  `AUTH_CLI_CLIENT_ID`, `AUTH_CLI_REDIRECT_URIS` (`RUNTIME_SECRET_SETTINGS` in
-  `apps/guest/src/settings.ts`). An environment value wins over wasi:config.
+  `AUTH_CLI_CLIENT_ID`, `AUTH_CLI_REDIRECT_URIS`, and for [column encryption](#column-encryption)
+  `IDENTITY_COLUMN_ENCRYPTION`, `IDENTITY_COLUMN_KEY`, `IDENTITY_BIDX_KEY`
+  (`RUNTIME_SECRET_SETTINGS` in `apps/guest/src/settings.ts`). An environment value wins over
+  wasi:config.
 
 wasi:config cannot carry secrets or URLs (the platform rejects them), and tenant admission lets a
 workload without an environment label reference only its `<workload>-control` Secret, which
 cli-plugin-platform creates for the control token. The guest refuses to boot without
 `ISSUER_URL`, `AUTH_PUBLIC_ORIGIN` and `AUTH_ACTIVE_PRIVATE_JWK`: every request answers 503 with
-`runtime settings missing from the identity-control Secret: <names>`.
+`{"ok":false,"error":"service unavailable","reason":"runtime-settings-missing"}`, and the log
+line `identity boot failed: runtime settings missing from the identity-control Secret: <names>`.
+Every boot failure answers the same generic body with a coarse `reason`:
+
+| `reason` | Cause |
+| --- | --- |
+| `runtime-settings-missing` | The runtime settings above are absent |
+| `bootstrap-in-progress` | Another realm is running bootstrap (with `Retry-After: 5`) |
+| `column-encryption-unavailable` | Column encryption is enabled but unusable |
+| `boot-failed` | Any other failure |
+
+The details are only in the log, because a driver message can echo a value.
 
 `di-framework platform deploy` (cli-plugin-platform 6.1.2) rewrites `identity-control` on each
 deploy with only `DI_CONTROL_TOKEN` and `DI_CONTROL_IDENTITY`. As a tenant developer it cannot

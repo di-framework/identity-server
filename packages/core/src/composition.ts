@@ -32,6 +32,7 @@ import {
   SESSIONS,
   SIGNING_KEYS,
 } from './shared/domain/tokens.ts';
+import { ColumnEncryption } from './shared/infrastructure/column-encryption.ts';
 import { SigningKeys } from './shared/infrastructure/crypto/signing-keys.ts';
 import { configuredDatabaseUrl } from './shared/infrastructure/database-config.ts';
 import {
@@ -71,6 +72,7 @@ export const IdentityModule = {
   /** Registers explicit settings, for a process that loaded them itself. */
   configure(settings: IdentitySettings): void {
     useContainer().registerValue(IDENTITY_SETTINGS, settings);
+    useContainer().resolve(ColumnEncryption).reset();
   },
 
   settings(): IdentitySettings {
@@ -79,6 +81,7 @@ export const IdentityModule = {
 
   connect(database: SqlDatabase): void {
     useContainer().registerValue(IDENTITY_DATABASE, database);
+    useContainer().resolve(ColumnEncryption).reset();
   },
 
   /** Opens Postgres from the identity config and registers that connection pool. */
@@ -93,11 +96,13 @@ export const IdentityModule = {
 
   /**
    * Startup checks that fail closed, as the auth server does: load and validate the signing
-   * keys, then reconcile bootstrap state.
+   * keys, load the column encryption state (enabling it when opted in; missing or wrong keys
+   * stop startup), then reconcile bootstrap state.
    */
   async prepare(): Promise<void> {
     const container = useContainer();
     container.resolve(SIGNING_KEYS);
+    await container.resolve(ColumnEncryption).cipher();
     await container.resolve(BootstrapReconciler).reconcile();
   },
 

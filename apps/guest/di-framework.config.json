@@ -3,7 +3,7 @@
   "entry": "src/app.ts",
   "output": "dist/identity.wasm",
   "pglite": {
-    "image": "ghcr.io/di-framework/pglite-component@sha256:8bc30505cf28b1a65f72588da692d2ba3d79a6a2025c9256341a8625967a3286",
+    "image": "ghcr.io/di-framework/pglite-component@sha256:9a00ac39f202ede852d0ce0e43dbb27c5626c3e3e613d63d5916c990394a7d5e",
     "storageMount": "/data",
     "dataDir": "/data/pglite"
   }

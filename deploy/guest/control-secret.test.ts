@@ -3,7 +3,9 @@ import { readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import {
   applyRuntimeSecrets,
+  assertColumnEncryption,
   assertPrivateMode,
+  COLUMN_KEY_NAMES,
   controlSecretDocument,
   defaultKubeStateDir,
   type Kubectl,
@@ -70,6 +72,40 @@ test('values files: known names, strings, required names, owner-only mode', () =
   expect(() => assertPrivateMode(0o100400, 'v')).not.toThrow();
   expect(() => assertPrivateMode(0o100640, 'v')).toThrow('(mode 640); chmod 600 it');
   expect(() => assertPrivateMode(0o100604, 'v')).toThrow('(mode 604)');
+});
+
+test('column encryption values: valid keys, distinct keys, and the switch needs both', () => {
+  const column = Buffer.alloc(32, 1).toString('base64');
+  const bidx = Buffer.alloc(32, 2).toString('base64');
+  const keyed = { ...VALUES, IDENTITY_COLUMN_KEY: column, IDENTITY_BIDX_KEY: bidx };
+  expect(COLUMN_KEY_NAMES).toEqual(['IDENTITY_COLUMN_KEY', 'IDENTITY_BIDX_KEY']);
+  expect(parseRuntimeValues(JSON.stringify(keyed), 'v')).toEqual(keyed);
+  const enabled = { ...keyed, IDENTITY_COLUMN_ENCRYPTION: 'enabled' };
+  expect(parseRuntimeValues(JSON.stringify(enabled), 'v')).toEqual(enabled);
+  expect(() =>
+    assertColumnEncryption({ IDENTITY_COLUMN_ENCRYPTION: 'disabled' }, 'v'),
+  ).not.toThrow();
+  expect(() => assertColumnEncryption({ IDENTITY_COLUMN_ENCRYPTION: 'on' }, 'v')).toThrow(
+    'IDENTITY_COLUMN_ENCRYPTION in v must be enabled or disabled',
+  );
+  expect(() => assertColumnEncryption({ IDENTITY_COLUMN_KEY: 'c2hvcnQ=' }, 'v')).toThrow(
+    'IDENTITY_COLUMN_KEY in v must be at least 32 random bytes, base64 encoded',
+  );
+  expect(() =>
+    assertColumnEncryption({ IDENTITY_COLUMN_KEY: column, IDENTITY_BIDX_KEY: column }, 'v'),
+  ).toThrow('must differ');
+  const missing = (() => {
+    try {
+      assertColumnEncryption(
+        { IDENTITY_COLUMN_ENCRYPTION: 'enabled', IDENTITY_COLUMN_KEY: column },
+        'v',
+      );
+    } catch (error) {
+      return String(error);
+    }
+  })();
+  expect(missing).toContain('needs IDENTITY_COLUMN_KEY and IDENTITY_BIDX_KEY');
+  expect(missing).not.toContain(column);
 });
 
 test('a tenant with the Postgres directory BackingService is refused, and so is a failed check', async () => {

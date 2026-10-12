@@ -1,5 +1,10 @@
 import { useContainer } from '@di-framework/core/container';
 import { Container } from '@di-framework/core/decorators';
+import { IdentityError } from '@di-framework/identity/src/shared/domain/identity-error.ts';
+import {
+  describeError,
+  redactStatement,
+} from '@di-framework/identity/src/shared/infrastructure/error-redaction.ts';
 import { ControlPlaneController, HttpResponse, type RouteRequest } from './control-plane.ts';
 
 export interface HttpCall {
@@ -88,8 +93,10 @@ export class ControlPlaneHandlers {
       ) => Promise<{ status: number; body?: unknown }>;
       return HttpResponse.from(await method.call(controller, request));
     } catch (error) {
-      console.error(`control-plane ${name} failed`, error);
-      return new Response(null, { status: 500 });
+      // Message and code only: driver errors can carry bound values, which may include keys.
+      console.error(`control-plane ${name} failed: ${describeError(redactStatement(error))}`);
+      const unavailable = error instanceof IdentityError && error.status === 503;
+      return new Response(null, { status: unavailable ? 503 : 500 });
     }
   }
 }

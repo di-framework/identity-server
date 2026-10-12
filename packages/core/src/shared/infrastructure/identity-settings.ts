@@ -30,7 +30,11 @@ export interface IdentitySettings {
   issuer: string;
   publicOrigin: string;
   cookieSecure: boolean;
-  database: { url: string; poolMax: number };
+  /**
+   * `migrationUrl` (`MIGRATION_DATABASE_URL`): when set, migrations run as that (owner) role and
+   * the service, on `url`, gets only DML and EXECUTE grants (role separation).
+   */
+  database: { url: string; poolMax: number; migrationUrl: string };
   smtp: {
     host: string;
     port: number;
@@ -56,6 +60,12 @@ export interface IdentitySettings {
   };
   identityLink: { clientId: string; providers: Record<string, ProviderSettings> };
   notifications: { fixedDelayMs: number; schedulerEnabled: boolean };
+  /**
+   * Opt-in pgcrypto column encryption (`IDENTITY_COLUMN_ENCRYPTION=enabled`). The two keys are
+   * separate 32-byte random values (base64) from the runtime Secret; they are bound as statement
+   * parameters only and are never logged.
+   */
+  encryption: { columns: boolean; columnKey: string; bidxKey: string };
 }
 
 type Env = Record<string, string | undefined>;
@@ -68,7 +78,11 @@ export function loadIdentitySettings(env: Env = process.env): IdentitySettings {
     issuer,
     publicOrigin: text('AUTH_PUBLIC_ORIGIN', issuer),
     cookieSecure: text('SERVER_SERVLET_SESSION_COOKIE_SECURE', 'true'),
-    database: { url: text('DATABASE_URL', localPostgresUrl), poolMax: '8' },
+    database: {
+      url: text('DATABASE_URL', localPostgresUrl),
+      poolMax: '8',
+      migrationUrl: text('MIGRATION_DATABASE_URL'),
+    },
     smtp: {
       host: text('SMTP_HOST'),
       port: text('SMTP_PORT', '587'),
@@ -120,11 +134,36 @@ export function loadIdentitySettings(env: Env = process.env): IdentitySettings {
       schedulerEnabled: text('GSIO_IDENTITY_NOTIFICATION_SCHEDULER_ENABLED', 'true'),
     },
   };
+  const encryption = {
+    columns: encryptionSwitch(text('IDENTITY_COLUMN_ENCRYPTION')),
+    columnKey: columnKey(env, 'IDENTITY_COLUMN_KEY'),
+    bidxKey: columnKey(env, 'IDENTITY_BIDX_KEY'),
+  };
+  if (encryption.columnKey && encryption.columnKey === encryption.bidxKey) {
+    throw new Error('IDENTITY_COLUMN_KEY and IDENTITY_BIDX_KEY must be different keys');
+  }
   const overrides = envSource({ prefix: 'IDENTITY_', env, coerce: false }).load() as Record<
     string,
     unknown
   >;
-  return normalize(deepMerge(base, overrides) as typeof base);
+  return { ...normalize(deepMerge(base, overrides) as typeof base), encryption };
+}
+
+/** `IDENTITY_COLUMN_ENCRYPTION`: `enabled` opts in; unset or `disabled` leaves it off. */
+function encryptionSwitch(value: string): boolean {
+  if (value === '' || value === 'disabled') return false;
+  if (value === 'enabled') return true;
+  throw new Error('IDENTITY_COLUMN_ENCRYPTION must be enabled or disabled');
+}
+
+/** A column key: base64 or base64url of at least 32 bytes. The message never echoes the value. */
+function columnKey(env: Env, name: string): string {
+  const value = env[name]?.trim() ?? '';
+  if (!value) return '';
+  if (!/^[A-Za-z0-9+/_-]+={0,2}$/.test(value) || Buffer.from(value, 'base64').length < 32) {
+    throw new Error(`${name} must be at least 32 random bytes, base64 encoded`);
+  }
+  return value;
 }
 
 function person(env: Env, prefix: string): PersonSettings {
@@ -136,13 +175,13 @@ function person(env: Env, prefix: string): PersonSettings {
   };
 }
 
-function normalize(raw: unknown): IdentitySettings {
+function normalize(raw: unknown): Omit<IdentitySettings, 'encryption'> {
   const value = raw as {
     server: { host: unknown; port: unknown };
     issuer: unknown;
     publicOrigin: unknown;
     cookieSecure: unknown;
-    database: { url: unknown; poolMax: unknown };
+    database: { url: unknown; poolMax: unknown; migrationUrl: unknown };
     smtp: Record<string, unknown>;
     jwk: Record<string, unknown>;
     bootstrap: IdentitySettings['bootstrap'];
@@ -163,6 +202,7 @@ function normalize(raw: unknown): IdentitySettings {
     database: {
       url: str(value.database.url),
       poolMax: int(value.database.poolMax, 'database pool size'),
+      migrationUrl: str(value.database.migrationUrl),
     },
     smtp: {
       host: str(value.smtp.host),

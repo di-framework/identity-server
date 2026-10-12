@@ -1,5 +1,7 @@
 import { Component, Container } from '@di-framework/core/decorators';
+import { ColumnEncryption } from '../../shared/infrastructure/column-encryption.ts';
 import { PostgresGateway, Timestamps } from '../../shared/infrastructure/postgres-gateway.ts';
+import { sql } from '../../shared/infrastructure/sql.ts';
 import type {
   NotificationAction,
   NotificationRepository,
@@ -25,47 +27,39 @@ interface Row {
   last_error: string | null;
 }
 
+/** `recipient_email` is encrypted once column encryption is enabled. */
 @Container()
 export class PostgresNotificationRepository implements NotificationRepository {
-  constructor(@Component(PostgresGateway) private readonly db: PostgresGateway) {}
+  constructor(
+    @Component(PostgresGateway) private readonly db: PostgresGateway,
+    @Component(ColumnEncryption) private readonly encryption: ColumnEncryption,
+  ) {}
 
   async insertIfAbsent(n: SecurityNotification): Promise<boolean> {
+    const cipher = await this.encryption.cipher();
     const result = await this.db.run(
-      `INSERT INTO identity_security_notifications (id, event_key, user_id, action, recipient_email,
-         provider_name, issuer, identity_hint, correlation_id, status, attempts, next_attempt_at,
-         created_at, sent_at, last_error)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      sql`INSERT INTO identity_security_notifications (id, event_key, user_id, action, recipient_email,
+         recipient_email_enc, provider_name, issuer, identity_hint, correlation_id, status, attempts,
+         next_attempt_at, created_at, sent_at, last_error)
+       VALUES (${n.id}, ${n.eventKey}, ${n.userId}, ${n.action}, ${cipher.plain(n.recipientEmail)},
+         ${cipher.encrypt(n.recipientEmail)}, ${n.providerName}, ${n.issuer}, ${n.identityHint},
+         ${n.correlationId}, ${n.status}, ${n.attempts}, ${new Date(n.nextAttemptAt)},
+         ${new Date(n.createdAt)}, ${n.sentAt == null ? null : new Date(n.sentAt)}, ${n.lastError})
        ON CONFLICT (event_key) DO NOTHING
        RETURNING 1`,
-      [
-        n.id,
-        n.eventKey,
-        n.userId,
-        n.action,
-        n.recipientEmail,
-        n.providerName,
-        n.issuer,
-        n.identityHint,
-        n.correlationId,
-        n.status,
-        n.attempts,
-        new Date(n.nextAttemptAt),
-        new Date(n.createdAt),
-        n.sentAt == null ? null : new Date(n.sentAt),
-        n.lastError,
-      ],
     );
     return (result.changes ?? 0) > 0;
   }
 
   async claim(id: string, now: number, until: number): Promise<SecurityNotification | undefined> {
+    const cipher = await this.encryption.cipher();
     const row = await this.db.one<Row>(
-      `UPDATE identity_security_notifications SET next_attempt_at = ?
-       WHERE id = ? AND status IN ('pending', 'failed') AND next_attempt_at <= ?
-       RETURNING id::text AS id, event_key, user_id::text AS user_id, action, recipient_email,
-         provider_name, issuer, identity_hint, correlation_id, status, attempts, next_attempt_at,
-         created_at, sent_at, last_error`,
-      [new Date(until), id, new Date(now)],
+      sql`UPDATE identity_security_notifications SET next_attempt_at = ${new Date(until)}
+       WHERE id = ${id} AND status IN ('pending', 'failed') AND next_attempt_at <= ${new Date(now)}
+       RETURNING id::text AS id, event_key, user_id::text AS user_id, action,
+         ${cipher.read('recipient_email', 'recipient_email')}, provider_name, issuer,
+         identity_hint, correlation_id, status, attempts, next_attempt_at, created_at, sent_at,
+         last_error`,
     );
     if (!row) return undefined;
     return {
