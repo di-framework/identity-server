@@ -371,7 +371,10 @@ required) runs:
 The values file is only read, so the data directory key in it is the same on every deploy. On a
 first deploy the Secret does not exist yet: the CLI creates it with only its control keys, and the
 guest answers 503 until step 4 (the encryption layer refuses to start without its key and
-changes nothing). **Recovery:** if step 3 or 4 fails, fix the cause and run
+changes nothing). The first deploy of a new workload can also stop at step 3 with `did not become
+ready` (exit 3): the tenant host rolls to mount the new directory, which outlasts the CLI's
+wait. Wait until the WorkloadDeployment is Ready, then run `apply` as below. **Recovery:** if
+step 3 or 4 fails, fix the cause and run
 `bun deploy/guest/runtime-secrets.ts apply --values <file> --kubeconfig <kc> --tenant <tenant>`
 on its own; it rewrites the Secret and rolls the workload.
 
