@@ -45,7 +45,7 @@ test('reports a server error with no body when an operation throws', async () =>
   );
   expect(response.status).toBe(500);
   expect(await response.text()).toBe('');
-  expect(logged).toHaveBeenCalledWith('control-plane createUser failed', expect.any(Error));
+  expect(logged).toHaveBeenCalledWith('control-plane createUser failed: internal detail');
   logged.mockRestore();
 
   const responseNoHeaders = await handlers.getUser(

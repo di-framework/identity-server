@@ -43,16 +43,17 @@ ALTER TABLE users
   ADD COLUMN avatar_url_enc bytea,
   ALTER COLUMN display_name DROP NOT NULL,
   ADD CONSTRAINT users_display_name_present
-    CHECK (display_name IS NOT NULL OR display_name_enc IS NOT NULL);
--- Uniqueness moves to the normalized address: normalized_email (legacy rows) and its blind index.
-ALTER TABLE users DROP CONSTRAINT users_email_key;
+    CHECK (display_name IS NOT NULL OR display_name_enc IS NOT NULL) NOT VALID;
+-- users_email_key stays: while disabled it keeps raw addresses unique even for a writer that leaves
+-- normalized_email unset, and once enabled `email` is written NULL, which never collides. New rows
+-- are unique by the blind index of the normalized address.
 CREATE UNIQUE INDEX users_normalized_email_bidx_key ON users (normalized_email_bidx);
 
 ALTER TABLE email_challenges
   ADD COLUMN email_enc bytea,
   ADD COLUMN email_bidx bytea,
   ALTER COLUMN email DROP NOT NULL,
-  ADD CONSTRAINT email_challenges_email_present CHECK (email IS NOT NULL OR email_enc IS NOT NULL);
+  ADD CONSTRAINT email_challenges_email_present CHECK (email IS NOT NULL OR email_enc IS NOT NULL) NOT VALID;
 CREATE INDEX email_challenges_rate_limit_bidx_idx
   ON email_challenges (email_bidx, purpose, created_at DESC);
 
@@ -62,7 +63,7 @@ ALTER TABLE identity_links
   ADD COLUMN provider_email_enc bytea,
   ALTER COLUMN subject DROP NOT NULL,
   ADD CONSTRAINT identity_links_subject_present
-    CHECK (subject IS NOT NULL OR subject_enc IS NOT NULL),
+    CHECK (subject IS NOT NULL OR subject_enc IS NOT NULL) NOT VALID,
   ADD CONSTRAINT uq_identity_links_issuer_subject_bidx UNIQUE (issuer, subject_bidx);
 
 ALTER TABLE identity_link_flows
@@ -70,15 +71,15 @@ ALTER TABLE identity_link_flows
   ADD COLUMN code_verifier_enc bytea,
   ALTER COLUMN nonce DROP NOT NULL,
   ALTER COLUMN code_verifier DROP NOT NULL,
-  ADD CONSTRAINT identity_link_flows_nonce_present CHECK (nonce IS NOT NULL OR nonce_enc IS NOT NULL),
+  ADD CONSTRAINT identity_link_flows_nonce_present CHECK (nonce IS NOT NULL OR nonce_enc IS NOT NULL) NOT VALID,
   ADD CONSTRAINT identity_link_flows_code_verifier_present
-    CHECK (code_verifier IS NOT NULL OR code_verifier_enc IS NOT NULL);
+    CHECK (code_verifier IS NOT NULL OR code_verifier_enc IS NOT NULL) NOT VALID;
 
 ALTER TABLE identity_unlink_confirmations
   ADD COLUMN subject_enc bytea,
   ALTER COLUMN subject DROP NOT NULL,
   ADD CONSTRAINT identity_unlink_confirmations_subject_present
-    CHECK (subject IS NOT NULL OR subject_enc IS NOT NULL);
+    CHECK (subject IS NOT NULL OR subject_enc IS NOT NULL) NOT VALID;
 
 ALTER TABLE identity_security_notifications ADD COLUMN recipient_email_enc bytea;
 
@@ -88,7 +89,7 @@ ALTER TABLE browser_sessions
   ADD COLUMN attributes_enc bytea,
   ALTER COLUMN attributes DROP NOT NULL,
   ADD CONSTRAINT browser_sessions_attributes_present
-    CHECK (attributes IS NOT NULL OR attributes_enc IS NOT NULL);
+    CHECK (attributes IS NOT NULL OR attributes_enc IS NOT NULL) NOT VALID;
 
 ALTER TABLE auth_audit_records
   ADD COLUMN before_metadata_enc bytea,
@@ -96,9 +97,46 @@ ALTER TABLE auth_audit_records
   ALTER COLUMN before_metadata DROP NOT NULL,
   ALTER COLUMN after_metadata DROP NOT NULL,
   ADD CONSTRAINT auth_audit_records_before_present
-    CHECK (before_metadata IS NOT NULL OR before_metadata_enc IS NOT NULL),
+    CHECK (before_metadata IS NOT NULL OR before_metadata_enc IS NOT NULL) NOT VALID,
   ADD CONSTRAINT auth_audit_records_after_present
-    CHECK (after_metadata IS NOT NULL OR after_metadata_enc IS NOT NULL);
+    CHECK (after_metadata IS NOT NULL OR after_metadata_enc IS NOT NULL) NOT VALID;
+
+-- The CHECKs above were added NOT VALID (no scan under the ALTER's lock); validate them now. They
+-- hold for every existing row, whose plaintext columns were NOT NULL.
+ALTER TABLE users VALIDATE CONSTRAINT users_display_name_present;
+ALTER TABLE email_challenges VALIDATE CONSTRAINT email_challenges_email_present;
+ALTER TABLE identity_links VALIDATE CONSTRAINT identity_links_subject_present;
+ALTER TABLE identity_link_flows VALIDATE CONSTRAINT identity_link_flows_nonce_present;
+ALTER TABLE identity_link_flows VALIDATE CONSTRAINT identity_link_flows_code_verifier_present;
+ALTER TABLE identity_unlink_confirmations VALIDATE CONSTRAINT identity_unlink_confirmations_subject_present;
+ALTER TABLE browser_sessions VALIDATE CONSTRAINT browser_sessions_attributes_present;
+ALTER TABLE auth_audit_records VALIDATE CONSTRAINT auth_audit_records_before_present;
+ALTER TABLE auth_audit_records VALIDATE CONSTRAINT auth_audit_records_after_present;
+
+-- The latch is one-way in the database, not only in the service: once enabled, the state row
+-- cannot be turned off, have its key checks changed or cleared, be deleted, or be truncated
+-- (SQLSTATE IDC02). An operator who really must undo it has to drop this trigger first, on purpose.
+CREATE FUNCTION identity_column_encryption_guard() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+  IF TG_OP = 'TRUNCATE' OR TG_OP = 'DELETE' THEN
+    RAISE EXCEPTION 'identity_column_encryption state cannot be removed' USING ERRCODE = 'IDC02';
+  END IF;
+  IF OLD.enabled AND (
+    NOT NEW.enabled
+    OR NEW.column_key_check IS DISTINCT FROM OLD.column_key_check
+    OR NEW.bidx_key_check IS DISTINCT FROM OLD.bidx_key_check
+  ) THEN
+    RAISE EXCEPTION 'column encryption is enabled and cannot be turned off or rekeyed here'
+      USING ERRCODE = 'IDC02';
+  END IF;
+  RETURN NEW;
+END
+$$;
+CREATE TRIGGER identity_column_encryption_guard_row BEFORE UPDATE OR DELETE
+  ON identity_column_encryption FOR EACH ROW EXECUTE FUNCTION identity_column_encryption_guard();
+CREATE TRIGGER identity_column_encryption_guard_truncate BEFORE TRUNCATE
+  ON identity_column_encryption FOR EACH STATEMENT
+  EXECUTE FUNCTION identity_column_encryption_guard();
 
 -- Fail closed in the database too: while encryption is enabled, an INSERT or UPDATE that writes a
 -- new non-NULL value to a protected plaintext column is refused (SQLSTATE IDC01). Updates that
@@ -109,7 +147,11 @@ DECLARE
   previous jsonb := CASE WHEN TG_OP = 'UPDATE' THEN to_jsonb(OLD) ELSE '{}'::jsonb END;
   column_name text;
 BEGIN
-  IF NOT EXISTS (SELECT 1 FROM identity_column_encryption WHERE enabled) THEN
+  -- Recorded key checks count as enabled too, so clearing only `enabled` downgrades nothing.
+  IF NOT EXISTS (
+    SELECT 1 FROM identity_column_encryption
+    WHERE enabled OR column_key_check IS NOT NULL OR bidx_key_check IS NOT NULL
+  ) THEN
     RETURN NEW;
   END IF;
   FOREACH column_name IN ARRAY TG_ARGV LOOP

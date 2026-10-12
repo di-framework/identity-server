@@ -3,6 +3,7 @@ import { Container } from '@di-framework/core/decorators';
 import type { SqlDatabase } from '@di-framework/repo';
 import { IdentityError } from '../domain/identity-error.ts';
 import { IDENTITY_DATABASE } from '../domain/tokens.ts';
+import { redactStatement } from './error-redaction.ts';
 import type { Sql } from './sql.ts';
 
 /** SQLSTATE the V18 trigger raises for a plaintext write while column encryption is enabled. */
@@ -23,6 +24,8 @@ function bind(statement: Statement, params: unknown[]): [string, unknown[]] {
  */
 @Container()
 export class PostgresGateway {
+  private readonly rejectionListeners = new Set<() => void>();
+
   private get database(): SqlDatabase {
     return useContainer().resolve<SqlDatabase>(IDENTITY_DATABASE);
   }
@@ -31,7 +34,7 @@ export class PostgresGateway {
     try {
       return await this.database.query<T>(...bind(statement, params));
     } catch (error) {
-      throw this.translate(error);
+      throw this.translate(redactStatement(error));
     }
   }
 
@@ -40,7 +43,7 @@ export class PostgresGateway {
       const row = await this.database.first<T>(...bind(statement, params));
       return row ?? undefined;
     } catch (error) {
-      throw this.translate(error);
+      throw this.translate(redactStatement(error));
     }
   }
 
@@ -48,7 +51,7 @@ export class PostgresGateway {
     try {
       return await this.database.run(...bind(statement, params));
     } catch (error) {
-      throw this.translate(error);
+      throw this.translate(redactStatement(error));
     }
   }
 
@@ -61,7 +64,9 @@ export class PostgresGateway {
     try {
       return (await this.database.run(...bind(statement, params))).changes ?? 0;
     } catch (error) {
-      throw this.isUnique(error) ? new IdentityError(409, 'Conflict') : this.translate(error);
+      throw this.isUnique(error)
+        ? new IdentityError(409, 'Conflict')
+        : this.translate(redactStatement(error));
     }
   }
 
@@ -82,9 +87,15 @@ export class PostgresGateway {
   private translate(error: unknown): unknown {
     const record = (error ?? {}) as { code?: unknown; errno?: unknown };
     if (record.code === PLAINTEXT_REJECTED || record.errno === PLAINTEXT_REJECTED) {
-      return new IdentityError(503, 'Column encryption is enabled; restart with its keys');
+      for (const listener of this.rejectionListeners) listener();
+      return new IdentityError(503, 'Column encryption was enabled by another instance; retry');
     }
     return error;
+  }
+
+  /** Called when the database refuses a plaintext write, so cached encryption state is re-read. */
+  onPlaintextRejected(listener: () => void): void {
+    this.rejectionListeners.add(listener);
   }
 
   isUnique(error: unknown): boolean {

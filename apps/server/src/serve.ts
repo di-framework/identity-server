@@ -1,4 +1,8 @@
 import { IdentityError } from '../../../packages/core/src/shared/domain/identity-error.ts';
+import {
+  describeError,
+  redactStatement,
+} from '../../../packages/core/src/shared/infrastructure/error-redaction.ts';
 import { controlPlane } from '../../api/src/control-plane.ts';
 import { handle } from '../../client/src/server/handler.ts';
 
@@ -19,11 +23,13 @@ export async function routeRequest(
     if (controlPlane.handles(pathname)) return await controlPlane.fetch(request);
     return await handle(request, undefined, shell);
   } catch (error) {
-    // Column encryption is enabled but unusable here: fail closed, naming no key or value.
-    if (error instanceof IdentityError && error.status === 503) {
-      return Response.json({ ok: false, error: error.message }, { status: 503 });
-    }
-    throw error;
+    // The body names no setting, key or value; the log line has the message and code only.
+    console.error(`request ${pathname} failed: ${describeError(redactStatement(error))}`);
+    const unavailable = error instanceof IdentityError && error.status === 503;
+    return Response.json(
+      { ok: false, error: unavailable ? 'service unavailable' : 'internal error' },
+      { status: unavailable ? 503 : 500, headers: { 'cache-control': 'no-store' } },
+    );
   }
 }
 

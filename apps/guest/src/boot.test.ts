@@ -1,4 +1,4 @@
-import { afterAll, expect, test } from 'bun:test';
+import { afterAll, expect, spyOn, test } from 'bun:test';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -488,15 +488,21 @@ test('column encryption on pglite with pgcrypto: opt in, flows on ciphertext, fa
         expect([table, Number(counts?.plain), Number(counts?.enc) > 0]).toEqual([table, 0, true]);
       }
 
-      // A restart without the keys answers 503 and names the missing settings only.
+      // A restart without the keys answers 503.
+      const logged: string[] = [];
+      const log = spyOn(console, 'error').mockImplementation((line: unknown) => {
+        logged.push(String(line));
+      });
       freshRealm();
       const locked = await handle(
         new Request('https://identity.test/health'),
         runtimeFor(database, guestConfig(false)),
       );
+      log.mockRestore();
       expect(locked.status).toBe(503);
-      const body = (await locked.json()) as { error: string };
-      expect(body.error).toBe(
+      // The unauthenticated body is generic; the detail goes to the log only.
+      expect(await locked.json()).toEqual({ ok: false, error: 'column encryption unavailable' });
+      expect(logged.join('\n')).toContain(
         'column encryption is enabled but IDENTITY_COLUMN_KEY and IDENTITY_BIDX_KEY are not set',
       );
     } finally {
@@ -519,15 +525,18 @@ test('a provider without pgcrypto runs unencrypted and refuses the opt-in', asyn
         runtimeFor(database, guestConfig(false)),
       );
       expect(plain.status).toBe(200);
+      const logged: string[] = [];
+      const log = spyOn(console, 'error').mockImplementation((line: unknown) => {
+        logged.push(String(line));
+      });
       freshRealm();
       const refused = await handle(
         new Request('https://identity.test/ready'),
         runtimeFor(database, guestConfig(false, undefined, encryptionOn)),
       );
+      log.mockRestore();
       expect(refused.status).toBe(503);
-      expect(((await refused.json()) as { error: string }).error).toContain(
-        'needs the pgcrypto extension',
-      );
+      expect(logged.join('\n')).toContain('needs the pgcrypto extension');
     } finally {
       await fixture.shutdown();
       await restoreContainer();

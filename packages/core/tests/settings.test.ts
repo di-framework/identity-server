@@ -246,6 +246,9 @@ test('column encryption: an explicit switch and two 32-byte keys, never echoed',
   expect(loadIdentitySettings({ IDENTITY_COLUMN_ENCRYPTION: 'disabled' }).encryption.columns).toBe(
     false,
   );
+  expect(() => loadIdentitySettings({ IDENTITY_COLUMN_KEY: key, IDENTITY_BIDX_KEY: key })).toThrow(
+    'IDENTITY_COLUMN_KEY and IDENTITY_BIDX_KEY must be different keys',
+  );
   expect(() => loadIdentitySettings({ IDENTITY_COLUMN_ENCRYPTION: 'yes' })).toThrow(
     'IDENTITY_COLUMN_ENCRYPTION must be enabled or disabled',
   );

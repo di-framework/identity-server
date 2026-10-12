@@ -5,8 +5,15 @@ import { Readiness } from '../../../packages/core/src/bootstrap/application/read
 import { IdentityModule } from '../../../packages/core/src/composition.ts';
 import { NotificationWorker } from '../../../packages/core/src/notifications/application/security-notifications.ts';
 import { SIGNING_KEYS } from '../../../packages/core/src/shared/domain/tokens.ts';
-import { ColumnEncryption } from '../../../packages/core/src/shared/infrastructure/column-encryption.ts';
+import {
+  ColumnEncryption,
+  ColumnEncryptionUnavailable,
+} from '../../../packages/core/src/shared/infrastructure/column-encryption.ts';
 import { Hashing } from '../../../packages/core/src/shared/infrastructure/crypto/hashing.ts';
+import {
+  describeError,
+  redactStatement,
+} from '../../../packages/core/src/shared/infrastructure/error-redaction.ts';
 import type { IdentitySettings } from '../../../packages/core/src/shared/infrastructure/identity-settings.ts';
 import { ControlPlaneRouter } from '../../api/src/control-plane.ts';
 import { OperationsEndpoints } from '../../api/src/operations/health.ts';
@@ -63,8 +70,16 @@ export async function handle(request: Request, runtime: GuestRuntime): Promise<R
     });
     await ready;
   } catch (error) {
-    const message = error instanceof Error ? error.message : 'failed';
     const headers = error instanceof BootstrapBusyError ? { 'retry-after': '5' } : {};
+    // Column encryption details (which key is missing or differs) stay in the log.
+    if (error instanceof ColumnEncryptionUnavailable) {
+      console.error(`identity boot failed: ${describeError(redactStatement(error))}`);
+      return Response.json(
+        { ok: false, error: 'column encryption unavailable' },
+        { status: 503, headers },
+      );
+    }
+    const message = error instanceof Error ? error.message : 'failed';
     return Response.json({ ok: false, error: message }, { status: 503, headers });
   }
   const response = await routeRequest(request, runtime.assets, runtime.shell);

@@ -55,7 +55,7 @@ Optional at-rest encryption of PII and secrets with pgcrypto, for **new writes o
 
 | Column | Protection |
 | --- | --- |
-| `users.email`, `users.display_name`, `users.avatar_url` | `pgp_sym_encrypt` into `<column>_enc` |
+| `users.email`, `users.display_name`, `users.avatar_url` | `pgp_sym_encrypt` into `<column>_enc`. `users_email_key` stays: new rows write `email` NULL, which never collides. |
 | `users.normalized_email` | HMAC-SHA256 blind index `normalized_email_bidx` (UNIQUE); the three email lookups use it. The address itself is in `email_enc`. |
 | `email_challenges.email` | encrypted, plus `email_bidx` of the trimmed lower-cased address for the issuance rate limit (index on `email_bidx, purpose, created_at`) |
 | `identity_links.subject` | encrypted, plus `subject_bidx` (`UNIQUE (issuer, subject_bidx)`); the three subject lookups use it |
@@ -67,23 +67,45 @@ hold SHA-256 or Argon2id hashes and are unchanged.
 **Opting in.** `V18__column_encryption.sql` always runs. It creates the pgcrypto extension (or, on
 an engine without it, logs a notice and carries on), adds the nullable `_enc` and `_bidx`
 columns and indexes, and adds the one-row `identity_column_encryption` table with
-`enabled = false`. Nothing is encrypted yet. To opt in, put both keys and
-`IDENTITY_COLUMN_ENCRYPTION=enabled` in the settings (for the guest, in `identity-control`;
-see below) and restart. At startup (`IdentityModule.prepare`, or the guest's boot before
-bootstrap) the service runs `CREATE EXTENSION IF NOT EXISTS pgcrypto`, then sets
-`enabled = true` and records an HMAC check value for each key, never the keys. Enabling is
-one-way. After that `IDENTITY_COLUMN_ENCRYPTION` no longer matters, because the database state
-decides.
+`enabled = false`. Its CHECK constraints are added `NOT VALID` and validated in a separate step.
+Nothing is encrypted yet. To opt in, put both keys and `IDENTITY_COLUMN_ENCRYPTION=enabled` in
+the settings (for the guest, in `identity-control`; see below) and restart. At startup
+(`IdentityModule.prepare`, or the guest's boot before bootstrap) the service:
+
+1. runs `CREATE EXTENSION IF NOT EXISTS pgcrypto` and looks up the schema pgcrypto lives in, so
+   its functions are called schema-qualified, whatever the `search_path`;
+2. proves the engine works with the real keys, by running an encrypt/decrypt round trip and an
+   HMAC that it compares with its own;
+3. only then sets `enabled = true` and records an HMAC check value for each key, never the keys.
+
+**Enabling is one-way, and the database enforces it.** The `identity_column_encryption_guard`
+trigger refuses (SQLSTATE `IDC02`) any of these: turning `enabled` off, changing or clearing a
+recorded key check, deleting the row, or truncating the table. An operator who really must undo
+the latch has to drop that trigger, on purpose. The service and the plaintext-reject trigger
+also treat recorded key checks as enabled, even if `enabled` were forced off. Keep
+`IDENTITY_COLUMN_ENCRYPTION=enabled` and both keys in the settings after opting in. The switch
+is what opts a fresh database in (for example, a restore into an empty one). On an
+already-enabled database the keys are what count, and removing the switch does not turn
+encryption off.
 
 **Once enabled, it fails closed.**
 - Startup needs both keys, and they must match the recorded checks. A missing or different key
-  stops the Bun server at startup, and the guest answers every request with 503 and the names of
-  the missing settings. A request that reaches an unusable cipher also answers 503. Nothing falls
-  back to plaintext.
+  stops the Bun server at startup. The guest answers every request with 503 and the generic body
+  `column encryption unavailable`. A request that reaches an unusable cipher also answers 503,
+  with `service unavailable`. Which setting is missing, or which key differs, appears only in the
+  log. Nothing falls back to plaintext.
 - In the database, the `identity_reject_plaintext` trigger refuses (SQLSTATE `IDC01`, which the
   service maps to 503) any INSERT or UPDATE that writes a new non-NULL value to a protected
-  plaintext column. This covers an instance that loaded the disabled state before another
-  instance enabled encryption. Give every instance the keys before any instance opts in.
+  plaintext column.
+- An instance that loaded the disabled state before another instance opted in reacts in two
+  ways. On an `IDC01` refusal it drops its cached state at once, and it also re-reads a disabled
+  state every 30 seconds (`DISABLED_REFRESH_MS`). Within at most one refusal or 30 seconds it
+  therefore reads encrypted rows correctly, provided it has the keys. Roll the keys out to every
+  instance before any instance opts in.
+- The trigger costs about 5 µs per written row on the server: an `EXPLAIN ANALYZE` of 20,000
+  `browser_sessions` updates on Postgres 16 measured 4.9 µs per row while disabled and 5.6 µs
+  per row while enabled, against 5.4 µs for the update itself. That is small next to the ~0.4 ms
+  round trip of each statement.
 - An engine without pgcrypto cannot be enabled: startup fails with
   `column encryption needs the pgcrypto extension`. The pglite provider gets pgcrypto in a
   separate di-framework/platform change. Until that ships, the guest runs unencrypted and should
@@ -99,12 +121,39 @@ plaintext stays in the table until a later re-encrypt (backfill) pass, which is 
 also stays in WAL, dead tuples (until VACUUM) and every backup taken before then.** Treat
 backups from before the opt-in as holding plaintext PII.
 
-**Statements.** A key is always a bound statement parameter (`pgp_sym_encrypt(?::text, ?::text,
-'cipher-algo=aes256, s2k-mode=1')`, `hmac(?::text, ?::text, 'sha256')`) and never part of SQL
-text, logs or error messages. Statements are composed with the `sql` tag
-(`packages/core/src/shared/infrastructure/sql.ts`), which only ever turns values into `?`
-bindings. `packages/core/tests/column-encryption.test.ts` records every statement and asserts
-this.
+**Statements.** A key is always a bound statement parameter and never part of SQL text, for
+example `<schema>.pgp_sym_encrypt(?::text, ?::text, 'cipher-algo=aes256, s2k-mode=1,
+s2k-digest-algo=sha256')` and `<schema>.hmac(?::text, ?::text, 'sha256')`. Statements are
+composed with the `sql` tag (`packages/core/src/shared/infrastructure/sql.ts`), which only ever
+turns values into `?` bindings. `packages/core/tests/column-encryption.test.ts` records every
+statement and asserts this. MDC integrity is on, and compression is off. S2K is salted but not
+iterated, because the key is 32 random bytes and not a password. Ciphertext length still follows
+plaintext length (an email's length is visible, for example).
+
+### Threat model and logging
+
+Column encryption protects copies of the data at rest that do not include the keys: the data
+directory, `pg_dump` output, base backups, and WAL written after the opt-in. It does **not**
+protect against someone who controls the live database server or the service process. The keys
+travel to the server with every statement, so such a person can capture them, for example by
+turning on statement logging. It also does not cover plaintext from before the opt-in (see
+above).
+
+The keys are bound values, so they reach any log that records bound values:
+
+- **Postgres (Bun server).** With `log_min_duration_statement`, `log_statement` or
+  `auto_explain`, Postgres logs `DETAIL: parameters: $1 = '…'`, which includes keys and plaintext.
+  For the application role, turn off parameter logging:
+  `ALTER ROLE identity SET log_parameter_max_length = 0;` and
+  `ALTER ROLE identity SET log_parameter_max_length_on_error = 0;`. Do not enable statement
+  logging with parameters for that role. Connect to Postgres over TLS (`sslmode=verify-full`),
+  because the keys cross the network on every statement.
+- **The service.** Driver errors can carry the statement and its values (PGlite's
+  `DatabaseError` keeps `params` and `query`). `PostgresGateway` strips `params`, `parameters`,
+  `query` and `values` from every database error before rethrowing it. The control-plane and
+  route error handlers log only `message (code)`, and HTTP error bodies are generic.
+- **The production guest.** The platform pglite provider already redacts statement values from
+  its error descriptions.
 
 ### Key custody
 
@@ -113,7 +162,10 @@ this.
   filesystem key `DI_PGLITE_KEY`, so a leak of one does not expose the others.
 - They live only in the runtime settings: `identity-control` for the guest, the stack's secret
   state for `deploy/platform` (`random.RandomBytes`), and the process environment for the Bun
-  server. They are never stored in the database or written to logs.
+  server. They are never stored in the database, and the service never logs them. Database
+  server logs are configured separately; see [Threat model and logging](#threat-model-and-logging).
+- The two keys must differ. The settings loader refuses equal keys, and so do the runtime
+  secrets tools.
 - **Losing `IDENTITY_COLUMN_KEY` makes every encrypted column unreadable, and losing
   `IDENTITY_BIDX_KEY` breaks every lookup by email or subject.** Back both up with the same care
   as the database backups, but store them separately from those backups.

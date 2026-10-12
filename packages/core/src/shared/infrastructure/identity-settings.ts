@@ -131,6 +131,9 @@ export function loadIdentitySettings(env: Env = process.env): IdentitySettings {
     columnKey: columnKey(env, 'IDENTITY_COLUMN_KEY'),
     bidxKey: columnKey(env, 'IDENTITY_BIDX_KEY'),
   };
+  if (encryption.columnKey && encryption.columnKey === encryption.bidxKey) {
+    throw new Error('IDENTITY_COLUMN_KEY and IDENTITY_BIDX_KEY must be different keys');
+  }
   const overrides = envSource({ prefix: 'IDENTITY_', env, coerce: false }).load() as Record<
     string,
     unknown

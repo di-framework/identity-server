@@ -1,4 +1,4 @@
-import { expect, test } from 'bun:test';
+import { expect, spyOn, test } from 'bun:test';
 import { mkdtemp, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -39,13 +39,17 @@ test('serves the JSON API, OAuth metadata, browser pages, and assets from one ro
   ).toBe(404);
 });
 
-test('column encryption that is enabled but unusable answers 503; other errors propagate', async () => {
+test('column encryption that is enabled but unusable answers 503; other errors are a generic 500', async () => {
   await useTestDatabase();
   const encryption = useContainer().resolve(ColumnEncryption);
   const fail = (error: Error) => {
     (encryption as unknown as { cipher: () => Promise<never> }).cipher = () =>
       Promise.reject(error);
   };
+  const lines: string[] = [];
+  const log = spyOn(console, 'error').mockImplementation((line: unknown) => {
+    lines.push(String(line));
+  });
   try {
     fail(
       new ColumnEncryptionUnavailable(
@@ -54,24 +58,17 @@ test('column encryption that is enabled but unusable answers 503; other errors p
     );
     const page = await routeRequest(new Request('https://identity.test/login'), new Map());
     expect(page.status).toBe(503);
-    expect(await page.json()).toEqual({
-      ok: false,
-      error: 'column encryption is enabled but IDENTITY_COLUMN_KEY is not set',
-    });
-    const token = await routeRequest(
-      new Request('https://identity.test/oauth2/token', {
-        method: 'POST',
-        headers: { 'content-type': 'application/x-www-form-urlencoded' },
-        body: 'grant_type=authorization_code&code=x&client_id=nobody',
-      }),
-      new Map(),
-    );
-    expect([400, 401, 503]).toContain(token.status);
+    expect(page.headers.get('cache-control')).toBe('no-store');
+    // Generic body: which setting is missing goes to the log only.
+    expect(await page.json()).toEqual({ ok: false, error: 'service unavailable' });
     fail(new Error('boom'));
-    await expect(
-      routeRequest(new Request('https://identity.test/login'), new Map()),
-    ).rejects.toThrow('boom');
+    const failed = await routeRequest(new Request('https://identity.test/login'), new Map());
+    expect(failed.status).toBe(500);
+    expect(await failed.json()).toEqual({ ok: false, error: 'internal error' });
+    expect(lines.join('\n')).toContain('IDENTITY_COLUMN_KEY is not set');
+    expect(lines.join('\n')).toContain('request /login failed: boom');
   } finally {
+    log.mockRestore();
     delete (encryption as unknown as { cipher?: unknown }).cipher;
   }
 });

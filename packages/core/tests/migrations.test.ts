@@ -7,9 +7,23 @@ import {
   loadMigrations,
   migrationsDirectory,
 } from '@di-framework/identity-migrations';
-import { User, UserRepository } from '../src/directory/infrastructure/user-repository.ts';
+import { Id, Model } from '@di-framework/repo';
 import { PostgresAdapter, toPostgresParams } from '../src/shared/infrastructure/postgres.ts';
 import { withThrowawayDatabase } from './support/database.ts';
+
+/**
+ * An `organizations` row for exercising `PostgresAdapter`. Production code has no entity mapping
+ * of `users`: its PII columns are encrypted once column encryption is enabled, so every user
+ * read and write goes through `PostgresDirectoryRepository`.
+ */
+@Model()
+class OrganizationRow {
+  @Id()
+  id!: string;
+
+  slug!: string;
+  name!: string;
+}
 
 test('rewrites repo placeholders to postgres bindings', () => {
   expect(toPostgresParams('SELECT * FROM t WHERE id = ? AND binding = ?', ['a', 'b'])).toEqual({
@@ -46,7 +60,7 @@ test('discovers the reused Flyway migrations in version order', async () => {
   ]);
 });
 
-test('applies the reused migrations and reads a user through UserRepository', async () => {
+test('applies the reused migrations and reads a row through PostgresAdapter', async () => {
   await withThrowawayDatabase('identity_migrate_test', async (db) => {
     const applied = await applyMigrations(db);
     expect(applied.pending).toEqual([]);
@@ -75,31 +89,18 @@ test('applies the reused migrations and reads a user through UserRepository', as
     expect(again.applied).toEqual([]);
     expect(again.pending).toEqual([]);
 
-    const users = new UserRepository(db);
     const id = crypto.randomUUID();
-    const user = new User();
-    user.id = id;
-    user.login = 'ada';
-    user.normalized_login = 'ada';
-    user.email = 'ada@example.com';
-    user.normalized_email = 'ada@example.com';
-    user.password_hash = null;
-    user.display_name = 'Ada';
-    user.avatar_url = null;
-    user.email_verified = true;
-    user.status = 'active';
-    await users.save(user);
-    const found = await users.findById(id);
-    expect(found?.login).toBe('ada');
-    expect(found?.display_name).toBe('Ada');
-    expect(found?.email_verified).toBe(true);
-    expect(found?.status).toBe('active');
-
-    const adapter = new PostgresAdapter<User, string>(db, { table: 'users' });
+    const adapter = new PostgresAdapter<OrganizationRow, string>(db, { table: 'organizations' });
+    const organization = new OrganizationRow();
+    organization.id = id;
+    organization.slug = 'ada';
+    organization.name = 'Ada';
+    await adapter.save(organization);
+    expect((await adapter.findById(id))?.name).toBe('Ada');
     await adapter.transaction(async (tx) => {
-      expect((await tx.findById(id))?.login).toBe('ada');
+      expect((await tx.findById(id))?.slug).toBe('ada');
     });
-    expect((await adapter.findAll()).some((user) => user.id === id)).toBe(true);
+    expect((await adapter.findAll()).some((row) => row.id === id)).toBe(true);
   });
 }, 30_000);
 
@@ -308,12 +309,23 @@ test('V18 prepares column encryption on a populated database without changing a 
           `SELECT count(*)::int AS n FROM pg_extension WHERE extname = 'pgcrypto'`,
         ),
       ).toEqual({ n: 1 });
-      // Disabled, the trigger lets plaintext through; the raw email is no longer unique.
-      await db.run(
-        `INSERT INTO users (id, login, normalized_login, email, normalized_email, display_name)
-         VALUES (?, 'pat2', 'pat2', 'Pat@Example.com', 'pat2@example.com', 'Pat 2')`,
-        [crypto.randomUUID()],
+      // Disabled, plaintext is written as before, and users_email_key still refuses a duplicate
+      // raw address even from a writer that leaves normalized_email unset.
+      const insert = (login: string, email: string, normalized: string | null) =>
+        db.run(
+          `INSERT INTO users (id, login, normalized_login, email, normalized_email, display_name)
+           VALUES (?, ?, ?, ?, ?, 'Pat 2')`,
+          [crypto.randomUUID(), login, login, email, normalized],
+        );
+      const duplicate = await insert('pat2', 'Pat@Example.com', null).catch(
+        (error: unknown) => error,
       );
+      expect(String((duplicate as Error).message)).toContain('users_email_key');
+      const normalized = await insert('pat3', 'PAT@example.com', 'pat@example.com').catch(
+        (error: unknown) => error,
+      );
+      expect(String((normalized as Error).message)).toContain('users_normalized_email_key');
+      await insert('pat4', 'other@example.com', 'other@example.com');
     });
   } finally {
     rmSync(earlier, { recursive: true, force: true });

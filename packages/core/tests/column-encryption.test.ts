@@ -604,16 +604,60 @@ describe('opt-in column encryption', () => {
     expect((await directory().findUser(fresh.userId))?.email).toBe(fresh.email);
   });
 
-  test('a missing state row fails closed', async () => {
-    await raw().run('DELETE FROM identity_column_encryption');
-    encryption().reset();
-    await expect(encryption().cipher()).rejects.toThrow('has no state row');
-    await raw().run(
-      `INSERT INTO identity_column_encryption (enabled, enabled_at, column_key_check, bidx_key_check)
-       VALUES (true, now(), ?, ?)`,
-      [keyCheck(COLUMN_KEY), keyCheck(BIDX_KEY)],
+  test('the database refuses every downgrade of the latch', async () => {
+    const refused = async (statement: string) => {
+      const error = await raw()
+        .run(statement)
+        .catch((caught: unknown) => caught as Error);
+      expect([statement, String((error as Error | undefined)?.message)]).toEqual([
+        statement,
+        expect.stringMatching(/cannot be (removed|turned off or rekeyed here)/),
+      ]);
+    };
+    await refused('UPDATE identity_column_encryption SET enabled = false');
+    await refused('UPDATE identity_column_encryption SET column_key_check = NULL');
+    await refused(`UPDATE identity_column_encryption SET bidx_key_check = 'x'`);
+    await refused('DELETE FROM identity_column_encryption');
+    await refused('TRUNCATE identity_column_encryption');
+    // Harmless updates still work, and the state is unchanged.
+    await raw().run('UPDATE identity_column_encryption SET enabled_at = enabled_at');
+    expect(
+      await raw().first<Record<string, unknown>>(
+        'SELECT enabled, column_key_check FROM identity_column_encryption',
+      ),
+    ).toEqual({ enabled: true, column_key_check: keyCheck(COLUMN_KEY) });
+  });
+
+  test('recorded key checks count as enabled even if the flag is forced off', async () => {
+    // Only possible by disabling the guard on purpose, as a database owner could.
+    await raw().exec(
+      'ALTER TABLE identity_column_encryption DISABLE TRIGGER identity_column_encryption_guard_row',
     );
-    encryption().reset();
+    try {
+      await raw().run('UPDATE identity_column_encryption SET enabled = false');
+      configure({ columns: false, columnKey: COLUMN_KEY, bidxKey: BIDX_KEY });
+      expect((await encryption().cipher()).enabled).toBe(true);
+      configure({});
+      await expect(encryption().cipher()).rejects.toMatchObject({ status: 503 });
+      const error = await raw()
+        .run(`UPDATE users SET display_name = 'leak' WHERE id = ?`, [fresh.userId])
+        .catch((caught: unknown) => caught as Error);
+      expect(String((error as Error | undefined)?.message)).toContain('users.display_name');
+
+      await raw().run('DELETE FROM identity_column_encryption');
+      encryption().reset();
+      await expect(encryption().cipher()).rejects.toThrow('has no state row');
+      await raw().run(
+        `INSERT INTO identity_column_encryption (enabled, enabled_at, column_key_check, bidx_key_check)
+         VALUES (true, now(), ?, ?)`,
+        [keyCheck(COLUMN_KEY), keyCheck(BIDX_KEY)],
+      );
+    } finally {
+      await raw().exec(
+        'ALTER TABLE identity_column_encryption ENABLE TRIGGER identity_column_encryption_guard_row',
+      );
+    }
+    configure(enabledSettings);
     expect((await encryption().cipher()).enabled).toBe(true);
   });
 });
@@ -638,24 +682,63 @@ describe('column cipher statements', () => {
     expect(cipher.blindIndex('a').params).toEqual(['a', 'bk']);
     expect(cipher.matches('email', 'email_bidx', 'a', 'A').params).toEqual(['a', 'bk', 'A']);
     expect(cipher.read('u.email', 'email', { enc: 'u.email_enc' }).text).toBe(
-      'coalesce(pgp_sym_decrypt(u.email_enc, ?::text), u.email) AS email',
+      'coalesce(public.pgp_sym_decrypt(u.email_enc, ?::text), u.email) AS email',
     );
+    expect(new ColumnCipher({ column: 'ck', bidx: 'bk' }, 'extensions').blindIndex('a').text).toBe(
+      "extensions.hmac(?::text, ?::text, 'sha256')",
+    );
+    expect(cipher.encrypt('a').text).toContain('s2k-digest-algo=sha256');
   });
 
-  test('enabling fails closed on an engine without pgcrypto', async () => {
-    const settings = loadIdentitySettings({});
-    const gateway = {
-      one: async () => ({ enabled: false, column_key_check: null, bidx_key_check: null }),
-      run: async () => {
-        throw new Error('could not open extension control file');
-      },
-    } as unknown as PostgresGateway;
+  test('enabling fails closed without a working pgcrypto, before the latch', async () => {
+    const disabled = { enabled: false, column_key_check: null, bidx_key_check: null };
+    const fake = (
+      run: (text: string) => Promise<unknown>,
+      one: (text: string) => Promise<unknown>,
+    ) => {
+      const updates: string[] = [];
+      const gateway = {
+        onPlaintextRejected: () => undefined,
+        run: async (text: string) => {
+          if (text.includes('UPDATE identity_column_encryption')) updates.push(text);
+          return run(text);
+        },
+        one: async (text: unknown) => one(typeof text === 'string' ? text : (text as Sql).text),
+      } as unknown as PostgresGateway;
+      return { gateway, updates };
+    };
     const previous = IdentityModule.settings();
-    IdentityModule.configure({ ...settings, encryption: enabledSettings });
+    IdentityModule.configure({ ...loadIdentitySettings({}), encryption: enabledSettings });
     try {
-      await expect(new ColumnEncryption(gateway).cipher()).rejects.toThrow(
+      const noExtension = fake(
+        async () => {
+          throw new Error('could not open extension control file');
+        },
+        async () => disabled,
+      );
+      await expect(new ColumnEncryption(noExtension.gateway).cipher()).rejects.toThrow(
         'needs the pgcrypto extension',
       );
+      const notInstalled = fake(
+        async () => ({}),
+        async (text) => (text.includes('pg_extension') ? null : disabled),
+      );
+      await expect(new ColumnEncryption(notInstalled.gateway).cipher()).rejects.toThrow(
+        'pgcrypto extension is not installed',
+      );
+      // Installed, but the round trip fails (for example functions outside the expected schema).
+      const broken = fake(
+        async () => ({}),
+        async (text) => {
+          if (text.includes('pg_extension')) return { schema: 'public' };
+          if (text.includes('round_trip')) throw new Error('function does not exist');
+          return disabled;
+        },
+      );
+      await expect(new ColumnEncryption(broken.gateway).cipher()).rejects.toThrow(
+        'pgcrypto round trip with these keys failed',
+      );
+      expect([...noExtension.updates, ...notInstalled.updates, ...broken.updates]).toEqual([]);
     } finally {
       IdentityModule.configure(previous);
     }
