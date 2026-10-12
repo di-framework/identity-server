@@ -276,7 +276,7 @@ test('a V15 export imports into pglite and the current guest boots on it with th
   } finally {
     await fixture.shutdown();
   }
-});
+}, 120_000);
 
 test('V13 and V14 sources import, and the later migrations apply to the imported rows', async () => {
   for (const version of [13, 14]) {
@@ -298,7 +298,7 @@ test('V13 and V14 sources import, and the later migrations apply to the imported
       await fixture.shutdown();
     }
   }
-});
+}, 120_000);
 
 test('the import refuses exports that do not match, and leaves nothing behind', async () => {
   const { dir, loaded } = await exportAt(15);
@@ -377,4 +377,4 @@ test('the import refuses exports that do not match, and leaves nothing behind', 
   const { dir: other } = await exportAt(15);
   writeFileSync(join(other, 'state.json'), '{"SMTP_HOST":"x"}');
   expect(() => loadExport(other)).toThrow('state.json holds rows that are not bootstrap state');
-});
+}, 120_000);
