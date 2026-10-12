@@ -14,6 +14,7 @@ import {
   REVISION_KEY,
   refuseLegacyTenant,
   resetControlSecret,
+  resolveKubeTarget,
   rollWorkload,
   writeControlSecret,
 } from '../platform/components/control-secret.ts';
@@ -355,5 +356,62 @@ describe('the Pulumi preflight before any resource', () => {
     expect(defaultKubeStateDir('win32', 'C:\\Users\\u', {})).toBe(
       'C:\\Users\\u\\AppData\\Roaming\\di-framework-kube',
     );
+  });
+});
+
+describe('one resolved kube target for the preflight and for kube', () => {
+  const host = {
+    resolve: (path: string) => (path.startsWith('/') ? path : `/project/deploy/platform/${path}`),
+    platform: 'darwin',
+    home: '/Users/u',
+    env: {},
+  };
+  const defaultDir = '/Users/u/Library/Application Support/di-framework-kube';
+  /** What runKube passes: `--state-dir` only for a non-empty value, else kube's default. */
+  const kubeStateDirUsed = (stateDir: string | undefined) => stateDir || defaultDir;
+
+  test('empty kubeStateDir and kubeconfig are unset, so the check runs on the instance kube upgrades', () => {
+    const target = resolveKubeTarget(
+      { kubeInstance: 'other', kubeStateDir: '', kubeconfig: '', context: '' },
+      host,
+    );
+    expect(target).toEqual({
+      instance: 'other',
+      configuredStateDir: undefined,
+      stateDir: defaultDir,
+      kubeconfig: undefined,
+      context: undefined,
+    });
+    expect(target.stateDir).toBe(kubeStateDirUsed(target.configuredStateDir));
+
+    const kubectlCalls: string[] = [];
+    const files = [`${defaultDir}/other`, `${defaultDir}/other/kubeconfig`];
+    expect(() =>
+      preflightCluster(target, {
+        exists: (path) => files.includes(path),
+        kubectl: (kubeconfig) => {
+          kubectlCalls.push(kubeconfig);
+          return { code: 0, stdout: 'di-tenant-identity/directory', stderr: '' };
+        },
+      }),
+    ).toThrow('Refusing');
+    expect(kubectlCalls).toEqual([`${defaultDir}/other/kubeconfig`]);
+  });
+
+  test('relative paths resolve once, to the same absolute paths for the preflight and kube', () => {
+    const target = resolveKubeTarget(
+      { kubeInstance: 'other', kubeStateDir: 'state', kubeconfig: '../kc', context: 'ctx' },
+      host,
+    );
+    expect(target).toEqual({
+      instance: 'other',
+      configuredStateDir: '/project/deploy/platform/state',
+      stateDir: '/project/deploy/platform/state',
+      kubeconfig: '/project/deploy/platform/../kc',
+      context: 'ctx',
+    });
+    expect(target.stateDir).toBe(kubeStateDirUsed(target.configuredStateDir));
+    expect(resolveKubeTarget({}, host).instance).toBe('identity');
+    expect(resolveKubeTarget({ kubeInstance: '  ' }, host).instance).toBe('identity');
   });
 });

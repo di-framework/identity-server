@@ -65,7 +65,7 @@ import * as pulumi from '@pulumi/pulumi';
 import * as random from '@pulumi/random';
 import * as tls from '@pulumi/tls';
 import { parse } from 'yaml';
-import { defaultKubeStateDir, preflightCluster } from './components/control-secret';
+import { preflightCluster, resolveKubeTarget } from './components/control-secret';
 import { containerEngine, localImageId, PublishedImage } from './components/image';
 import { KubeInstance, latestKubeRelease } from './components/kube';
 import { Mailpit, mailpitDestination } from './components/mailpit';
@@ -104,13 +104,26 @@ if (!/^[a-z]([-a-z0-9]{0,40}[a-z0-9])?$/.test(TENANT)) {
  * in place, and the tenant host patch and Mailpit would run before CliWorkload's own check. See
  * preflightCluster in components/control-secret.ts. Runs on previews too.
  */
-const preflight = preflightCluster(
+const kubeTarget = resolveKubeTarget(
   {
-    instance: config.get('kubeInstance') ?? 'identity',
-    stateDir:
-      config.get('kubeStateDir') ?? defaultKubeStateDir(process.platform, homedir(), process.env),
+    kubeInstance: config.get('kubeInstance'),
+    kubeStateDir: config.get('kubeStateDir'),
     kubeconfig: config.get('kubeconfig'),
     context: config.get('context'),
+  },
+  {
+    resolve: (path) => resolve(__dirname, path),
+    platform: process.platform,
+    home: homedir(),
+    env: process.env,
+  },
+);
+const preflight = preflightCluster(
+  {
+    instance: kubeTarget.instance,
+    stateDir: kubeTarget.stateDir,
+    kubeconfig: kubeTarget.kubeconfig,
+    context: kubeTarget.context,
   },
   {
     exists: existsSync,
@@ -180,7 +193,7 @@ const tenantHostImage = publishHostImage
   ? `127.0.0.1:${registryNodePort}/${hostRepository}`
   : (configuredHostImage ?? PUBLISHED_HOST_IMAGE);
 
-const instanceName = config.get('kubeInstance') ?? 'identity';
+const instanceName = kubeTarget.instance;
 /** Known up front so previews of kube updates don't mark the registry's namespace unknown. */
 const platformNamespace = config.get('platformNamespace') ?? 'wasmcloud';
 const kubeBinary = config.get('kubeBinary');
@@ -198,9 +211,10 @@ const kube = new KubeInstance('kube', {
   name: instanceName,
   version: kubeBinary ? undefined : kubeVersion === 'latest' ? latestKubeRelease() : kubeVersion,
   binary: kubeBinary,
-  stateDir: config.get('kubeStateDir'),
-  existingKubeconfig: config.get('kubeconfig'),
-  existingContext: config.get('context'),
+  // The same resolved values the preflight checked (resolveKubeTarget).
+  stateDir: kubeTarget.configuredStateDir,
+  existingKubeconfig: kubeTarget.kubeconfig,
+  existingContext: kubeTarget.context,
   httpPort: config.getNumber('httpPort', { min: 1024, max: 65535 }) ?? 28180,
   platformPackage: config.get('platformPackage') ?? '@di-framework/platform@6.0.11',
   platformConfig: {

@@ -360,3 +360,52 @@ export function preflightCluster(
   }
   return 'checked';
 }
+
+/** The stack's kube target settings as configured (any of them may be unset or empty). */
+export interface KubeTargetConfig {
+  kubeInstance?: string;
+  kubeStateDir?: string;
+  kubeconfig?: string;
+  context?: string;
+}
+
+/** The one resolved kube target that both the preflight and `KubeInstance` (`runKube`) use. */
+export interface KubeTarget {
+  instance: string;
+  /** The configured state directory, absolute; undefined lets kube use its default. */
+  configuredStateDir?: string;
+  /** The state directory kube will actually use: `configuredStateDir` or kube's default. */
+  stateDir: string;
+  /** An existing cluster's kubeconfig, absolute. */
+  kubeconfig?: string;
+  context?: string;
+}
+
+/**
+ * Normalises the kube settings once. kube's runner treats an empty string as unset (no
+ * `--state-dir`, no `--kubeconfig`), so the preflight must too; otherwise `kubeStateDir: ""`
+ * would point the check at `/<instance>` while kube upgrades the instance in its default
+ * directory. Paths are made absolute against the program's directory, so the dynamic provider's
+ * working directory cannot change which instance kube sees.
+ */
+export function resolveKubeTarget(
+  config: KubeTargetConfig,
+  host: {
+    resolve(path: string): string;
+    platform: string;
+    home: string;
+    env: Readonly<Record<string, string | undefined>>;
+  },
+): KubeTarget {
+  const set = (value: string | undefined) => (value?.trim() ? value : undefined);
+  const configuredStateDir = set(config.kubeStateDir);
+  const kubeconfig = set(config.kubeconfig);
+  const stateDir = configuredStateDir === undefined ? undefined : host.resolve(configuredStateDir);
+  return {
+    instance: set(config.kubeInstance) ?? 'identity',
+    configuredStateDir: stateDir,
+    stateDir: stateDir ?? defaultKubeStateDir(host.platform, host.home, host.env),
+    kubeconfig: kubeconfig === undefined ? undefined : host.resolve(kubeconfig),
+    context: set(config.context),
+  };
+}

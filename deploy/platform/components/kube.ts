@@ -162,9 +162,18 @@ function newestCachedRelease(): string | undefined {
 
 const kubeProvider: pulumi.dynamic.ResourceProvider = {
   async diff(_id: string, olds: KubeInstanceState, news: KubeInstanceInputs) {
+    const path = require('node:path') as typeof import('node:path');
+    // index.ts now passes these resolved (absolute, empty as unset). An older state with a
+    // relative path or an empty string for the same location is the same instance, not a
+    // replacement (which would run `down`).
+    const PATHS = ['stateDir', 'existingKubeconfig'];
+    const normal = (key: string, value: unknown) => {
+      if (value === undefined || value === null || value === '') return undefined;
+      return PATHS.includes(key) && typeof value === 'string' ? path.resolve(value) : value;
+    };
     const differs = (key: string) =>
-      JSON.stringify((olds as unknown as Record<string, unknown>)[key]) !==
-      JSON.stringify((news as unknown as Record<string, unknown>)[key]);
+      JSON.stringify(normal(key, (olds as unknown as Record<string, unknown>)[key])) !==
+      JSON.stringify(normal(key, (news as unknown as Record<string, unknown>)[key]));
     const replaces = REPLACE_ON_CHANGE.filter(differs);
     return { changes: INPUT_KEYS.some(differs), replaces, deleteBeforeReplace: true };
   },

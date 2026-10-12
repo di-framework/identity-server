@@ -159,7 +159,7 @@ cd deploy/platform
 pulumi up
 ```
 
-The program creates the di-framework-kube instance and platform, then the component registry. It then runs `di-framework platform deploy identity --target identity` whenever the guest's sources change, with the registry port-forwarded for the push. That builds `apps/guest/dist/identity.wasm`, pushes it to `IDENTITY_REGISTRY_PUSH`, and updates `WorkloadDeployment/identity` in `di-tenant-identity`. No second Postgres service is created. Egress is limited to the hosts in `allowedIpNameLookups`.
+The program creates the di-framework-kube instance and platform, then the component registry. It then runs `di-framework platform deploy identity --target identity` whenever the guest's sources change, with the registry port-forwarded for the push. That builds `apps/guest/dist/identity.wasm`, pushes it to `IDENTITY_REGISTRY_PUSH`, and updates `WorkloadDeployment/identity` in `di-tenant-<tenant>` (the stack's required `tenant`). No second Postgres service is created. Egress is limited to the hosts in `allowedIpNameLookups`.
 
 The platform otherwise runs tenant hosts on stock `ghcr.io/wasmcloud/wash:2.8.0`, a default-features build whose host world has no `wasi:tls/client@0.3.0-draft`, and a deploy warns that the component imports `wasi:tls`. `deploy/platform` sets the platform's `tenantHostImage` to `ghcr.io/di-framework/wash:2.8.0-wasi-tls`, pinned by digest, with pull policy `IfNotPresent`. That is the platform repo's `platform/tenant-host` build: `--features wasi-tls` on wasmCloud `v2.8.0`, with the postgres invocation-lease patch. Stack config `tenantHostImage` overrides it, and `tenantHostLocalImage` publishes and runs a local build instead (see `deploy/platform/README.md`).
 
