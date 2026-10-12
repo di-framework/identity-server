@@ -39,7 +39,7 @@ export interface PendingLink {
 export type PendingLinkRef = string | { tokenHash: string } | null | undefined;
 
 export type CallbackResult =
-  | { kind: 'pending'; token: string; tokenHash: string }
+  | { kind: 'pending'; tokenHash: string }
   | { kind: 'error'; message: string };
 
 export const CALLBACK_INCOMPLETE =
@@ -149,7 +149,7 @@ export class LinkFlowService {
         correlationId: Hashing.sha256Hex(input.sessionId),
         after: { issuer: pending.issuer, providerName: pending.providerName },
       });
-      return { kind: 'pending', token: pending.token, tokenHash: Hashing.sha256Hex(pending.token) };
+      return { kind: 'pending', tokenHash: Hashing.sha256Hex(pending.token) };
     } catch {
       return { kind: 'error', message: CALLBACK_FAILED };
     }

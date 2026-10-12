@@ -217,10 +217,19 @@ test('V17 removes raw secrets from existing browser session attributes', async (
         SPRING_SECURITY_SAVED_REQUEST: '/admin',
       });
       await insert('b'.repeat(64), { SPRING_SECURITY_SAVED_REQUEST: '/account' });
+      // Not objects: left as they are instead of failing the migration.
+      await db.run(
+        `INSERT INTO browser_sessions (id, csrf_token, attributes, expires_at)
+         VALUES (?, 'csrf', '"GSIO_IDENTITY_LINK_PENDING_TOKEN"'::jsonb, now()),
+                (?, 'csrf', '["IDENTITY_CLIENT_SECRET_REVEAL"]'::jsonb, now())`,
+        ['c'.repeat(64), 'd'.repeat(64)],
+      );
       expect((await applyMigrations(db)).applied.map((record) => record.version)).toEqual(['17']);
       expect(await db.query('SELECT id, attributes FROM browser_sessions ORDER BY id')).toEqual([
         { id: 'a'.repeat(64), attributes: { SPRING_SECURITY_SAVED_REQUEST: '/admin' } },
         { id: 'b'.repeat(64), attributes: { SPRING_SECURITY_SAVED_REQUEST: '/account' } },
+        { id: 'c'.repeat(64), attributes: 'GSIO_IDENTITY_LINK_PENDING_TOKEN' },
+        { id: 'd'.repeat(64), attributes: ['IDENTITY_CLIENT_SECRET_REVEAL'] },
       ]);
     });
   } finally {

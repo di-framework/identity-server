@@ -24,7 +24,6 @@ import {
   type AccountCaller,
   LinkService,
 } from '@di-framework/identity/src/linking/application/link-service.ts';
-import { SecretFlash } from '@di-framework/identity/src/sessions/application/secret-flash.ts';
 import {
   type ActiveSession,
   SessionService,
@@ -52,8 +51,6 @@ import type {
 
 /** Passwordless challenge cookie (`WebController.challengeCookie`). */
 export const CHALLENGE_COOKIE = 'gsio_passwordless_challenge';
-/** `SecretFlash` scope for a newly minted client secret, per client. */
-const clientSecretScope = (clientId: string) => `oauth-client-secret:${clientId}`;
 
 type Body<P> = P extends PageModel ? Omit<P, keyof ActorFields> : never;
 type PageBody = Body<PageModel>;
@@ -425,7 +422,7 @@ export class WebApp {
         const error = result.title === 'Scope Not Allowed' ? 'scope-not-allowed' : 'invalid-org';
         return page({ page: 'register-client', organizations, error }, result.status);
       }
-      return this.revealThenRedirect(c, result, 'newSecret');
+      return this.revealSecret(actor, result, 'registered');
     }
     const clientAction = /^\/admin\/oauth-clients\/([^/]+)\/(edit|rotate-secret|revoke)$/.exec(
       path,
@@ -442,15 +439,15 @@ export class WebApp {
         return this.admin(result, () => redirect(`/admin/oauth-clients/${id}?updated=1`));
       }
       if (action === 'rotate-secret')
-        return this.revealThenRedirect(
-          c,
+        return this.revealSecret(
+          actor,
           await this.clients.rotateSecret(actor, id),
-          'rotatedSecret',
+          'secret-rotated',
         );
       return this.admin(await this.clients.revoke(actor, id), () => page({ page: 'not-found' }));
     }
     const clientDetail = /^\/admin\/oauth-clients\/([^/]+)$/.exec(path);
-    if (clientDetail && get) return this.clientPage(c, actor, clientDetail[1] ?? '', q);
+    if (clientDetail && get) return this.clientPage(actor, clientDetail[1] ?? '', q);
 
     if (path === '/admin/audit' && get) return this.auditPage(actor, q);
     const auditDetail = /^\/admin\/audit\/([^/]+)$/.exec(path);
@@ -621,32 +618,21 @@ export class WebApp {
     });
   }
 
-  private async clientPage(c: Context, actor: string, id: string, q: Query): Promise<Result> {
-    return this.admin(await this.clients.detail(actor, id), async (client: RegisteredClient) => {
-      const secret =
-        this.flash.take(c.active.session.id, clientSecretScope(client.clientId)) ?? null;
-      return page({
-        page: 'client',
-        client: {
-          id: client.clientId,
-          organizationId: client.organizationSlug ?? '',
-          organization: client.organizationSlug ?? '',
-          name: client.clientName,
-          status: client.revokedAt === null ? 'active' : 'revoked',
-          redirectUris: client.redirectUris.join(', '),
-          grantTypes: client.grantTypes.join(', '),
-          scopes: client.scopes.join(', '),
-        },
-        banner: banner(q, {
-          newSecret: 'registered',
-          rotatedSecret: 'secret-rotated',
-          updated: 'metadata-updated',
-          revoked: 'revoked',
-        }),
-        secret,
-        canModify: client.revokedAt === null,
-      });
-    });
+  private async clientPage(actor: string, id: string, q: Query): Promise<Result> {
+    return this.admin(await this.clients.detail(actor, id), (client: RegisteredClient) =>
+      page(
+        clientModel(
+          client,
+          banner(q, {
+            newSecret: 'registered',
+            rotatedSecret: 'secret-rotated',
+            updated: 'metadata-updated',
+            revoked: 'revoked',
+          }),
+          null,
+        ),
+      ),
+    );
   }
 
   private async auditPage(actor: string, q: Query): Promise<Result> {
@@ -673,18 +659,20 @@ export class WebApp {
   }
 
   /**
-   * The new secret is flashed in memory for one page view: never in the URL, and never in the
-   * session row (#54).
+   * The new secret is shown in the POST response itself, once: never in a URL, the session, the
+   * database, or any state another request (or another process) could read. A reload re-submits
+   * the form rather than showing it again, and every browser response is `no-store`.
    */
-  private async revealThenRedirect(
-    c: Context,
+  private async revealSecret(
+    actor: string,
     result: AdminResult<{ clientId: string; secret: string }>,
-    flag: string,
+    shown: BannerName,
   ): Promise<Result> {
-    return this.admin(result, ({ clientId, secret }) => {
-      this.flash.put(c.active.session.id, clientSecretScope(clientId), secret);
-      return redirect(`/admin/oauth-clients/${clientId}?${flag}=1`);
-    });
+    return this.admin(result, async ({ clientId, secret }) =>
+      this.admin(await this.clients.detail(actor, clientId), (client: RegisteredClient) =>
+        page(clientModel(client, shown, secret)),
+      ),
+    );
   }
 
   private async admin<T>(
@@ -900,9 +888,6 @@ export class WebApp {
   private get flows() {
     return this.container.resolve(LinkFlowService);
   }
-  private get flash() {
-    return this.container.resolve(SecretFlash);
-  }
 }
 
 function choices(organizations: Organization[]): OrgChoice[] {
@@ -911,6 +896,26 @@ function choices(organizations: Organization[]): OrgChoice[] {
     slug: organization.slug,
     name: organization.name,
   }));
+}
+
+/** The OAuth client page; `secret` is set only on the response that minted it. */
+function clientModel(client: RegisteredClient, shown: BannerName | null, secret: string | null) {
+  return {
+    page: 'client' as const,
+    client: {
+      id: client.clientId,
+      organizationId: client.organizationSlug ?? '',
+      organization: client.organizationSlug ?? '',
+      name: client.clientName,
+      status: client.revokedAt === null ? ('active' as const) : ('revoked' as const),
+      redirectUris: client.redirectUris.join(', '),
+      grantTypes: client.grantTypes.join(', '),
+      scopes: client.scopes.join(', '),
+    },
+    banner: shown,
+    secret,
+    canModify: client.revokedAt === null,
+  };
 }
 
 function banner(q: Query, flags: Record<string, BannerName>): BannerName | null {

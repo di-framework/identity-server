@@ -98,7 +98,9 @@ async function linkedViaFlow(userId: string, sessionId = 'session-1') {
   const state = idp.rememberAuthorization(location);
   const result = await flows.callback({ userId, sessionId, state, code: 'code-1' });
   expect(result.kind).toBe('pending');
-  return { flows, token: (result as { token: string }).token, subject: idp.subject };
+  const tokenHash = (result as { tokenHash: string }).tokenHash;
+  const token = flows.pendingFor({ tokenHash }, userId)?.token as string;
+  return { flows, token, subject: idp.subject };
 }
 
 describe('issuers and providers', () => {
@@ -318,7 +320,10 @@ describe('link flow', () => {
     );
     expect(form?.get('code_verifier')).toMatch(/^[A-Za-z0-9_-]{43}$/);
     expect(form?.has('client_secret')).toBe(false);
-    const pending = flows.pendingFor((result as { token: string }).token, userId);
+    const pending = flows.pendingFor(
+      { tokenHash: (result as { tokenHash: string }).tokenHash },
+      userId,
+    );
     expect(pending).toMatchObject({
       userId,
       issuer: idp.issuer,
@@ -369,7 +374,10 @@ describe('link flow', () => {
       await flows.start({ userId, sessionId: 's', provider: 'acme' }),
     );
     const restaged = await flows.callback({ userId, sessionId: 's', state: sameUser, code: 'c' });
-    expect((await flows.confirm((restaged as { token: string }).token, userId))?.id).toBe(link?.id);
+    expect(
+      (await flows.confirm({ tokenHash: (restaged as { tokenHash: string }).tokenHash }, userId))
+        ?.id,
+    ).toBe(link?.id);
 
     const thief = await person();
     const stolen = idp.rememberAuthorization(

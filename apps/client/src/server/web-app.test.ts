@@ -31,6 +31,23 @@ const directory = () => useContainer().resolve<DirectoryRepository>(DIRECTORY);
 const ids = { admin: '', owner: '', member: '', inactive: '', acme: '', beta: '' };
 const PASSWORD = 'correct-horse-battery';
 
+/**
+ * A secret-revealing POST response: 200, `no-store`, and the secret exactly once in the body.
+ */
+async function revealed(response: Response): Promise<{ model: PageModel; secret: string }> {
+  expect(response.status).toBe(200);
+  expect(response.headers.get('location')).toBeNull();
+  expect(response.headers.get('cache-control')).toBe('no-store');
+  expect(response.headers.get('x-frame-options')).toBe('DENY');
+  const html = await response.text();
+  const json = /window\.__IDENTITY_PAGE__ = (.*);<\/script>/.exec(html)?.[1] ?? 'null';
+  const model = JSON.parse(json) as PageModel;
+  const secret = (model as { secret?: string }).secret ?? '';
+  expect(secret).toMatch(/^[A-Za-z0-9_-]{43}$/);
+  expect(html.split(secret).length - 1).toBe(1);
+  return { model, secret };
+}
+
 /** Every browser session row's attributes, as the database (or a backup of it) holds them. */
 async function storedSessionAttributes(): Promise<string> {
   const rows = await isolated.database.query<{ attributes: unknown }>(
@@ -552,14 +569,9 @@ describe('admin pages', () => {
       grantTypes: '',
       scopes: '',
     });
-    const location = registered.headers.get('location') ?? '';
-    expect(location).toMatch(/^\/admin\/oauth-clients\/cli_[0-9a-f]{16}\?newSecret=1$/);
-    expect(location).not.toContain('secret=');
-    // #54: the secret waiting to be shown is not in any session row.
-    expect(await storedSessionAttributes()).not.toContain('IDENTITY_CLIENT_SECRET_REVEAL');
-    const shown = await owner.page(location);
-    const revealed = String((shown as { secret?: unknown }).secret);
-    expect(shown).toMatchObject({
+    // #54: the secret is rendered once in the POST response itself, never redirected to.
+    const shown = await revealed(registered);
+    expect(shown.model).toMatchObject({
       page: 'client',
       banner: 'registered',
       secret: expect.stringMatching(/^[A-Za-z0-9_-]{43}$/),
@@ -570,11 +582,15 @@ describe('admin pages', () => {
         scopes: 'openid, profile, email',
       },
     });
-    expect(await owner.page(location)).toMatchObject({ secret: null });
-    const afterReveal = await storedSessionAttributes();
-    expect(typeof afterReveal).toBe('string');
-    expect(afterReveal.includes(revealed)).toBe(false);
-    const id = location.split('/')[3]?.split('?')[0] ?? '';
+    const id = (shown.model as { client: { id: string } }).client.id;
+    expect(id).toMatch(/^cli_[0-9a-f]{16}$/);
+    // A later GET (a reload of the detail page, or a JSON fetch) never shows it.
+    expect(await owner.page(`/admin/oauth-clients/${id}?newSecret=1`)).toMatchObject({
+      banner: 'registered',
+      secret: null,
+    });
+    expect(await owner.page(`/admin/oauth-clients/${id}`)).toMatchObject({ secret: null });
+    expect(await storedSessionAttributes()).not.toContain(shown.secret);
     expect(await owner.page('/admin/oauth-clients?orgSlug=acme&status=active')).toMatchObject({
       page: 'clients',
       clients: [{ id, organization: 'acme', name: 'Portal', status: 'active' }],
@@ -613,22 +629,26 @@ describe('admin pages', () => {
       banner: 'metadata-updated',
       client: { name: 'Portal 2' },
     });
-    const rotated = await owner.post(`/admin/oauth-clients/${id}/rotate-secret`);
-    expect(rotated.headers.get('location')).toBe(`/admin/oauth-clients/${id}?rotatedSecret=1`);
+    const rotated = await revealed(await owner.post(`/admin/oauth-clients/${id}/rotate-secret`));
+    expect(rotated.model).toMatchObject({ banner: 'secret-rotated', client: { id } });
+    expect(rotated.secret).not.toBe(shown.secret);
     expect(await owner.page(`/admin/oauth-clients/${id}?rotatedSecret=1`)).toMatchObject({
       banner: 'secret-rotated',
-      secret: expect.any(String),
+      secret: null,
     });
-    await owner.post(`/admin/oauth-clients/${id}/rotate-secret`);
+    // JSON callers get the same one-time model.
+    const json = await owner.send('POST', `/admin/oauth-clients/${id}/rotate-secret`, {
+      form: {},
+      json: true,
+    });
+    expect(json.headers.get('cache-control')).toBe('no-store');
+    expect(await json.json()).toMatchObject({ secret: expect.any(String) });
     const other = await owner.post('/admin/oauth-clients/register', {
       orgSlug: 'acme',
       clientName: 'Other',
     });
-    // The flash belongs to the session that registered the client.
-    expect(await admin.page(other.headers.get('location') ?? '')).toMatchObject({ secret: null });
-    expect(await owner.page(other.headers.get('location') ?? '')).toMatchObject({
-      secret: expect.any(String),
-    });
+    const otherId = ((await revealed(other)).model as { client: { id: string } }).client.id;
+    expect(await admin.page(`/admin/oauth-clients/${otherId}`)).toMatchObject({ secret: null });
     expect((await owner.post(`/admin/oauth-clients/${id}/revoke`)).headers.get('location')).toBe(
       `/admin/oauth-clients/${id}?revoked=1`,
     );
