@@ -71,6 +71,9 @@ columns and indexes, and adds the one-row `identity_column_encryption` table wit
 `enabled = false`. Its CHECK constraints are added `NOT VALID`, so V18 itself scans no rows.
 `V19__validate_column_encryption_checks.sql` validates them in a separate migration, which only
 takes SHARE UPDATE EXCLUSIVE locks and so blocks neither reads nor writes.
+`V20__pin_column_encryption_search_path.sql` pins name resolution in both trigger functions
+(`SET search_path = pg_catalog, pg_temp`, and the latch table named by schema), so a caller's
+`search_path` or a temp table cannot change what they read.
 Nothing is encrypted yet. To opt in, put both keys and `IDENTITY_COLUMN_ENCRYPTION=enabled` in
 the settings (for the guest, in `identity-control`; see below) and restart. At startup
 (`IdentityModule.prepare`, or the guest's boot before bootstrap) the service:
@@ -86,10 +89,20 @@ the settings (for the guest, in `identity-control`; see below) and restart. At s
 deleting the row, or truncating the table. The service and the plaintext-reject trigger also
 treat recorded key checks as enabled, even if `enabled` were forced off.
 
-**What the in-database latch does and does not stop.** These triggers stop mistakes, and they
-stop SQL writers without the keys who **do not own the tables**. They do not stop the table
-owner or a superuser. Either one can `ALTER TABLE … DISABLE TRIGGER`, `DROP TRIGGER`, or replace
-the trigger functions, and then downgrade the latch or write plaintext.
+**What the in-database latch does and does not stop.** These triggers stop mistakes. Against a
+SQL writer that **does not own the tables** (for example, a session using the service role's
+credentials under [role separation](#database-role-separation)), they stop exactly two things:
+downgrading or rekeying the latch, and writing a new non-NULL value to a protected plaintext
+column. Since V20 that also holds when the writer creates its own
+`pg_temp.identity_column_encryption` or changes its `search_path`: the trigger functions read only
+the real latch table. They do not stop the table owner or a superuser. Either one can
+`ALTER TABLE … DISABLE TRIGGER`, `DROP TRIGGER`, or replace the trigger functions, and then
+downgrade the latch or write plaintext.
+
+They are not access control for the data. A writer with DML on the tables can still change or
+delete rows, change the columns that are not encrypted, write NULL or arbitrary bytes to an `_enc`
+or `_bidx` column, and copy ciphertext from one row to another. Without the keys, it cannot read
+or produce valid ciphertext.
 
 - **Bun server on Postgres:** use [role separation](#database-role-separation). The service's
   own role then is not the owner, and the latch holds against the service role and anything that
@@ -217,18 +230,46 @@ then does this:
 
 Startup refuses a service role that is the owner, a superuser, or the owner of any table in the
 schema. As the service role, `ALTER TABLE … DISABLE TRIGGER`, `DROP TRIGGER`,
-`CREATE OR REPLACE FUNCTION`, `TRUNCATE` and DDL all fail, and the
-[column encryption latch](#column-encryption) cannot be undone with the service's credentials.
-`packages/core/tests/role-separation.test.ts` checks each of these.
+`CREATE OR REPLACE FUNCTION` on the trigger functions, `TRUNCATE`, writes to `_migrations`, and
+downgrading or deleting the latch row all fail. A plaintext write to a protected column is refused
+with `IDC01`, also from a session that has created a `pg_temp.identity_column_encryption` shadow
+table claiming encryption is off (V20). `packages/core/tests/role-separation.test.ts` checks each
+of these on PostgreSQL 16.
+
+Two caveats about DDL:
+
+- `CREATE TABLE` in `public` fails for the service role only because PostgreSQL 15 and later no
+  longer grant `CREATE` on `public` to `PUBLIC`. On PostgreSQL 14 and earlier, run
+  `REVOKE CREATE ON SCHEMA public FROM PUBLIC;` yourself. The trigger functions do not depend on
+  it, because V20 pins their name resolution.
+- The service role can still create temporary tables, since `PUBLIC` has `TEMPORARY` on the
+  database by default. Since V20 this does not affect the triggers. To remove it anyway, run
+  `REVOKE TEMPORARY ON DATABASE identity FROM PUBLIC;`. The service does not use temporary tables.
 
 ```sql
 -- once, as a superuser
-CREATE ROLE identity_owner LOGIN PASSWORD '…';
-CREATE ROLE identity_service LOGIN PASSWORD '…';
+CREATE ROLE identity_owner LOGIN PASSWORD '…';      -- MIGRATION_DATABASE_URL uses this role
+CREATE ROLE identity_service LOGIN PASSWORD '…';    -- DATABASE_URL uses this role
+
+-- a new database:
 CREATE DATABASE identity OWNER identity_owner;
--- on an existing database, hand the schema's tables to the owner first:
+
+-- an existing database, where the single role `identity` has been migrating and serving so far
+-- and owns the tables. Connected to that database, hand everything it owns to the owner role:
 REASSIGN OWNED BY identity TO identity_owner;
 ```
+
+In the existing-database case, `identity` is the role that used to be the only one. After the
+`REASSIGN OWNED` it owns nothing, and you have two options:
+
+- Point `DATABASE_URL` at `identity_service`, as above, and then retire or lock the `identity`
+  login.
+- Skip `CREATE ROLE identity_service` and keep `DATABASE_URL` on `identity`, which is now the
+  service role. This only works if `identity` is not a superuser. For example, the `POSTGRES_USER`
+  of the official image and of `compose.yml` is a superuser, and startup refuses it.
+
+Either way, `DATABASE_URL` must name the role that owns nothing, and `MIGRATION_DATABASE_URL`
+must name `identity_owner`.
 
 With `MIGRATION_DATABASE_URL` unset, the server keeps the earlier behaviour: one role migrates and
 serves, so it owns the tables and could undo the latch. The pglite guest has no roles; see
