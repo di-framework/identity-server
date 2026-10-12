@@ -1,16 +1,19 @@
-import { expect, test } from 'bun:test';
+import { describe, expect, test } from 'bun:test';
 import { readdirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import {
   applyRuntimeSecrets,
   assertPrivateMode,
   controlSecretDocument,
+  defaultKubeStateDir,
   type Kubectl,
   type KubectlResult,
   parseRuntimeValues,
+  preflightCluster,
   REQUIRED_RUNTIME_SECRETS,
   REVISION_KEY,
   refuseLegacyTenant,
+  resetControlSecret,
   rollWorkload,
   writeControlSecret,
 } from '../platform/components/control-secret.ts';
@@ -39,7 +42,9 @@ function scripted(...results: Array<Partial<KubectlResult>>): { kubectl: Kubectl
   return { kubectl, calls };
 }
 
-const tempEntries = () => new Set(readdirSync(tmpdir()));
+/** Temp entries that could hold a Secret document (other processes share $TMPDIR). */
+const tempEntries = () =>
+  new Set(readdirSync(tmpdir()).filter((name) => /identity|control|secret/i.test(name)));
 
 function expectNoSecretOutside(calls: Call[], error: unknown): void {
   const visible = [String(error), ...calls.flatMap((call) => call.args)].join('\n');
@@ -227,4 +232,128 @@ test('apply guards, writes and rolls, and reports names only', async () => {
     'patch',
   ]);
   expect(controlSecretDocument('n', 'w', {}, 't')).toContain('"w-control"');
+});
+
+test('CliWorkload refuses a legacy tenant before it deletes the control Secret', async () => {
+  const legacy = scripted({ stdout: 'backingservice.platform.di-framework.dev/directory' });
+  await expect(
+    resetControlSecret(legacy.kubectl, {
+      namespace: 'di-tenant-identity',
+      name: 'identity-control',
+    }),
+  ).rejects.toThrow('refusing to deploy');
+  expect(legacy.calls).toHaveLength(1);
+  expect(legacy.calls[0]?.args[2]).toBe('get');
+
+  const clean = scripted({ stdout: '' }, {});
+  await resetControlSecret(clean.kubectl, {
+    namespace: 'di-tenant-pgprove',
+    name: 'identity-control',
+  });
+  expect(clean.calls[1]?.args).toEqual([
+    '--namespace',
+    'di-tenant-pgprove',
+    'delete',
+    'secret',
+    'identity-control',
+    '--ignore-not-found',
+    '--wait=false',
+  ]);
+
+  const failed = scripted({ stdout: '' }, { code: 1, stderr: 'Forbidden' });
+  await expect(
+    resetControlSecret(failed.kubectl, {
+      namespace: 'di-tenant-pgprove',
+      name: 'identity-control',
+    }),
+  ).rejects.toThrow('deleting identity-control failed: Forbidden');
+});
+
+describe('the Pulumi preflight before any resource', () => {
+  const state = '/state/di-framework-kube';
+  const io = (files: string[], result: Partial<KubectlResult> = {}) => {
+    const calls: Array<{ kubeconfig: string; context?: string; args: string[] }> = [];
+    return {
+      calls,
+      io: {
+        exists: (path: string) => files.includes(path),
+        kubectl: (kubeconfig: string, context: string | undefined, args: string[]) => {
+          calls.push({ kubeconfig, context, args });
+          return { code: 0, stdout: '', stderr: '', ...result };
+        },
+      },
+    };
+  };
+
+  test('refuses the authproto instance by name, without touching the cluster', () => {
+    const probe = io([`${state}/authproto`, `${state}/authproto/kubeconfig`]);
+    expect(() => preflightCluster({ instance: 'authproto', stateDir: state }, probe.io)).toThrow(
+      'kubeInstance authproto runs the Postgres-era identity guest',
+    );
+    expect(probe.calls).toEqual([]);
+  });
+
+  test('a managed instance that does not exist yet is new', () => {
+    const probe = io([]);
+    expect(preflightCluster({ instance: 'fresh', stateDir: state }, probe.io)).toBe('new-instance');
+    expect(probe.calls).toEqual([]);
+  });
+
+  test('an existing managed instance is checked through its kubeconfig in the state directory', () => {
+    const files = [`${state}/other`, `${state}/other/kubeconfig`];
+    const clean = io(files, { stdout: 'di-tenant-other/cache\n' });
+    expect(preflightCluster({ instance: 'other', stateDir: state }, clean.io)).toBe('checked');
+    expect(clean.calls[0]?.kubeconfig).toBe(`${state}/other/kubeconfig`);
+    expect(clean.calls[0]?.args.slice(0, 3)).toEqual([
+      'get',
+      'backingservices.platform.di-framework.dev',
+      '--all-namespaces',
+    ]);
+
+    // A `directory` in any namespace refuses: `kube up` rewrites the whole platform install.
+    const legacy = io(files, { stdout: 'di-tenant-pgprove/cache\ndi-tenant-identity/directory\n' });
+    expect(() => preflightCluster({ instance: 'other', stateDir: state }, legacy.io)).toThrow(
+      'other has the Postgres BackingService di-tenant-identity/directory',
+    );
+
+    const down = io(files, { code: 1 });
+    expect(() => preflightCluster({ instance: 'other', stateDir: state }, down.io)).toThrow(
+      'cannot list BackingServices on other (kubectl exit 1)',
+    );
+  });
+
+  test('an existing instance without a kubeconfig fails closed', () => {
+    const probe = io([`${state}/broken`]);
+    expect(() => preflightCluster({ instance: 'broken', stateDir: state }, probe.io)).toThrow(
+      'kube instance broken exists in /state/di-framework-kube but has no kubeconfig',
+    );
+    expect(probe.calls).toEqual([]);
+  });
+
+  test('an existing cluster named by kubeconfig is checked even when the instance is new', () => {
+    const legacy = io([], { stdout: 'di-tenant-identity/directory' });
+    expect(() =>
+      preflightCluster(
+        { instance: 'new-name', stateDir: state, kubeconfig: '/kc', context: 'ctx' },
+        legacy.io,
+      ),
+    ).toThrow('Refusing');
+    expect(legacy.calls[0]).toMatchObject({ kubeconfig: '/kc', context: 'ctx' });
+  });
+
+  test("kube's default state directory follows Go's os.UserConfigDir", () => {
+    expect(defaultKubeStateDir('darwin', '/Users/u', {})).toBe(
+      '/Users/u/Library/Application Support/di-framework-kube',
+    );
+    expect(defaultKubeStateDir('linux', '/home/u', {})).toBe('/home/u/.config/di-framework-kube');
+    expect(defaultKubeStateDir('linux', '/home/u', { XDG_CONFIG_HOME: '/xdg' })).toBe(
+      '/xdg/di-framework-kube',
+    );
+    expect(defaultKubeStateDir('win32', 'C:\\Users\\u', { AppData: 'D:\\AD' })).toBe(
+      'D:\\AD\\di-framework-kube',
+    );
+    expect(defaultKubeStateDir('win32', 'C:\\Users\\u', {})).toBe(
+      'C:\\Users\\u\\AppData\\Roaming\\di-framework-kube',
+    );
+  });
 });

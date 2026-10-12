@@ -18,7 +18,7 @@ pulumi destroy
 | `PublishedImage` (`components/image.ts`) | Only with `tenantHostLocalImage`: publishes that local tenant host build to the registry. The engine saves it as an OCI layout and `oras` copies it through a port-forward. |
 | `DeploymentPatch` `tenant-host-rollout` | Switches the tenant host to stop-then-start updates, because the tenant quota has no room for a second host pod, and so two hosts never open the database at once. With a published local image, it also rolls the host whenever that image's digest changes. |
 | `CliWorkload` (`components/workload.ts`) | The identity component, with the pglite provider composed in. It runs `di-framework platform deploy identity` when its sources change, and `di-framework platform destroy identity` on delete. |
-| `Mailpit` (`components/mailpit.ts`) | SMTP relay in `di-tenant-identity` on a fixed ClusterIP, plus the platform egress grant that lets the guest dial it. Skipped when `smtpHost` is set. |
+| `Mailpit` (`components/mailpit.ts`) | SMTP relay in `di-tenant-<tenant>` on a fixed ClusterIP, plus the platform egress grant that lets the guest dial it. Skipped when `smtpHost` is set. |
 | `RandomPassword`, `tls.PrivateKey` | Bootstrap passwords, client secrets, the SMTP password, and the RS256 signing key, generated once and kept in state. |
 | `RuntimeSecrets` (`components/secrets.ts`) | Writes those values to the workload's `identity-control` Secret after every deploy, rolls the workload onto them, and waits until `/health` answers 200. |
 
@@ -29,7 +29,7 @@ pulumi destroy
 `di-framework platform deploy` builds `apps/guest` into a Wasm component, composes the
 pglite provider into it (pulled from GHCR by the digest in `apps/guest/di-framework.config.json`),
 and pushes it with `oras`. It then applies the `WorkloadDeployment`, `Service`, and bindings in
-`di-tenant-identity`. The CLI keeps owning those generated manifests; the
+`di-tenant-<tenant>`. The CLI keeps owning those generated manifests; the
 `CliWorkload` resource only decides when to run it.
 
 - **Change detection.** The resource's input is a sha256 over `apps/`, `packages/`,
@@ -165,13 +165,13 @@ pulumi up
 | `registry` | Push and pull references the deploy used |
 | `image` | Pull reference of the deployed identity component |
 | `tenantHostImage` | Image reference the tenant host runs |
-| `url` | Tenant route through the gateway, such as `http://identity.identity.localhost:28180` |
+| `url` | Tenant route through the gateway, such as `http://identity.<tenant>.localhost:28180` |
 | `signingKeyId` | `kid` of the active signing key |
 | `bootstrapOwnerPassword`, `bootstrapViewerPassword` | Secret. Passwords of the bootstrap `owner` and `viewer` |
 | `accessClientSecret`, `directoryClientSecret`, `provisionerClientSecret` | Secret. Bootstrap client secrets |
 
 ```sh
-kubectl --kubeconfig "$(pulumi stack output kubeconfig)" -n di-tenant-identity get workloaddeployments
+kubectl --kubeconfig "$(pulumi stack output kubeconfig)" -n "di-tenant-$(pulumi config get tenant)" get workloaddeployments
 curl "$(pulumi stack output url)/health"
 ```
 
@@ -198,7 +198,13 @@ pulumi stack output --show-secrets bootstrapOwnerPassword
 
 To rotate a value, replace its resource: `pulumi up --replace <urn>`.
 
-Before it deletes or writes `identity-control`, the program checks that `di-tenant-<tenant>` has
+Before it registers any resource (so before `di-framework-kube up`, the tenant host patch and
+Mailpit), the program refuses `kubeInstance` `authproto` and refuses a target cluster with a
+Postgres `directory` BackingService in any namespace. The target is the stack's `kubeconfig`, or
+the managed instance's kubeconfig in kube's state directory (`kubeStateDir`, else kube's default
+`os.UserConfigDir()/di-framework-kube`); an instance directory without a kubeconfig is refused, and
+one that does not exist yet is a new instance. Before it deletes or writes `identity-control`, the
+program also checks that `di-tenant-<tenant>` has
 no Postgres `directory` BackingService and refuses the tenant otherwise (on an existing cluster
 named by `kubeconfig`, it checks before anything else runs, `kube up` included).
 
@@ -216,7 +222,7 @@ Without Pulumi, `deploy/guest/deploy.sh <instance> <tenant> <values-file>` does 
 Mailpit catches everything identity sends. Open its UI with:
 
 ```sh
-kubectl --kubeconfig "$(pulumi stack output kubeconfig)" -n di-tenant-identity \
+kubectl --kubeconfig "$(pulumi stack output kubeconfig)" -n "di-tenant-$(pulumi config get tenant)" \
   port-forward service/mailpit 8025:8025
 ```
 

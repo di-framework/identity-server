@@ -242,3 +242,121 @@ export async function applyRuntimeSecrets(
   });
   return { names: Object.keys(options.values).sort(), revision: options.revision };
 }
+
+/**
+ * Deletes the control Secret before a CLI deploy, after refusing a tenant that still runs the
+ * Postgres-era guest. The CLI rewrites `<workload>-control` with only its control token, and a
+ * tenant developer's replace is refused while it holds more keys. A plain delete: tenant
+ * developers may delete Secrets but not read them.
+ */
+export async function resetControlSecret(
+  kubectl: Kubectl,
+  options: { namespace: string; name: string },
+): Promise<void> {
+  await refuseLegacyTenant(kubectl, options.namespace);
+  const deleted = await kubectl([
+    '--namespace',
+    options.namespace,
+    'delete',
+    'secret',
+    options.name,
+    '--ignore-not-found',
+    '--wait=false',
+  ]);
+  if (deleted.code !== 0) {
+    throw new Error(`deleting ${options.name} failed: ${deleted.stderr.trim().slice(-300)}`);
+  }
+}
+
+/** The di-framework-kube instance that runs the Postgres-era guest; never a target here. */
+export const LEGACY_INSTANCE = 'authproto';
+
+/** kubectl run synchronously, for checks at Pulumi program evaluation, before any resource. */
+export type SyncKubectl = (
+  kubeconfig: string,
+  context: string | undefined,
+  args: string[],
+) => KubectlResult;
+
+export interface PreflightTarget {
+  /** di-framework-kube instance name (`kubeInstance`). */
+  instance: string;
+  /** kube `--state-dir`; kube's default (`os.UserConfigDir()/di-framework-kube`) when unset. */
+  stateDir: string;
+  /** `kubeconfig` and `context` of an existing cluster, instead of the managed instance's. */
+  kubeconfig?: string;
+  context?: string;
+}
+
+/**
+ * kube's default state directory: Go's `os.UserConfigDir()` joined with `di-framework-kube`
+ * (kube internal/state DefaultDir).
+ */
+export function defaultKubeStateDir(
+  platform: string,
+  home: string,
+  env: Readonly<Record<string, string | undefined>>,
+): string {
+  if (platform === 'darwin') return `${home}/Library/Application Support/di-framework-kube`;
+  if (platform === 'win32')
+    return `${env.AppData ?? `${home}\\AppData\\Roaming`}\\di-framework-kube`;
+  return `${env.XDG_CONFIG_HOME || `${home}/.config`}/di-framework-kube`;
+}
+
+/**
+ * Runs before the Pulumi program registers any resource, so before `di-framework-kube up` (which
+ * upgrades a managed instance in place and replaces its tenant declarations and host image),
+ * the tenant host patches and Mailpit.
+ *
+ * - The instance name `authproto` is refused outright.
+ * - The target cluster is the stack's `kubeconfig`, or else the managed instance's kubeconfig in
+ *   kube's state directory. A managed instance whose directory does not exist yet is new and has
+ *   nothing to protect. One that exists without a kubeconfig is refused (fail closed).
+ * - Any `directory` BackingService in any namespace of that cluster refuses the run: `kube up`
+ *   rewrites the whole platform install, not only the target tenant. A failed check refuses too.
+ *
+ * Returns what it checked, for the log.
+ */
+export function preflightCluster(
+  target: PreflightTarget,
+  io: { exists(path: string): boolean; kubectl: SyncKubectl },
+): 'new-instance' | 'checked' {
+  if (target.instance === LEGACY_INSTANCE) {
+    throw new Error(
+      `kubeInstance ${LEGACY_INSTANCE} runs the Postgres-era identity guest; deploying there is the cutover in docs/guest-http-api.md#authproto-cutover. Refusing`,
+    );
+  }
+  let kubeconfig = target.kubeconfig;
+  if (kubeconfig === undefined) {
+    const instanceDir = `${target.stateDir}/${target.instance}`;
+    if (!io.exists(instanceDir)) return 'new-instance';
+    kubeconfig = `${instanceDir}/kubeconfig`;
+    if (!io.exists(kubeconfig)) {
+      throw new Error(
+        `kube instance ${target.instance} exists in ${target.stateDir} but has no kubeconfig, so it cannot be checked for the Postgres guest; refusing`,
+      );
+    }
+  }
+  const result = io.kubectl(kubeconfig, target.context, [
+    'get',
+    'backingservices.platform.di-framework.dev',
+    '--all-namespaces',
+    '-o',
+    'jsonpath={range .items[*]}{.metadata.namespace}/{.metadata.name}{"\\n"}{end}',
+  ]);
+  if (result.code !== 0) {
+    throw new Error(
+      `cannot list BackingServices on ${target.instance} (kubectl exit ${result.code}); refusing. Start the cluster and retry`,
+    );
+  }
+  const legacy = result.stdout
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.endsWith(`/${LEGACY_DATABASE}`));
+  if (legacy.length > 0) {
+    throw new Error(
+      `${target.instance} has the Postgres BackingService ${legacy.join(', ')}, so it runs the Postgres-era identity guest. This program would upgrade that platform install and replace the guest; that is the cutover in docs/guest-http-api.md#authproto-cutover. Refusing`,
+    );
+  }
+  return 'checked';
+}

@@ -328,17 +328,24 @@ namespace has the `directory` BackingService, the Pulumi program also refuses an
 > tuples until `VACUUM`, in WAL until it is recycled, and in every existing `pg_dump` or volume
 > backup until rotation. Treat those as secret-bearing until then.
 
-A cutover would:
+The guards refuse a deploy to any tenant, and any Pulumi run on any cluster, that still has the
+`directory` BackingService, and they refuse the instance name `authproto` outright. The cutover
+therefore deploys the pglite guest into a **new tenant** and never into `identity` while
+`directory` exists. Every step needs the user's sign-off first; none is automated here.
 
-1. Freeze writes, and export the directory data from Postgres (`pg_dump --data-only` of the
+1. Freeze writes on the Postgres guest, and export the directory data (`pg_dump --data-only` of the
    identity tables) and the runtime secret rows (names and values, kept out of logs), per the
    gate above.
-2. Upgrade the tenant host to the exclusive image and deploy the pglite guest with those values
-   in `identity-control` (keeping the issuer, origin and signing key keeps issued tokens valid).
+2. Create a new tenant on the instance (for example `identity-pg`) with the exclusive tenant host
+   image, and deploy the pglite guest there with `deploy/guest/deploy.sh <instance> <new tenant>
+   <values>`, the values taken from the export (keeping the issuer, origin and signing key keeps
+   issued tokens valid). The `authproto` name refusal in `deploy.sh` and the Pulumi preflight is
+   what the sign-off lifts, by a deliberate change, not a flag.
 3. Load the data into the new database. There is no network path into pglite; this needs a
    one-off import (for example a guest admin endpoint or a one-shot component on the same data
    directory) that does not exist yet.
-4. Remove the `directory` BackingService once the new guest is verified.
+4. Move the public route to the new tenant once the new guest is verified, then retire the old
+   workload and, after a final backup, the `directory` BackingService and tenant `identity`.
 
 Open choices for that change: whether to migrate the data or start from a fresh bootstrap; how
 to import into pglite; and the backup of the pglite data directory (the backup agent only runs

@@ -1,5 +1,5 @@
 import * as pulumi from '@pulumi/pulumi';
-import { refuseLegacyTenant } from './control-secret';
+import { resetControlSecret } from './control-secret';
 import { kubectlRunner, portForward, runProcess } from './process';
 
 /**
@@ -114,21 +114,8 @@ async function deploy(inputs: CliWorkloadInputs): Promise<CliWorkloadState> {
       reset.context,
       `di-framework-reset-${reset.name}.log`,
     );
-    // Never replace the Postgres-era guest (authproto): its tenant still has `directory`.
-    await refuseLegacyTenant(kubectl, reset.namespace);
-    // A plain delete: tenant developers may delete Secrets but not read them.
-    const deleted = await kubectl([
-      '--namespace',
-      reset.namespace,
-      'delete',
-      'secret',
-      reset.name,
-      '--ignore-not-found',
-      '--wait=false',
-    ]);
-    if (deleted.code !== 0) {
-      throw new Error(`deleting ${reset.name} failed: ${deleted.stderr.slice(-300)}`);
-    }
+    // Refuses a tenant that still has `directory` (the Postgres-era guest) before deleting.
+    await resetControlSecret(kubectl, { namespace: reset.namespace, name: reset.name });
   }
   const forward = inputs.registryForward ? await portForward(inputs.registryForward) : undefined;
   try {

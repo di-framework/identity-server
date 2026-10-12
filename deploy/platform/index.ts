@@ -15,7 +15,7 @@
  *                     (apps/guest/di-framework.config.json): `di-framework platform deploy`
  *                     when its sources change, `di-framework platform destroy` on delete. Its
  *                     database lives in the workload's persistent /data directory on the host.
- *   Mailpit           the tenant's SMTP relay in di-tenant-identity, with a platform egress
+ *   Mailpit           the tenant's SMTP relay in di-tenant-<tenant>, with a platform egress
  *                     grant that lets the guest dial it; skipped when `smtpHost` is set.
  *   RuntimeSecrets    the guest's runtime secrets in its `identity-control` Secret: issuer,
  *                     origin, RS256 signing key (@pulumi/tls), passwords and client secrets
@@ -58,13 +58,14 @@
 import { spawnSync } from 'node:child_process';
 import { createHash, createPrivateKey } from 'node:crypto';
 import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import * as k8s from '@pulumi/kubernetes';
 import * as pulumi from '@pulumi/pulumi';
 import * as random from '@pulumi/random';
 import * as tls from '@pulumi/tls';
 import { parse } from 'yaml';
-import { LEGACY_DATABASE } from './components/control-secret';
+import { defaultKubeStateDir, preflightCluster } from './components/control-secret';
 import { containerEngine, localImageId, PublishedImage } from './components/image';
 import { KubeInstance, latestKubeRelease } from './components/kube';
 import { Mailpit, mailpitDestination } from './components/mailpit';
@@ -97,37 +98,33 @@ if (!/^[a-z]([-a-z0-9]{0,40}[a-z0-9])?$/.test(TENANT)) {
 }
 
 /**
- * On an existing cluster, check before anything (kube's `up` included) touches it. A new
- * Kubesolo instance has no BackingServices; CliWorkload and RuntimeSecrets check again before
- * they write.
+ * Before any resource: refuse `authproto`, and refuse a target cluster (the stack's `kubeconfig`,
+ * or the managed instance's kubeconfig in kube's state directory) that has a Postgres
+ * `directory` BackingService in any namespace. `di-framework-kube up` would otherwise upgrade it
+ * in place, and the tenant host patch and Mailpit would run before CliWorkload's own check. See
+ * preflightCluster in components/control-secret.ts. Runs on previews too.
  */
-const existingKubeconfig = config.get('kubeconfig');
-if (existingKubeconfig !== undefined && !pulumi.runtime.isDryRun()) {
-  const result = spawnSync(
-    'kubectl',
-    [
-      '--kubeconfig',
-      existingKubeconfig,
-      ...(config.get('context') ? ['--context', config.get('context') as string] : []),
-      '--namespace',
-      `di-tenant-${TENANT}`,
-      'get',
-      'backingservices.platform.di-framework.dev',
-      LEGACY_DATABASE,
-      '--ignore-not-found',
-      '-o',
-      'name',
-    ],
-    { encoding: 'utf8' },
-  );
-  if (result.status !== 0 || result.stdout.trim() !== '') {
-    throw new Error(
-      result.status !== 0
-        ? `cannot check di-tenant-${TENANT} for the Postgres \`${LEGACY_DATABASE}\` BackingService; refusing`
-        : `di-tenant-${TENANT} has the Postgres \`${LEGACY_DATABASE}\` BackingService (the Postgres-era guest); see docs/guest-http-api.md#authproto-cutover`,
-    );
-  }
-}
+const preflight = preflightCluster(
+  {
+    instance: config.get('kubeInstance') ?? 'identity',
+    stateDir:
+      config.get('kubeStateDir') ?? defaultKubeStateDir(process.platform, homedir(), process.env),
+    kubeconfig: config.get('kubeconfig'),
+    context: config.get('context'),
+  },
+  {
+    exists: existsSync,
+    kubectl: (kubeconfig, context, args) => {
+      const result = spawnSync(
+        'kubectl',
+        ['--kubeconfig', kubeconfig, ...(context ? ['--context', context] : []), ...args],
+        { encoding: 'utf8' },
+      );
+      return { code: result.status, stdout: result.stdout ?? '', stderr: result.stderr ?? '' };
+    },
+  },
+);
+pulumi.log.info(`preflight: ${preflight}, no Postgres directory BackingService`);
 
 /**
  * Earlier versions of this program ran the guest on a Postgres BackingService (`directory`). An

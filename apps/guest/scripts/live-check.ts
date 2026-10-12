@@ -5,15 +5,19 @@
  *   bun apps/guest/scripts/live-check.ts --values <file> --url <gateway> --host <workload host> \
  *     --slug <new organization slug> [--read-only]
  *
- * `--values` is the runtime secrets file deploy/guest/deploy.sh applied (bootstrap owner password
+ * `--values` is the runtime secrets file deploy/guest/deploy.sh applied (mode 0600, checked) (bootstrap owner password
  * and client secrets come from it). Requests go to `--url` with `Host: <--host>`, for example
  * `--url http://127.0.0.1:28380 --host identity.pgprove.localhost`. Without `--read-only` it
  * creates the organization `--slug` and runs the authorization-code checks (tests/support/flows.ts:
  * the HTTP-only assertions of apps/server/tests/authorization-code.test.ts); with it, it checks
  * that the organization exists and the owner can sign in, which is the check after a restart. Prints status codes and names only, never a secret.
  */
-import { readFileSync } from 'node:fs';
+import { readFileSync, statSync } from 'node:fs';
 import { parseArgs } from 'node:util';
+import {
+  assertPrivateMode,
+  parseRuntimeValues,
+} from '../../../deploy/platform/components/control-secret.ts';
 import {
   authorizationCodeChecks,
   identityFlows,
@@ -33,7 +37,11 @@ const { values: args } = parseArgs({
 for (const name of ['values', 'url', 'host', 'slug'] as const) {
   if (!args[name]) throw new Error(`--${name} is required`);
 }
-const secrets = JSON.parse(readFileSync(args.values as string, 'utf8')) as Record<string, string>;
+assertPrivateMode(statSync(args.values as string).mode, args.values as string);
+const secrets = parseRuntimeValues(
+  readFileSync(args.values as string, 'utf8'),
+  args.values as string,
+);
 const base = new URL(args.url as string);
 const host = args.host as string;
 
