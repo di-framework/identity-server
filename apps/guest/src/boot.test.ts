@@ -1,102 +1,26 @@
-import { expect, test } from 'bun:test';
+import { afterAll, expect, test } from 'bun:test';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { useContainer } from '@di-framework/core/container';
-import { pgScalar } from '@di-framework/repo/postgres';
-import { SQL } from 'bun';
+import type { SqlDatabase } from '@di-framework/repo';
 import { BootstrapReconciler } from '../../../packages/core/src/bootstrap/application/bootstrap-reconciler.ts';
 import { Readiness } from '../../../packages/core/src/bootstrap/application/readiness.ts';
 import { IdentityModule } from '../../../packages/core/src/composition.ts';
 import { NotificationWorker } from '../../../packages/core/src/notifications/application/security-notifications.ts';
 import { withContainer } from '../../../packages/core/tests/support/container-lock.ts';
-import {
-  databaseUrl,
-  useTestDatabase,
-  withThrowawayDatabase,
-} from '../../../packages/core/tests/support/database.ts';
+import { useTestDatabase } from '../../../packages/core/tests/support/database.ts';
 import { rsaPrivateJwk } from '../../../packages/core/tests/support/keys.ts';
-import type { IdentityDatabase } from './bindings.ts';
-import { handle, resetGuest } from './runtime.ts';
+import { identityFlows } from '../tests/support/flows.ts';
+import { type PgliteFixture, pgliteFixture } from '../tests/support/pglite.ts';
+import { DATABASE_ROOT_ENV, pgliteDatabase } from './database.ts';
+import { type GuestRuntime, handle, resetGuest } from './runtime.ts';
+import { RUNTIME_SECRET_SETTINGS } from './settings.ts';
 
-const textCell = (val: string) => ({ tag: 'text' as const, val });
+const scratch = mkdtempSync(join(tmpdir(), 'identity-guest-pglite-'));
+afterAll(() => rmSync(scratch, { recursive: true, force: true }));
 
-function stream(rows: readonly unknown[]): AsyncIterable<unknown> {
-  return {
-    async *[Symbol.asyncIterator]() {
-      for (const row of rows) yield row;
-    },
-  };
-}
-
-function table(columns: string[], rows: readonly unknown[]): unknown {
-  return [columns, stream(rows), null];
-}
-
-function fromPg(value: unknown): unknown {
-  if (value == null || typeof value !== 'object' || !('tag' in value)) return value;
-  const tagged = value as { tag: unknown; val?: unknown };
-  if (tagged.tag === 'null') return null;
-  if (tagged.tag === 'bytea' && Array.isArray(tagged.val)) return Uint8Array.from(tagged.val);
-  if (tagged.tag === 'timestamp-tz') {
-    const iso = pgScalar(value);
-    return typeof iso === 'string' ? new Date(iso) : null;
-  }
-  return tagged.val ?? null;
-}
-
-function cellOf(value: unknown): unknown {
-  if (value == null) return { tag: 'null' };
-  if (typeof value === 'string') return textCell(value);
-  if (typeof value === 'boolean') return { tag: 'bool', val: value };
-  if (typeof value === 'bigint') return { tag: 'int8', val: Number(value) };
-  if (typeof value === 'number') {
-    return Number.isInteger(value)
-      ? { tag: 'int8', val: value }
-      : { tag: 'numeric', val: String(value) };
-  }
-  if (value instanceof Date) return { tag: 'timestamp', val: value.toISOString() };
-  if (value instanceof Uint8Array) return { tag: 'bytea', val: [...value] };
-  if (typeof value === 'object') return { tag: 'jsonb', val: JSON.stringify(value) };
-  return textCell(String(value));
-}
-
-function asTable(result: unknown): unknown {
-  const rows = Array.isArray(result) ? result : [];
-  const first = rows[0];
-  const columns = first != null && typeof first === 'object' ? Object.keys(first as object) : [];
-  return table(
-    columns,
-    rows.map((row) => columns.map((column) => cellOf((row as Record<string, unknown>)[column]))),
-  );
-}
-
-/**
- * The binding as the host serves it: every call takes whichever pooled connection is free, so
- * consecutive statements of one request land on different connections. Rotating through the
- * reserved connections reproduces that, including for `BEGIN` / `COMMIT` pairs, which is why
- * the guest must not rely on them.
- */
-function bridge(connections: SQL[]): IdentityDatabase {
-  let turn = 0;
-  const next = () => connections[turn++ % connections.length] as SQL;
-  return {
-    async batch(sql: string) {
-      await next().unsafe(sql);
-    },
-    async rows(sql: string, params: readonly { val: string }[] = []) {
-      const result = await next().unsafe(
-        sql,
-        params.map((param) => param.val),
-      );
-      return Array.isArray(result) ? (result as Record<string, unknown>[]) : [];
-    },
-    async query(sql: string, params: readonly unknown[] = []) {
-      return asTable(await next().unsafe(sql, params.map(fromPg)));
-    },
-    async queryBatch(sql: string) {
-      await next().unsafe(sql);
-    },
-  } as unknown as IdentityDatabase;
-}
-
+/** The guest's settings as the deploy delivers them: wasi:config plus the identity-control env. */
 function guestConfig(
   scheduler: boolean,
   redirects = 'http://localhost:3000/callback',
@@ -133,244 +57,361 @@ function guestConfig(
   ];
 }
 
-test('the guest boots with no connection affinity and serves the Bun routes', async () => {
-  await withContainer(() =>
-    withThrowawayDatabase('identity_guest_http', async () => {
-      const sql = new SQL(databaseUrl('identity_guest_http'));
-      const reserved = await sql.reserve();
-      const other = await sql.reserve();
-      // Two connections, used in turn: a `BEGIN` on one would never pair with a `COMMIT` on the
-      // other, so this boot and every write below prove the guest does without them.
-      const database = bridge([reserved, other]);
-      const shell = '<!doctype html><div id="root" data-guest="shell"></div>';
-      const fresh = () => {
-        useContainer().register(BootstrapReconciler);
-        useContainer().register(Readiness);
-      };
-      const assets = new Map<string, Uint8Array>([['main.js', new Uint8Array([1, 2, 3])]]);
-      try {
-        fresh();
-        const ready = await handle(new Request('https://identity.test/ready'), {
-          database,
-          config: { getAll: () => guestConfig(false) },
-          assets,
-          shell,
-        });
-        const report = await ready.json();
-        expect({ status: ready.status, report }).toEqual({
-          status: 200,
-          report: {
-            database: true,
-            signing_key: true,
-            smtp: true,
-            bootstrap: true,
-            ok: true,
-          },
-        });
-        const health = await handle(new Request('https://identity.test/health'), {
-          database,
-          config: { getAll: () => guestConfig(false) },
-          assets,
-          shell,
-        });
-        expect(health.status).toBe(200);
-        const login = await handle(new Request('https://identity.test/login'), {
-          database,
-          config: { getAll: () => guestConfig(false) },
-          assets,
-          shell,
-        });
-        expect(login.status).toBe(200);
-        expect(await login.text()).toContain('data-guest="shell"');
-        const script = await handle(new Request('https://identity.test/assets/main.js'), {
-          database,
-          config: { getAll: () => guestConfig(false) },
-          assets,
-          shell,
-        });
-        expect(script.status).toBe(200);
-        const organizations = await handle(
-          new Request('https://identity.test/api/admin/organizations', {
-            method: 'POST',
-            headers: { 'content-type': 'application/json' },
-            body: JSON.stringify({ slug: 'acme', name: 'Acme' }),
-          }),
-          {
-            database,
-            config: { getAll: () => guestConfig(false) },
-            assets,
-            shell,
-          },
-        );
-        expect(organizations.status).not.toBe(404);
+const SECRET_NAMES = new Set<string>(RUNTIME_SECRET_SETTINGS);
 
-        resetGuest();
-        fresh();
-        useContainer().registerValue(NotificationWorker, {
-          runOnce: async () => {
-            throw new Error('drain');
-          },
-        } as unknown as NotificationWorker);
-        const drained = await handle(new Request('https://identity.test/health'), {
-          database,
-          config: { getAll: () => guestConfig(true) },
-          assets,
-          shell,
-        });
-        expect(drained.status).toBe(200);
-
-        // Same secrets, new redirect URI: the stored fingerprint must not skip reconcile.
-        resetGuest();
-        fresh();
-        const redirected = await handle(new Request('https://identity.test/health'), {
-          database,
-          config: {
-            getAll: () => guestConfig(false, 'http://localhost:3000/callback,https://app.test/cb'),
-          },
-          assets,
-          shell,
-        });
-        expect(redirected.status).toBe(200);
-        const [access] = await reserved.unsafe(
-          `SELECT redirect_uris FROM oauth2_registered_client WHERE client_id = 'access'`,
-        );
-        expect(access.redirect_uris).toBe('http://localhost:3000/callback,https://app.test/cb');
-
-        // A lease another realm holds: the fingerprint differs (new CLI client), so this realm
-        // would reconcile, but it answers 503 at once and hashes nothing.
-        const redirects = 'http://localhost:3000/callback,https://app.test/cb';
-        const withCli = (extra: Array<[string, string]> = []) => ({
-          database,
-          config: {
-            getAll: () =>
-              guestConfig(false, redirects, [['AUTH_CLI_CLIENT_ID', 'tenant-cli'], ...extra]),
-          },
-          assets,
-          shell,
-        });
-        const secretOf = async (clientId: string) =>
-          (
-            await reserved.unsafe(
-              `SELECT client_secret FROM oauth2_registered_client WHERE client_id = '${clientId}'`,
-            )
-          )[0]?.client_secret as string | undefined;
-        const held = new Date(Date.now() + 60_000).toISOString();
-        await reserved.unsafe(
-          `INSERT INTO identity_runtime_secret (name, value) VALUES ('bootstrap_lease', $1)`,
-          [held],
-        );
-        resetGuest();
-        fresh();
-        const busy = await handle(new Request('https://identity.test/health'), withCli());
-        expect(busy.status).toBe(503);
-        expect(busy.headers.get('retry-after')).toBe('5');
-        expect(await busy.json()).toEqual({
-          ok: false,
-          error: `bootstrap in progress until ${held}`,
-        });
-        expect(await secretOf('tenant-cli')).toBeUndefined();
-
-        // An expired lease is taken over and released after the store. Stored client
-        // fingerprints that are not JSON settle nothing, so the access secret is hashed again.
-        const accessHash = await secretOf('access');
-        await reserved.unsafe(
-          `UPDATE identity_runtime_secret SET value = $1 WHERE name = 'bootstrap_lease'`,
-          [new Date(Date.now() - 1000).toISOString()],
-        );
-        await reserved.unsafe(
-          `UPDATE identity_runtime_secret SET value = 'not json' WHERE name = 'bootstrap_client_fingerprints'`,
-        );
-        resetGuest();
-        fresh();
-        const taken = await handle(new Request('https://identity.test/health'), withCli());
-        expect(taken.status).toBe(200);
-        expect(
-          await reserved.unsafe(
-            `SELECT 1 FROM identity_runtime_secret WHERE name = 'bootstrap_lease'`,
-          ),
-        ).toHaveLength(0);
-        const [cli] = await reserved.unsafe(
-          `SELECT client_authentication_methods FROM oauth2_registered_client WHERE client_id = 'tenant-cli'`,
-        );
-        expect(cli.client_authentication_methods).toBe('none');
-        const rehashed = await secretOf('access');
-        expect(rehashed).not.toBe(accessHash);
-
-        // Stored fingerprints that are JSON but not an object settle nothing either.
-        await reserved.unsafe(
-          `UPDATE identity_runtime_secret SET value = '[1]' WHERE name = 'bootstrap_client_fingerprints'`,
-        );
-        resetGuest();
-        fresh();
-        const renamed = await handle(
-          new Request('https://identity.test/health'),
-          withCli([['AUTH_BOOTSTRAP_OWNER_DISPLAY_NAME', 'Owner Two']]),
-        );
-        expect(renamed.status).toBe(200);
-        const rehashedAgain = await secretOf('access');
-        expect(rehashedAgain).not.toBe(rehashed);
-
-        // A change outside the clients reconciles with every client settled: no hash changes.
-        resetGuest();
-        fresh();
-        const settled = await handle(
-          new Request('https://identity.test/health'),
-          withCli([['AUTH_BOOTSTRAP_OWNER_DISPLAY_NAME', 'Owner Three']]),
-        );
-        expect(settled.status).toBe(200);
-        expect(await secretOf('access')).toBe(rehashedAgain);
-
-        // A reconcile that fails after the lease is taken (here: an invalid CLI redirect) leaves
-        // the prints of only the settled clients behind, so the next realm hashes the rotated
-        // access secret again instead of trusting the print of the secret it was rotated from.
-        resetGuest();
-        fresh();
-        const aborted = await handle(
-          new Request('https://identity.test/health'),
-          withCli([
-            ['AUTH_ACCESS_CLIENT_SECRET', 'rotated-secret'],
-            ['AUTH_CLI_REDIRECT_URIS', 'https://evil.test/cb'],
-          ]),
-        );
-        expect(aborted.status).toBe(503);
-        const [prints] = await reserved.unsafe(
-          `SELECT value FROM identity_runtime_secret WHERE name = 'bootstrap_client_fingerprints'`,
-        );
-        expect(Object.keys(JSON.parse(prints.value as string)).sort()).toEqual([
-          'directory',
-          'provisioner',
-        ]);
-        expect(
-          await reserved.unsafe(
-            `SELECT 1 FROM identity_runtime_secret WHERE name = 'bootstrap_lease'`,
-          ),
-        ).toHaveLength(0);
-        resetGuest();
-        fresh();
-        const repaired = await handle(
-          new Request('https://identity.test/health'),
-          withCli([['AUTH_BOOTSTRAP_OWNER_DISPLAY_NAME', 'Owner Four']]),
-        );
-        expect(repaired.status).toBe(200);
-        expect(await secretOf('access')).not.toBe(rehashedAgain);
-      } finally {
-        resetGuest();
-        IdentityModule.bind();
-        const services = (
-          useContainer() as unknown as {
-            services: Map<unknown, { hasInstance?: boolean; instance?: unknown }>;
-          }
-        ).services;
-        for (const definition of services.values()) {
-          definition.hasInstance = false;
-          definition.instance = undefined;
-        }
-        useContainer().register(NotificationWorker);
-        reserved.release();
-        other.release();
-        await sql.end();
-        await useTestDatabase();
-      }
+/** Splits the settings the way a deploy does: secrets in the env, the rest in wasi:config. */
+function runtimeFor(
+  database: () => Promise<SqlDatabase>,
+  settings: Array<[string, string]>,
+  assets = new Map<string, Uint8Array>(),
+  shell = '<!doctype html><div id="root" data-guest="shell"></div>',
+): GuestRuntime {
+  return {
+    database,
+    config: { getAll: () => settings.filter(([key]) => !SECRET_NAMES.has(key)) },
+    env: () => ({
+      ...Object.fromEntries(settings.filter(([key]) => SECRET_NAMES.has(key))),
+      [DATABASE_ROOT_ENV]: '/data/pglite',
     }),
-  );
-}, 120_000);
+    assets,
+    shell,
+  };
+}
+
+/** Each "realm" (request instance) re-registers the readiness chain, as a fresh boot would. */
+function freshRealm(): void {
+  resetGuest();
+  useContainer().register(BootstrapReconciler);
+  useContainer().register(Readiness);
+}
+
+/** Hand the process-wide container back to the shared Postgres test database. */
+async function restoreContainer(): Promise<void> {
+  resetGuest();
+  IdentityModule.bind();
+  const services = (
+    useContainer() as unknown as {
+      services: Map<unknown, { hasInstance?: boolean; instance?: unknown }>;
+    }
+  ).services;
+  for (const definition of services.values()) {
+    definition.hasInstance = false;
+    definition.instance = undefined;
+  }
+  useContainer().register(NotificationWorker);
+  await useTestDatabase();
+}
+
+const flowInputs = (fetch: (request: Request) => Promise<Response>, slug: string) => ({
+  fetch,
+  ownerLogin: 'owner',
+  ownerPassword: 'owner-secret',
+  accessClient: {
+    id: 'access',
+    secret: 'access-secret',
+    redirectUri: 'http://localhost:3000/callback',
+  },
+  provisionerClient: { id: 'provisioner', secret: 'provisioner-secret' },
+  organizationSlug: slug,
+});
+
+test('the guest boots on one pglite connection and serves the Bun routes and flows', async () => {
+  await withContainer(async () => {
+    const fixture = pgliteFixture();
+    const database = pgliteDatabase(fixture.module, () => ({ [DATABASE_ROOT_ENV]: '/data/boot' }));
+    const db = await database();
+    const assets = new Map<string, Uint8Array>([['main.js', new Uint8Array([1, 2, 3])]]);
+    const runtime = (settings: Array<[string, string]>) => runtimeFor(database, settings, assets);
+    const secretOf = async (clientId: string) =>
+      (
+        await db.first<{ client_secret: string }>(
+          'SELECT client_secret FROM oauth2_registered_client WHERE client_id = ?',
+          [clientId],
+        )
+      )?.client_secret;
+    try {
+      freshRealm();
+      const ready = await handle(
+        new Request('https://identity.test/ready'),
+        runtime(guestConfig(false)),
+      );
+      expect({ status: ready.status, report: await ready.json() }).toEqual({
+        status: 200,
+        report: { database: true, signing_key: true, smtp: true, bootstrap: true, ok: true },
+      });
+      // The instance opened its database once and keeps that one connection.
+      expect(fixture.opened).toEqual(['/data/boot']);
+      const login = await handle(
+        new Request('https://identity.test/login'),
+        runtime(guestConfig(false)),
+      );
+      expect(login.status).toBe(200);
+      expect(await login.text()).toContain('data-guest="shell"');
+      const script = await handle(
+        new Request('https://identity.test/assets/main.js'),
+        runtime(guestConfig(false)),
+      );
+      expect(script.status).toBe(200);
+
+      // Database writes and reads through the real flows: an admin API write, a duplicate, a
+      // read, then a browser sign-in, consent, a PKCE code exchange and UserInfo.
+      const serve = (request: Request) => handle(request, runtime(guestConfig(false)));
+      const report = await identityFlows(flowInputs(serve, 'acme'));
+      expect(report.organization).toEqual({
+        created: 201,
+        duplicate: 409,
+        read: 200,
+        name: 'Org acme',
+      });
+      expect(report.login).toMatchObject({ signIn: 303, consent: 303, token: 200, userinfo: 200 });
+      expect(fixture.opened).toEqual(['/data/boot']);
+      // Secrets stay out of the database: only bootstrap state is stored there.
+      const stored = await db.query<{ name: string }>(
+        'SELECT name FROM identity_runtime_secret ORDER BY name',
+      );
+      expect(stored.map((row) => row.name)).toEqual([
+        'bootstrap_client_fingerprints',
+        'bootstrap_fingerprint',
+      ]);
+
+      freshRealm();
+      useContainer().registerValue(NotificationWorker, {
+        runOnce: async () => {
+          throw new Error('drain');
+        },
+      } as unknown as NotificationWorker);
+      const drained = await handle(
+        new Request('https://identity.test/health'),
+        runtime(guestConfig(true)),
+      );
+      expect(drained.status).toBe(200);
+
+      // Same secrets, new redirect URI: the stored fingerprint must not skip reconcile.
+      freshRealm();
+      const redirects = 'http://localhost:3000/callback,https://app.test/cb';
+      const redirected = await handle(
+        new Request('https://identity.test/health'),
+        runtime(guestConfig(false, redirects)),
+      );
+      expect(redirected.status).toBe(200);
+      expect(
+        await db.first<Record<string, unknown>>(
+          'SELECT redirect_uris FROM oauth2_registered_client WHERE client_id = ?',
+          ['access'],
+        ),
+      ).toEqual({ redirect_uris: redirects });
+
+      // A lease another realm holds: the fingerprint differs (new CLI client), so this realm
+      // would reconcile, but it answers 503 at once and hashes nothing.
+      const withCli = (extra: Array<[string, string]> = []) =>
+        runtime(guestConfig(false, redirects, [['AUTH_CLI_CLIENT_ID', 'tenant-cli'], ...extra]));
+      const held = new Date(Date.now() + 60_000).toISOString();
+      await db.run(
+        `INSERT INTO identity_runtime_secret (name, value) VALUES ('bootstrap_lease', ?)`,
+        [held],
+      );
+      freshRealm();
+      const busy = await handle(new Request('https://identity.test/health'), withCli());
+      expect(busy.status).toBe(503);
+      expect(busy.headers.get('retry-after')).toBe('5');
+      expect(await busy.json()).toEqual({
+        ok: false,
+        error: `bootstrap in progress until ${held}`,
+      });
+      expect(await secretOf('tenant-cli')).toBeUndefined();
+
+      // An expired lease is taken over and released after the store. Stored client
+      // fingerprints that are not JSON settle nothing, so the access secret is hashed again.
+      const accessHash = await secretOf('access');
+      await db.run(`UPDATE identity_runtime_secret SET value = ? WHERE name = 'bootstrap_lease'`, [
+        new Date(Date.now() - 1000).toISOString(),
+      ]);
+      await db.run(
+        `UPDATE identity_runtime_secret SET value = 'not json' WHERE name = 'bootstrap_client_fingerprints'`,
+      );
+      freshRealm();
+      const taken = await handle(new Request('https://identity.test/health'), withCli());
+      expect(taken.status).toBe(200);
+      expect(
+        await db.query(`SELECT 1 FROM identity_runtime_secret WHERE name = 'bootstrap_lease'`),
+      ).toHaveLength(0);
+      expect(
+        await db.first<Record<string, unknown>>(
+          'SELECT client_authentication_methods FROM oauth2_registered_client WHERE client_id = ?',
+          ['tenant-cli'],
+        ),
+      ).toEqual({ client_authentication_methods: 'none' });
+      const rehashed = await secretOf('access');
+      expect(rehashed).not.toBe(accessHash);
+
+      // Stored fingerprints that are JSON but not an object settle nothing either.
+      await db.run(
+        `UPDATE identity_runtime_secret SET value = '[1]' WHERE name = 'bootstrap_client_fingerprints'`,
+      );
+      freshRealm();
+      const renamed = await handle(
+        new Request('https://identity.test/health'),
+        withCli([['AUTH_BOOTSTRAP_OWNER_DISPLAY_NAME', 'Owner Two']]),
+      );
+      expect(renamed.status).toBe(200);
+      const rehashedAgain = await secretOf('access');
+      expect(rehashedAgain).not.toBe(rehashed);
+
+      // A change outside the clients reconciles with every client settled: no hash changes.
+      freshRealm();
+      const settled = await handle(
+        new Request('https://identity.test/health'),
+        withCli([['AUTH_BOOTSTRAP_OWNER_DISPLAY_NAME', 'Owner Three']]),
+      );
+      expect(settled.status).toBe(200);
+      expect(await secretOf('access')).toBe(rehashedAgain);
+
+      // A reconcile that fails after the lease is taken (here: an invalid CLI redirect) leaves
+      // the prints of only the settled clients behind, so the next realm hashes the rotated
+      // access secret again instead of trusting the print of the secret it was rotated from.
+      freshRealm();
+      const aborted = await handle(
+        new Request('https://identity.test/health'),
+        withCli([
+          ['AUTH_ACCESS_CLIENT_SECRET', 'rotated-secret'],
+          ['AUTH_CLI_REDIRECT_URIS', 'https://evil.test/cb'],
+        ]),
+      );
+      expect(aborted.status).toBe(503);
+      const prints = await db.first<{ value: string }>(
+        `SELECT value FROM identity_runtime_secret WHERE name = 'bootstrap_client_fingerprints'`,
+      );
+      expect(Object.keys(JSON.parse(prints?.value ?? '{}')).sort()).toEqual([
+        'directory',
+        'provisioner',
+      ]);
+      expect(
+        await db.query(`SELECT 1 FROM identity_runtime_secret WHERE name = 'bootstrap_lease'`),
+      ).toHaveLength(0);
+      freshRealm();
+      const repaired = await handle(
+        new Request('https://identity.test/health'),
+        withCli([['AUTH_BOOTSTRAP_OWNER_DISPLAY_NAME', 'Owner Four']]),
+      );
+      expect(repaired.status).toBe(200);
+      expect(await secretOf('access')).not.toBe(rehashedAgain);
+    } finally {
+      await fixture.shutdown();
+      await restoreContainer();
+    }
+  });
+}, 180_000);
+
+test('data survives an instance restart on the same database root', async () => {
+  await withContainer(async () => {
+    const dataDir = (root: string) => join(scratch, root.replaceAll('/', '_'));
+    let fixture: PgliteFixture = pgliteFixture(dataDir);
+    const env = () => ({ [DATABASE_ROOT_ENV]: '/data/restart' });
+    try {
+      freshRealm();
+      const first = pgliteDatabase(fixture.module, env);
+      const serve = (request: Request) => handle(request, runtimeFor(first, guestConfig(false)));
+      const before = await identityFlows(flowInputs(serve, 'persisted'));
+      expect(before.organization.created).toBe(201);
+
+      // A new instance: new engine on the same files, nothing cached in the guest.
+      await (await first()).close?.();
+      await fixture.shutdown();
+      fixture = pgliteFixture(dataDir);
+      freshRealm();
+      const second = pgliteDatabase(fixture.module, env);
+      const serveAgain = (request: Request) =>
+        handle(request, runtimeFor(second, guestConfig(false)));
+      const health = await serveAgain(new Request('https://identity.test/health'));
+      expect(health.status).toBe(200);
+      const db = await second();
+      expect(
+        await db.first<Record<string, unknown>>('SELECT name FROM organizations WHERE slug = ?', [
+          'persisted',
+        ]),
+      ).toEqual({ name: 'Org persisted' });
+      // The schema was already there, and the stored fingerprint skipped reconcile.
+      expect(
+        await db.first<{ n: number }>('SELECT count(*)::int AS n FROM identity_schema_migrations'),
+      ).toEqual({ n: 16 });
+      // The owner signs in again with the bootstrap password hashed before the restart.
+      const again = await identityFlows({
+        ...flowInputs(serveAgain, 'second'),
+      });
+      expect(again.login.subject).toBe(before.login.subject);
+    } finally {
+      await fixture.shutdown();
+      await restoreContainer();
+    }
+  });
+}, 180_000);
+
+test('transactions serialize on the single pglite connection instead of blocking on row locks', async () => {
+  // The Bun server's pooled test (packages/core/tests/postgres.test.ts) proves FOR UPDATE makes a
+  // second connection wait. The guest has one connection, so a second transaction cannot reach
+  // the database at all until the first commits, and a plain statement issued meanwhile waits
+  // for the same mutex: it sees the committed value, never a half-done transaction.
+  const fixture = pgliteFixture();
+  const db = await pgliteDatabase(fixture.module, () => ({}))();
+  try {
+    await db.exec(
+      'CREATE TABLE pool_probe (id int PRIMARY KEY, value int NOT NULL); INSERT INTO pool_probe VALUES (1, 0);',
+    );
+    const order: string[] = [];
+    let releaseFirst!: () => void;
+    const firstHolds = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+    let firstLocked!: () => void;
+    const locked = new Promise<void>((resolve) => {
+      firstLocked = resolve;
+    });
+    const first = db.transaction(async (tx) => {
+      await tx.query('SELECT value FROM pool_probe WHERE id = 1 FOR UPDATE');
+      order.push('first-locked');
+      firstLocked();
+      await firstHolds;
+      await tx.run('UPDATE pool_probe SET value = value + 1 WHERE id = 1');
+      order.push('first-commit');
+    });
+    await locked;
+    const second = db.transaction(async (tx) => {
+      const row = await tx.first<{ value: number }>(
+        'SELECT value FROM pool_probe WHERE id = 1 FOR UPDATE',
+      );
+      order.push(`second-saw-${row?.value}`);
+    });
+    const outside = db
+      .first<{ value: number }>('SELECT value FROM pool_probe WHERE id = 1')
+      .then((row) => order.push(`outside-saw-${row?.value}`));
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(order).toEqual(['first-locked']);
+    releaseFirst();
+    await Promise.all([first, second, outside]);
+    expect(order[0]).toBe('first-locked');
+    expect(order[1]).toBe('first-commit');
+    expect(order.slice(2).sort()).toEqual(['outside-saw-1', 'second-saw-1']);
+
+    // A throwing transaction rolls back; a nested one is a savepoint.
+    await expect(
+      db.transaction(async (tx) => {
+        await tx.run('UPDATE pool_probe SET value = 99 WHERE id = 1');
+        throw new Error('abort');
+      }),
+    ).rejects.toThrow('abort');
+    await db.transaction(async (tx) => {
+      await tx.run('UPDATE pool_probe SET value = 5 WHERE id = 1');
+      await tx
+        .transaction(async (inner) => {
+          await inner.run('UPDATE pool_probe SET value = 6 WHERE id = 1');
+          throw new Error('inner');
+        })
+        .catch(() => undefined);
+    });
+    expect(
+      await db.first<Record<string, unknown>>('SELECT value FROM pool_probe WHERE id = 1'),
+    ).toEqual({ value: 5 });
+  } finally {
+    await fixture.shutdown();
+  }
+});

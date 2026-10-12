@@ -1,5 +1,10 @@
 {
   "name": "identity",
   "entry": "src/app.ts",
-  "output": "dist/identity.wasm"
+  "output": "dist/identity.wasm",
+  "pglite": {
+    "image": "ghcr.io/di-framework/pglite-component@sha256:8bc30505cf28b1a65f72588da692d2ba3d79a6a2025c9256341a8625967a3286",
+    "storageMount": "/data",
+    "dataDir": "/data/pglite"
+  }
 }

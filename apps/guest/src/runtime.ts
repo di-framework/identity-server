@@ -1,4 +1,3 @@
-import { openPostgresDatabase } from '@di-framework/bindings/postgres';
 import { useContainer } from '@di-framework/core/container';
 import type { SqlDatabase } from '@di-framework/repo';
 import { BootstrapReconciler } from '../../../packages/core/src/bootstrap/application/bootstrap-reconciler.ts';
@@ -12,7 +11,7 @@ import { ControlPlaneRouter } from '../../api/src/control-plane.ts';
 import { OperationsEndpoints } from '../../api/src/operations/health.ts';
 import type { AssetSource } from '../../server/src/serve.ts';
 import { routeRequest } from '../../server/src/serve.ts';
-import type { IdentityDatabase } from './bindings.ts';
+import type { GuestEnv } from './database.ts';
 import { ensureSchema, resetSchema } from './migrations.ts';
 import type { ConfigStore } from './settings.ts';
 import { loadGuestSettings } from './settings.ts';
@@ -22,9 +21,10 @@ const CLIENT_FINGERPRINTS = 'bootstrap_client_fingerprints';
 const BOOTSTRAP_LEASE = 'bootstrap_lease';
 /**
  * How long one realm may hold the reconcile lease. A cold reconcile hashes up to three client
- * secrets at about 30 seconds each on QuickJS; the lease outlasts that with room for a busy host.
- * A realm the host aborts mid-reconcile (its client disconnected) leaves the lease to expire, and
- * every realm answers 503 until then.
+ * secrets; the lease outlasts that with room for a busy host. A realm the host aborts
+ * mid-reconcile (its client disconnected) leaves the lease to expire, and every realm answers 503
+ * until then. On the exclusive pglite instance requests already run one at a time, so the lease
+ * matters only across instance restarts that interrupt a reconcile.
  */
 const LEASE_MS = 3 * 60_000;
 
@@ -37,8 +37,11 @@ export class BootstrapBusyError extends Error {
 }
 
 export interface GuestRuntime {
-  database: IdentityDatabase;
+  /** The instance's one pglite connection, opened on first use. */
+  database: () => Promise<SqlDatabase>;
   config: ConfigStore;
+  /** The WASI environment, read per boot: it is empty at pre-initialization. */
+  env: () => GuestEnv;
   assets: AssetSource;
   shell: string;
 }
@@ -50,7 +53,7 @@ export function resetGuest(): void {
   resetSchema();
 }
 
-/** Schema, signing keys, bootstrap, then the same routes as the Bun server. */
+/** Database, schema, settings, signing keys, bootstrap, then the same routes as the Bun server. */
 export async function handle(request: Request, runtime: GuestRuntime): Promise<Response> {
   try {
     ready ??= boot(runtime).catch((error: unknown) => {
@@ -69,9 +72,9 @@ export async function handle(request: Request, runtime: GuestRuntime): Promise<R
 }
 
 async function boot(runtime: GuestRuntime): Promise<void> {
-  await ensureSchema(runtime.database);
-  const database = openPostgresDatabase(runtime.database);
-  const settings = await loadGuestSettings(runtime.config, database);
+  const database = await runtime.database();
+  await ensureSchema(database);
+  const settings = await loadGuestSettings(runtime.config, runtime.env());
   IdentityModule.configure(settings);
   IdentityModule.connect(database);
   // Singletons built by other tests keep the settings they were constructed with.
@@ -152,11 +155,10 @@ function parseFingerprints(stored: string): Record<string, string> {
 }
 
 /**
- * Lets one realm reconcile at a time. Every request that arrives before the fingerprint is
- * stored runs in its own realm, and without this each of them would start the same minutes of
- * Argon2id hashing on the host's CPU. The claim is one statement, as every write on this
- * database must be: insert the lease, or take over one whose expiry has passed. Losers throw
- * `BootstrapBusyError` and the request answers 503 at once.
+ * Lets one realm reconcile at a time. Without it, every request that arrives before the
+ * fingerprint is stored would start the same Argon2id hashing. The claim is one statement: insert
+ * the lease, or take over one whose expiry has passed. Losers throw `BootstrapBusyError` and the
+ * request answers 503 at once.
  */
 async function withBootstrapLease(database: SqlDatabase, fn: () => Promise<void>): Promise<void> {
   const now = new Date();

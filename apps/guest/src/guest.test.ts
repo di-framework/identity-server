@@ -1,12 +1,18 @@
-import { beforeEach, expect, test } from 'bun:test';
+import { afterAll, beforeEach, expect, test } from 'bun:test';
 import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getBindingMetadata } from '@di-framework/bindings';
-import { bindParams, openPostgresDatabase } from '@di-framework/bindings/postgres';
-import { text } from '@di-framework/repo/postgres';
+import type { SqlDatabase } from '@di-framework/repo';
 import { routeRequest } from '../../server/src/serve.ts';
-import { IdentityConfig, IdentityDatabase } from './bindings.ts';
+import { pgliteFixture } from '../tests/support/pglite.ts';
+import { IdentityConfig } from './bindings.ts';
+import {
+  DATABASE_ROOT_ENV,
+  DEFAULT_DATABASE_ROOT,
+  databaseRoot,
+  pgliteDatabase,
+} from './database.ts';
 import { readFlywayMigrations } from './flyway.ts';
 import {
   applySchema,
@@ -16,34 +22,42 @@ import {
   resetSchema,
 } from './migrations.ts';
 import { handle, resetGuest } from './runtime.ts';
-import { loadGuestSettings } from './settings.ts';
+import {
+  loadGuestSettings,
+  MissingRuntimeSecretsError,
+  REQUIRED_RUNTIME_SECRETS,
+  RUNTIME_SECRET_SETTINGS,
+} from './settings.ts';
 
-const cell = (val: string) => ({ tag: 'text' as const, val });
+const fixture = pgliteFixture();
+let counter = 0;
+/** A fresh in-process pglite database behind the guest's real adapter. */
+const freshDatabase = () =>
+  pgliteDatabase(fixture.module, () => ({
+    [DATABASE_ROOT_ENV]: `/data/guest-${++counter}`,
+  }))();
 
-function stream(rows: readonly unknown[]): AsyncIterable<unknown> {
-  return {
-    async *[Symbol.asyncIterator]() {
-      for (const row of rows) yield row;
-    },
+/** A `SqlDatabase` whose statements fail, for the error paths. */
+function failing(error: unknown, calls: string[] = []): SqlDatabase {
+  const fail = async (sql: string) => {
+    calls.push(sql);
+    throw error;
   };
-}
-
-function table(columns: unknown, rows: readonly unknown[], done: unknown = null): unknown {
-  return [columns, stream(rows), done];
-}
-
-function guest(options: {
-  queryBatch?: (sql: string) => Promise<unknown>;
-  query?: (sql: string, params: readonly unknown[]) => Promise<unknown>;
-}): IdentityDatabase {
-  return new IdentityDatabase({
-    queryBatch: options.queryBatch ?? (async () => undefined),
-    query: options.query ?? (async () => table(['version'], [])),
-  });
+  return {
+    run: fail,
+    query: fail,
+    first: fail,
+    exec: fail,
+    transaction: async () => fail('transaction'),
+  } as unknown as SqlDatabase;
 }
 
 beforeEach(() => {
   resetSchema();
+});
+
+afterAll(async () => {
+  await fixture.shutdown();
 });
 
 test('embedded migrations are the shipped Flyway files in version order', () => {
@@ -73,58 +87,25 @@ test('embedded migrations are the shipped Flyway files in version order', () => 
   }
 });
 
-test('batch and rows surface guest failures', async () => {
-  const ok = guest({
-    queryBatch: async () => ({ tag: 'ok' }),
-    query: async () => table(['version'], [[cell('1')]]),
-  });
-  await expect(ok.batch('SELECT 1')).resolves.toBeUndefined();
-  await expect(ok.rows('SELECT version FROM identity_schema_migrations')).resolves.toEqual([
-    { version: '1' },
-  ]);
-
-  const rejected = guest({
-    queryBatch: async () => ({ tag: 'err', val: { code: '42601', message: 'syntax' } }),
-    query: async () => {
-      throw { message: 'down' };
-    },
-  });
-  await expect(rejected.batch('nope')).rejects.toThrow('PostgreSQL 42601 syntax');
-  await expect(rejected.rows('SELECT 1')).rejects.toThrow('PostgreSQL down');
-});
-
-test('schema batches run once and skip versions already recorded', async () => {
-  const batches: string[] = [];
-  const pending = guest({
-    queryBatch: async (sql) => {
-      batches.push(sql);
-    },
-  });
-  const first = await ensureSchema(pending);
+test('every shipped migration applies on PGlite (PostgreSQL 17) once, in version order', async () => {
+  const database = await freshDatabase();
+  const first = await ensureSchema(database);
   expect(first).toEqual(embeddedMigrations.map((migration) => migration.version));
-  expect(batches[0]).toContain('CREATE TABLE IF NOT EXISTS identity_schema_migrations');
-  expect(batches.some((sql) => sql.includes('CREATE TABLE users'))).toBe(true);
-  expect(batches.some((sql) => sql.includes("VALUES ('12', 'normalize_jsonb_metadata')"))).toBe(
-    true,
+  expect(await ensureSchema(database)).toEqual(first);
+  const recorded = await database.query<{ version: string; description: string }>(
+    'SELECT version, description FROM identity_schema_migrations ORDER BY version::int',
   );
-  const afterFirst = batches.length;
-  expect(await ensureSchema(pending)).toEqual(first);
-  expect(batches).toHaveLength(afterFirst);
-
+  expect(recorded.map((row) => [row.version, row.description])).toEqual(
+    embeddedMigrations.map((migration) => [migration.version, migration.description]),
+  );
+  // A second instance on the same files skips everything already recorded.
   resetSchema();
-  const applied = guest({
-    query: async () =>
-      table(
-        ['version'],
-        embeddedMigrations.map((migration) => [cell(migration.version)]),
-      ),
-    queryBatch: async (sql) => {
-      batches.push(sql);
-    },
-  });
-  batches.length = 0;
-  expect(await applySchema(applied)).toEqual([]);
-  expect(batches).toHaveLength(1);
+  expect(await applySchema(database)).toEqual([]);
+  expect(
+    await database.first<{ comment: string }>(
+      `SELECT obj_description('identity_runtime_secret'::regclass, 'pg_class') AS comment`,
+    ),
+  ).toEqual({ comment: expect.stringContaining('Not for secrets') });
 
   expect(() =>
     migrationStatement({ version: '0', description: 'directory', sql: 'SELECT 1;' }),
@@ -139,77 +120,59 @@ test('schema batches run once and skip versions already recorded', async () => {
   );
 });
 
-test('a failed schema apply can be retried', async () => {
-  let failed = false;
-  const database = guest({
-    queryBatch: async () => {
-      if (!failed) {
-        failed = true;
-        throw { message: 'unavailable' };
-      }
-    },
-  });
-  await expect(ensureSchema(database)).rejects.toThrow('PostgreSQL unavailable');
-  await expect(ensureSchema(database)).resolves.toEqual(
-    embeddedMigrations.map((migration) => migration.version),
-  );
-});
-
-test('uuid and integer parameters go inline so Postgres types them from context', () => {
-  const id = '11111111-1111-4111-8111-111111111111';
-  expect(bindParams('SELECT ?', [])).toEqual({ text: 'SELECT ?', params: [] });
-  expect(bindParams('INSERT INTO t VALUES (?, ?, ?, ?)', ['acme', id, true, 1.5])).toEqual({
-    text: `INSERT INTO t VALUES ($1, '${id}', $2, $3)`,
-    params: [text('acme'), { tag: 'bool', val: true }, { tag: 'numeric', val: '1.5' }],
-  });
-  expect(bindParams('SELECT x - ? LIMIT ? OFFSET ?', [-5, 25, 7n])).toEqual({
-    text: 'SELECT x - (-5) LIMIT 25 OFFSET 7',
-    params: [],
-  });
-  expect(() => bindParams('SELECT ?', [2 ** 53])).toThrow('not an exact integer');
-  expect(() => bindParams('SELECT ?', ['a', 'b'])).toThrow('placeholder count 1 does not match 2');
-});
-
-test('the sql adapter binds parameters and never opens a transaction', async () => {
-  const calls: string[] = [];
-  const database = guest({
-    queryBatch: async (sql) => {
-      calls.push(sql);
-    },
-    query: async (sql, params) => {
-      calls.push(`${sql} ${JSON.stringify(params)}`);
-      if (sql.includes('AS tx')) return table(['tx'], [[cell('9')]]);
-      if (sql.includes('RETURNING')) return table(['one'], [[cell('1')]]);
-      if (sql.includes('ALREADY')) throw new Error('PostgreSQL already failed');
-      if (sql.includes('EMPTY')) return table(['one'], []);
-      throw { code: '23505', message: 'duplicate key value' };
-    },
-  });
-  const sql = openPostgresDatabase(database);
-  expect(await sql.query<{ tx: string }>('SELECT ? AS tx', ['acme'])).toEqual([{ tx: '9' }]);
-  expect(await sql.first<{ tx: string }>('SELECT ? AS tx', ['acme'])).toEqual({ tx: '9' });
-  expect(await sql.first('SELECT EMPTY')).toBeNull();
-  expect((await sql.run('DELETE FROM t WHERE id = ? RETURNING 1', ['a'])).changes).toBe(1);
-  await expect(sql.run('INSERT INTO t VALUES (?)', ['a'])).rejects.toMatchObject({ code: '23505' });
-  await expect(sql.query('SELECT ALREADY')).rejects.toThrow('PostgreSQL already failed');
-  await sql.exec('CREATE TABLE t (id text)');
-  // `transaction` runs the callback on the same autocommit handle; nesting joins it.
+test('a failed migration rolls back with its version row and can be retried', async () => {
+  const database = await freshDatabase();
+  const [head, ...rest] = embeddedMigrations;
+  if (!head) throw new Error('no migrations');
+  const broken = { ...head, sql: `${head.sql}\nSELECT * FROM missing_table;` };
+  embeddedMigrations.splice(0, 1, broken);
+  try {
+    await expect(ensureSchema(database)).rejects.toMatchObject({ code: '42P01' });
+  } finally {
+    embeddedMigrations.splice(0, 1, head);
+  }
+  expect(await database.query('SELECT version FROM identity_schema_migrations')).toEqual([]);
   expect(
-    await sql.transaction(async (tx) => {
-      expect(tx).toBe(sql);
-      return tx.transaction(async (inner) => inner.first<{ tx: string }>('SELECT ? AS tx', ['x']));
-    }),
-  ).toEqual({ tx: '9' });
-  await expect(
-    sql.transaction(async () => {
-      throw new Error('nope');
-    }),
-  ).rejects.toThrow('nope');
-  expect(calls.filter((call) => /^(BEGIN|COMMIT|ROLLBACK)/i.test(call))).toEqual([]);
-  expect(calls).toContain('CREATE TABLE t (id text)');
+    await database.first<Record<string, unknown>>(`SELECT to_regclass('public.users') AS users`),
+  ).toEqual({
+    users: null,
+  });
+  expect(await ensureSchema(database)).toEqual([head, ...rest].map((m) => m.version));
 });
 
-test('runtime secrets override wasi config', async () => {
+test('the database root comes from DI_PGLITE_DATA_DIR, and a failed open is retried', async () => {
+  expect(databaseRoot({})).toBe(DEFAULT_DATABASE_ROOT);
+  expect(databaseRoot({ [DATABASE_ROOT_ENV]: '  ' })).toBe(DEFAULT_DATABASE_ROOT);
+  expect(databaseRoot({ [DATABASE_ROOT_ENV]: '/data/identity' })).toBe('/data/identity');
+
+  let attempts = 0;
+  const local = pgliteFixture();
+  const open = pgliteDatabase(
+    {
+      open: (path, options) => {
+        attempts += 1;
+        if (attempts === 1) return { tag: 'err', val: { tag: 'io', val: 'storage not mounted' } };
+        return local.module.open(path, options);
+      },
+    },
+    () => ({ [DATABASE_ROOT_ENV]: '/data/retry' }),
+  );
+  await expect(open()).rejects.toThrow('storage not mounted');
+  const database = await open();
+  expect(await open()).toBe(database);
+  expect(attempts).toBe(2);
+  expect(local.opened).toEqual(['/data/retry']);
+  await local.shutdown();
+});
+
+test('runtime secrets come from the environment and override wasi config', async () => {
+  const secrets = {
+    ISSUER_URL: 'http://from-secret',
+    AUTH_PUBLIC_ORIGIN: 'http://from-secret',
+    AUTH_ACTIVE_PRIVATE_JWK: '{"kty":"RSA"}',
+    SMTP_HOST: 'smtp.internal',
+    DATABASE_URL: 'postgres://not-a-runtime-setting',
+  };
   const settings = await loadGuestSettings(
     {
       getAll: () => [
@@ -217,17 +180,31 @@ test('runtime secrets override wasi config', async () => {
         ['SMTP_FROM', 'a@b.c'],
       ],
     },
-    {
-      query: async () => [
-        { name: 'ISSUER_URL', value: 'http://from-table' },
-        { name: 'SMTP_HOST', value: 'smtp.internal' },
-      ],
-    } as never,
+    secrets,
   );
-  expect(settings.issuer).toBe('http://from-table');
+  expect(settings.issuer).toBe('http://from-secret');
   expect(settings.smtp.from).toBe('a@b.c');
   expect(settings.smtp.host).toBe('smtp.internal');
+  // Only the listed names are read from the environment.
+  expect(settings.database.url).not.toBe(secrets.DATABASE_URL);
+  expect(RUNTIME_SECRET_SETTINGS).toContain('AUTH_DIRECTORY_CLIENT_SECRET');
   expect(getBindingMetadata(IdentityConfig)?.options.config?.SMTP_HOST).toBeUndefined();
+  expect(getBindingMetadata(IdentityConfig)?.options.secretFrom).toBeUndefined();
+});
+
+test('a control Secret without the runtime settings fails closed and names only the keys', async () => {
+  const error = await loadGuestSettings(
+    { getAll: async () => [['AUTH_PUBLIC_ORIGIN', ' ']] },
+    { AUTH_ACTIVE_PRIVATE_JWK: 'private-key-material', DI_CONTROL_TOKEN: 'control-token' },
+  ).catch((caught: unknown) => caught);
+  expect(error).toBeInstanceOf(MissingRuntimeSecretsError);
+  expect((error as MissingRuntimeSecretsError).missing).toEqual([
+    'ISSUER_URL',
+    'AUTH_PUBLIC_ORIGIN',
+  ]);
+  expect(String(error)).not.toContain('private-key-material');
+  expect(String(error)).not.toContain('control-token');
+  expect(REQUIRED_RUNTIME_SECRETS.every((key) => RUNTIME_SECRET_SETTINGS.includes(key))).toBe(true);
 });
 
 test('embedded assets keep their media types', async () => {
@@ -259,32 +236,40 @@ test('embedded assets keep their media types', async () => {
   ).toBe(404);
 });
 
-test('a failed schema apply surfaces as not ready', async () => {
-  resetGuest();
-  const database = guest({
-    queryBatch: async () => {
-      throw { message: 'closed' };
-    },
-  });
-  const response = await handle(new Request('https://identity.test/ready'), {
+test('a failed database or schema surfaces as not ready', async () => {
+  const runtime = (database: () => Promise<SqlDatabase>, env = {}) => ({
     database,
     config: { getAll: () => [] },
+    env: () => env,
     assets: new Map(),
     shell: '<div id="root"></div>',
   });
-  expect(response.status).toBe(503);
-  expect(await response.json()).toEqual({ ok: false, error: 'PostgreSQL closed' });
-  const opaque = await handle(new Request('https://identity.test/ready'), {
-    database: {
-      batch: async () => {
-        throw 'nope';
-      },
-      rows: async () => [],
-    } as unknown as IdentityDatabase,
-    config: { getAll: () => [] },
-    assets: new Map(),
-    shell: '<div id="root"></div>',
-  });
+  resetGuest();
+  const closed = await handle(
+    new Request('https://identity.test/ready'),
+    runtime(async () => failing(new Error('PostgreSQL closed'))),
+  );
+  expect(closed.status).toBe(503);
+  expect(await closed.json()).toEqual({ ok: false, error: 'PostgreSQL closed' });
+  const opaque = await handle(
+    new Request('https://identity.test/ready'),
+    runtime(async () => {
+      throw 'nope';
+    }),
+  );
   expect(opaque.status).toBe(503);
   expect(await opaque.json()).toEqual({ ok: false, error: 'failed' });
+
+  const database = await freshDatabase();
+  const unconfigured = await handle(
+    new Request('https://identity.test/ready'),
+    runtime(async () => database, { DI_CONTROL_TOKEN: 'only-the-cli-keys' }),
+  );
+  expect(unconfigured.status).toBe(503);
+  expect(await unconfigured.json()).toEqual({
+    ok: false,
+    error:
+      'runtime settings missing from the identity-control Secret: ISSUER_URL, AUTH_PUBLIC_ORIGIN, AUTH_ACTIVE_PRIVATE_JWK',
+  });
+  resetGuest();
 });
