@@ -1,5 +1,7 @@
 import { Component, Container } from '@di-framework/core/decorators';
+import { ColumnEncryption } from '../../shared/infrastructure/column-encryption.ts';
 import { PostgresGateway, Timestamps } from '../../shared/infrastructure/postgres-gateway.ts';
+import { Sql, sql } from '../../shared/infrastructure/sql.ts';
 import type { BrowserSession, SessionRepository } from '../domain/session.ts';
 
 interface Row {
@@ -7,34 +9,35 @@ interface Row {
   user_id: string | null;
   csrf_token: string;
   last_authenticated_at: unknown;
-  attributes: Record<string, string>;
+  attributes: string;
   created_at: unknown;
   expires_at: unknown;
 }
 
+/** `attributes` is encrypted once column encryption is enabled (V18). */
 @Container()
 export class PostgresSessionRepository implements SessionRepository {
-  constructor(@Component(PostgresGateway) private readonly db: PostgresGateway) {}
+  constructor(
+    @Component(PostgresGateway) private readonly db: PostgresGateway,
+    @Component(ColumnEncryption) private readonly encryption: ColumnEncryption,
+  ) {}
 
-  insert(session: BrowserSession, now: number): Promise<void> {
+  async insert(session: BrowserSession, now: number): Promise<void> {
+    const columns = await this.columns(session);
     return this.db.write(
-      `INSERT INTO browser_sessions (id, user_id, csrf_token, last_authenticated_at, attributes,
+      sql`INSERT INTO browser_sessions (${Sql.raw(Object.keys(columns).join(', '))},
          created_at, last_seen_at, expires_at)
-       VALUES (?, ?, ?, ?, ?::text::jsonb, ?, ?, ?)`,
-      [
-        ...this.values(session),
-        new Date(session.createdAt ?? now),
-        new Date(now),
-        new Date(session.expiresAt),
-      ],
+       VALUES (${Sql.join(Object.values(columns), ', ')}, ${new Date(session.createdAt ?? now)},
+         ${new Date(now)}, ${new Date(session.expiresAt)})`,
     );
   }
 
   async find(id: string): Promise<BrowserSession | undefined> {
+    const cipher = await this.encryption.cipher();
     const row = await this.db.one<Row>(
-      `SELECT id, user_id::text AS user_id, csrf_token, last_authenticated_at, attributes, created_at, expires_at
-       FROM browser_sessions WHERE id = ?`,
-      [id],
+      sql`SELECT id, user_id::text AS user_id, csrf_token, last_authenticated_at,
+         ${cipher.read('attributes', 'attributes', { json: true })}, created_at, expires_at
+       FROM browser_sessions WHERE id = ${id}`,
     );
     if (!row) return undefined;
     return {
@@ -43,27 +46,27 @@ export class PostgresSessionRepository implements SessionRepository {
       csrf: row.csrf_token,
       lastAuthenticatedAt:
         row.last_authenticated_at == null ? null : Timestamps.ms(row.last_authenticated_at),
-      attributes: row.attributes,
+      attributes: JSON.parse(row.attributes) as Record<string, string>,
       createdAt: row.created_at == null ? undefined : Timestamps.ms(row.created_at),
       expiresAt: Timestamps.ms(row.expires_at),
     };
   }
 
-  update(session: BrowserSession, now: number): Promise<void> {
+  async update(session: BrowserSession, now: number): Promise<void> {
+    const { id: _id, ...columns } = await this.columns(session);
     return this.db.write(
-      `UPDATE browser_sessions SET user_id = ?, csrf_token = ?, last_authenticated_at = ?,
-         attributes = ?::text::jsonb, last_seen_at = ?, expires_at = ?
-       WHERE id = ?`,
-      [...this.values(session).slice(1), new Date(now), new Date(session.expiresAt), session.id],
+      sql`UPDATE browser_sessions SET ${assignments(columns)}, last_seen_at = ${new Date(now)},
+         expires_at = ${new Date(session.expiresAt)}
+       WHERE id = ${session.id}`,
     );
   }
 
-  rename(oldId: string, session: BrowserSession, now: number): Promise<void> {
+  async rename(oldId: string, session: BrowserSession, now: number): Promise<void> {
+    const columns = await this.columns(session);
     return this.db.write(
-      `UPDATE browser_sessions SET id = ?, user_id = ?, csrf_token = ?, last_authenticated_at = ?,
-         attributes = ?::text::jsonb, last_seen_at = ?, expires_at = ?
-       WHERE id = ?`,
-      [...this.values(session), new Date(now), new Date(session.expiresAt), oldId],
+      sql`UPDATE browser_sessions SET ${assignments(columns)}, last_seen_at = ${new Date(now)},
+         expires_at = ${new Date(session.expiresAt)}
+       WHERE id = ${oldId}`,
     );
   }
 
@@ -79,13 +82,26 @@ export class PostgresSessionRepository implements SessionRepository {
     return result.changes ?? 0;
   }
 
-  private values(session: BrowserSession): unknown[] {
-    return [
-      session.id,
-      session.userId,
-      session.csrf,
-      session.lastAuthenticatedAt == null ? null : new Date(session.lastAuthenticatedAt),
-      JSON.stringify(session.attributes),
-    ];
+  /** Column values to write, by column name. */
+  private async columns(session: BrowserSession): Promise<Record<string, Sql>> {
+    const cipher = await this.encryption.cipher();
+    const attributes = JSON.stringify(session.attributes);
+    return {
+      id: sql`${session.id}`,
+      user_id: sql`${session.userId}`,
+      csrf_token: sql`${session.csrf}`,
+      last_authenticated_at: sql`${
+        session.lastAuthenticatedAt == null ? null : new Date(session.lastAuthenticatedAt)
+      }`,
+      attributes: cipher.plain(attributes, { json: true }),
+      attributes_enc: cipher.encrypt(attributes),
+    };
   }
+}
+
+function assignments(columns: Record<string, Sql>): Sql {
+  return Sql.join(
+    Object.entries(columns).map(([column, value]) => sql`${Sql.raw(column)} = ${value}`),
+    ', ',
+  );
 }

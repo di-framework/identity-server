@@ -254,7 +254,11 @@ Tests: `apps/guest/src/guest.test.ts` and `boot.test.ts` run the guest on an in-
 (`@electric-sql/pglite` 0.4.6, PostgreSQL 17.5) behind the real adapter
 (`apps/guest/tests/support/pglite.ts`): every migration, boot and bootstrap fingerprints and lease,
 the admin API, a browser sign-in with consent and a PKCE code exchange, transactions on one
-connection, and a restart on the same data directory.
+connection, and a restart on the same data directory. The fixture loads
+`@electric-sql/pglite/contrib/pgcrypto`, so the column encryption opt-in, flows on ciphertext,
+the `bytea` round trip through the WIT `blob` variant and the fail-closed restart without keys
+run there too; `pgcrypto: false` models a provider build without the extension
+(docs/configuration.md#column-encryption).
 
 ### Proof on a fresh instance
 

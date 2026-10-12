@@ -5,6 +5,7 @@ import { Readiness } from '../../../packages/core/src/bootstrap/application/read
 import { IdentityModule } from '../../../packages/core/src/composition.ts';
 import { NotificationWorker } from '../../../packages/core/src/notifications/application/security-notifications.ts';
 import { SIGNING_KEYS } from '../../../packages/core/src/shared/domain/tokens.ts';
+import { ColumnEncryption } from '../../../packages/core/src/shared/infrastructure/column-encryption.ts';
 import { Hashing } from '../../../packages/core/src/shared/infrastructure/crypto/hashing.ts';
 import type { IdentitySettings } from '../../../packages/core/src/shared/infrastructure/identity-settings.ts';
 import { ControlPlaneRouter } from '../../api/src/control-plane.ts';
@@ -82,6 +83,9 @@ async function boot(runtime: GuestRuntime): Promise<void> {
   const container = useContainer();
   container.register(BootstrapReconciler);
   container.resolve(SIGNING_KEYS);
+  // Opt in, or fail closed (503) when encryption is enabled and the keys are missing or wrong,
+  // before bootstrap writes any user row.
+  await container.resolve(ColumnEncryption).cipher();
   const reconciler = container.resolve(BootstrapReconciler);
   const fingerprint = bootstrapFingerprint(settings);
   if ((await storedValue(database, BOOTSTRAP_FINGERPRINT)) === fingerprint) {

@@ -3,9 +3,16 @@
  * Runtime secrets for the identity guest, kept in its `identity-control` Secret.
  *
  *   bun deploy/guest/runtime-secrets.ts generate --out <file> --origin <url> --smtp-host <host>
- *       [--issuer <url>] [--redirect-uris <list>]
+ *       [--issuer <url>] [--redirect-uris <list>] [--column-encryption]
  *     Writes a new values file (mode 0600): issuer and origin, an RS256 signing key, bootstrap
- *     passwords, client secrets, SMTP settings. Refuses to overwrite an existing file.
+ *     passwords, client secrets, SMTP settings, and the two column encryption keys
+ *     (IDENTITY_COLUMN_KEY, IDENTITY_BIDX_KEY). `--column-encryption` also opts in
+ *     (IDENTITY_COLUMN_ENCRYPTION=enabled). Refuses to overwrite an existing file.
+ *
+ *   bun deploy/guest/runtime-secrets.ts column-keys --values <file> [--enable]
+ *     Adds the column encryption keys to an existing values file when they are missing (an
+ *     existing key is never replaced: rows encrypted under it would become unreadable).
+ *     `--enable` also sets IDENTITY_COLUMN_ENCRYPTION=enabled. Run `apply` afterwards.
  *
  *   bun deploy/guest/runtime-secrets.ts guard --kubeconfig <path> --tenant <name> [--context <name>]
  *     Fails when di-tenant-<tenant> still has the Postgres `directory` BackingService (the
@@ -29,6 +36,7 @@ import { parseArgs } from 'node:util';
 import {
   applyRuntimeSecrets,
   assertPrivateMode,
+  COLUMN_KEY_NAMES,
   type Kubectl,
   parseRuntimeValues,
   refuseLegacyTenant,
@@ -47,6 +55,8 @@ const { positionals, values: args } = parseArgs({
     context: { type: 'string' },
     tenant: { type: 'string' },
     workload: { type: 'string', default: 'identity' },
+    'column-encryption': { type: 'boolean', default: false },
+    enable: { type: 'boolean', default: false },
   },
 });
 
@@ -57,6 +67,8 @@ function required(name: keyof typeof args): string {
 }
 
 const secret = (bytes: number) => randomBytes(bytes).toString('base64url');
+/** A column encryption key: 32 random bytes, base64. */
+const columnKey = () => randomBytes(32).toString('base64');
 
 /** RS256 private JWK with `kid` = RFC 7638 thumbprint, as the guest expects. */
 function signingJwk(): string {
@@ -124,9 +136,34 @@ function generate(): void {
     AUTH_PROVISIONER_CLIENT_SECRET: secret(36),
     SMTP_HOST: required('smtp-host'),
     SMTP_PASSWORD: secret(24),
+    IDENTITY_COLUMN_KEY: columnKey(),
+    IDENTITY_BIDX_KEY: columnKey(),
+    ...(args['column-encryption'] ? { IDENTITY_COLUMN_ENCRYPTION: 'enabled' } : {}),
   };
   writeFileSync(out, `${JSON.stringify(values, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
   console.log(`wrote ${out} (mode 0600): ${Object.keys(values).sort().join(', ')}`);
+}
+
+/** Adds missing column keys (never replacing one) and, with --enable, opts in. */
+function columnKeys(): void {
+  const path = required('values');
+  assertPrivateMode(statSync(path).mode, path);
+  // Parsed before validation, so a file that opted in without its keys can be repaired here.
+  const values = JSON.parse(readFileSync(path, 'utf8')) as Record<string, string>;
+  const added: string[] = [];
+  for (const name of COLUMN_KEY_NAMES) {
+    if (values[name]?.trim()) continue;
+    values[name] = columnKey();
+    added.push(name);
+  }
+  if (args.enable) values.IDENTITY_COLUMN_ENCRYPTION = 'enabled';
+  parseRuntimeValues(JSON.stringify(values), path);
+  writeFileSync(path, `${JSON.stringify(values, null, 2)}\n`, { mode: 0o600 });
+  console.log(
+    `updated ${path}: added ${added.length > 0 ? added.join(', ') : 'no keys'}${
+      args.enable ? '; IDENTITY_COLUMN_ENCRYPTION=enabled' : ''
+    }`,
+  );
 }
 
 try {
@@ -141,6 +178,9 @@ try {
     case 'apply':
       await apply();
       break;
+    case 'column-keys':
+      columnKeys();
+      break;
     case 'names':
       console.log(
         Object.keys(readValues(required('values')))
@@ -149,7 +189,7 @@ try {
       );
       break;
     default:
-      throw new Error('usage: runtime-secrets.ts generate|guard|apply|names [options]');
+      throw new Error('usage: runtime-secrets.ts generate|column-keys|guard|apply|names [options]');
   }
 } catch (error) {
   console.error(`runtime-secrets: ${error instanceof Error ? error.message : String(error)}`);

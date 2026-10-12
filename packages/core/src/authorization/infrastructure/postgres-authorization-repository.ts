@@ -1,5 +1,10 @@
 import { Component, Container } from '@di-framework/core/decorators';
+import {
+  type ColumnCipher,
+  ColumnEncryption,
+} from '../../shared/infrastructure/column-encryption.ts';
 import { PostgresGateway, Timestamps } from '../../shared/infrastructure/postgres-gateway.ts';
+import { Sql, sql } from '../../shared/infrastructure/sql.ts';
 import type {
   Authorization,
   AuthorizationRepository,
@@ -14,6 +19,8 @@ import type {
  * Column names are Spring Authorization Server's, but this repository is the only reader:
  * token columns hold the SHA-256 hex of the token, and `attributes`/`*_metadata` hold JSON this
  * code defines. Rows are not interchangeable with Spring's `JdbcOAuth2AuthorizationService`.
+ * `oidc_id_token_claims` is encrypted once column encryption is enabled; reads use the
+ * `oidc_claims` alias, which covers ciphertext and legacy plaintext.
  */
 interface Row {
   id: string;
@@ -36,7 +43,7 @@ interface Row {
   oidc_id_token_issued_at: unknown;
   oidc_id_token_expires_at: unknown;
   oidc_id_token_metadata: string | null;
-  oidc_id_token_claims: string | null;
+  oidc_claims: string | null;
   refresh_token_value: string | null;
   refresh_token_issued_at: unknown;
   refresh_token_expires_at: unknown;
@@ -73,16 +80,20 @@ const TOKEN_COLUMNS = [
   'oidc_id_token_expires_at',
   'oidc_id_token_metadata',
   'oidc_id_token_claims',
+  'oidc_id_token_claims_enc',
 ] as const;
 
-function tokenColumns(authorization: Authorization): unknown[] {
+const TOKEN_COLUMN_LIST = Sql.raw(TOKEN_COLUMNS.join(', '));
+
+function tokenColumns(authorization: Authorization, cipher: ColumnCipher): Sql[] {
   const token = (value: StoredToken | null) => [
     value?.hash ?? null,
     value ? new Date(value.issuedAt) : null,
     value ? new Date(value.expiresAt) : null,
     value ? JSON.stringify({ invalidated: value.invalidated }) : null,
   ];
-  return [
+  const claims = authorization.idToken ? JSON.stringify(authorization.idToken.claims) : null;
+  const values: unknown[] = [
     authorization.authorizedScopes.join(' '),
     JSON.stringify(authorization.attributes),
     authorization.state,
@@ -92,28 +103,30 @@ function tokenColumns(authorization: Authorization): unknown[] {
     authorization.access ? authorization.access.scopes.join(' ') : null,
     ...token(authorization.refresh),
     ...token(authorization.idToken),
-    authorization.idToken ? JSON.stringify(authorization.idToken.claims) : null,
   ];
+  return [...values.map((value) => sql`${value}`), cipher.plain(claims), cipher.encrypt(claims)];
+}
+
+function selectAuthorization(cipher: ColumnCipher): Sql {
+  return sql`SELECT *, ${cipher.read('oidc_id_token_claims', 'oidc_claims')} FROM oauth2_authorization`;
 }
 
 @Container()
 export class PostgresAuthorizationRepository implements AuthorizationRepository {
-  constructor(@Component(PostgresGateway) private readonly db: PostgresGateway) {}
+  constructor(
+    @Component(PostgresGateway) private readonly db: PostgresGateway,
+    @Component(ColumnEncryption) private readonly encryption: ColumnEncryption,
+  ) {}
 
-  save(authorization: Authorization): Promise<void> {
+  async save(authorization: Authorization): Promise<void> {
+    const values = tokenColumns(authorization, await this.encryption.cipher());
+    const updates = TOKEN_COLUMNS.map((column) => `${column} = EXCLUDED.${column}`).join(', ');
     return this.db.write(
-      `INSERT INTO oauth2_authorization (
-         id, registered_client_id, principal_name, authorization_grant_type, ${TOKEN_COLUMNS.join(', ')}
-       ) VALUES (?, ?, ?, ?, ${TOKEN_COLUMNS.map(() => '?').join(', ')})
-       ON CONFLICT (id) DO UPDATE SET
-         ${TOKEN_COLUMNS.map((column) => `${column} = EXCLUDED.${column}`).join(',\n         ')}`,
-      [
-        authorization.id,
-        authorization.registeredClientId,
-        authorization.principalName,
-        authorization.grantType,
-        ...tokenColumns(authorization),
-      ],
+      sql`INSERT INTO oauth2_authorization (
+         id, registered_client_id, principal_name, authorization_grant_type, ${TOKEN_COLUMN_LIST}
+       ) VALUES (${authorization.id}, ${authorization.registeredClientId},
+         ${authorization.principalName}, ${authorization.grantType}, ${Sql.join(values, ', ')})
+       ON CONFLICT (id) DO UPDATE SET ${Sql.raw(updates)}`,
     );
   }
 
@@ -125,25 +138,24 @@ export class PostgresAuthorizationRepository implements AuthorizationRepository 
   async commitGrant(authorization: Authorization, consumed: ConsumedToken): Promise<boolean> {
     const guard =
       'code' in consumed
-        ? `authorization_code_value = ?
+        ? sql`authorization_code_value = ${consumed.code}
            AND position('"invalidated":true' IN COALESCE(authorization_code_metadata, '')) = 0`
-        : 'refresh_token_value = ?';
+        : sql`refresh_token_value = ${consumed.refresh}`;
+    const values = tokenColumns(authorization, await this.encryption.cipher());
+    const assignments = TOKEN_COLUMNS.map(
+      (column, index) => sql`${Sql.raw(column)} = ${values[index]}`,
+    );
     const result = await this.db.run(
-      `UPDATE oauth2_authorization SET
-         ${TOKEN_COLUMNS.map((column) => `${column} = ?`).join(',\n         ')}
-       WHERE id = ? AND ${guard}
+      sql`UPDATE oauth2_authorization SET ${Sql.join(assignments, ', ')}
+       WHERE id = ${authorization.id} AND ${guard}
        RETURNING 1`,
-      [
-        ...tokenColumns(authorization),
-        authorization.id,
-        'code' in consumed ? consumed.code : consumed.refresh,
-      ],
     );
     return (result.changes ?? 0) > 0;
   }
 
   async findById(id: string): Promise<Authorization | undefined> {
-    const row = await this.db.one<Row>(`SELECT * FROM oauth2_authorization WHERE id = ?`, [id]);
+    const cipher = await this.encryption.cipher();
+    const row = await this.db.one<Row>(sql`${selectAuthorization(cipher)} WHERE id = ${id}`);
     return row ? this.authorization(row) : undefined;
   }
 
@@ -152,17 +164,18 @@ export class PostgresAuthorizationRepository implements AuthorizationRepository 
     hash: string,
     lock = false,
   ): Promise<Authorization | undefined> {
+    const cipher = await this.encryption.cipher();
     const row = await this.db.one<Row>(
-      `SELECT * FROM oauth2_authorization WHERE ${COLUMNS[kind]} = ?${lock ? ' FOR UPDATE' : ''}`,
-      [hash],
+      sql`${selectAuthorization(cipher)} WHERE ${Sql.raw(COLUMNS[kind])} = ${hash}${Sql.raw(
+        lock ? ' FOR UPDATE' : '',
+      )}`,
     );
     return row ? this.authorization(row) : undefined;
   }
 
   async findByState(hash: string): Promise<Authorization | undefined> {
-    const row = await this.db.one<Row>(`SELECT * FROM oauth2_authorization WHERE state = ?`, [
-      hash,
-    ]);
+    const cipher = await this.encryption.cipher();
+    const row = await this.db.one<Row>(sql`${selectAuthorization(cipher)} WHERE state = ${hash}`);
     return row ? this.authorization(row) : undefined;
   }
 
@@ -267,7 +280,7 @@ export class PostgresAuthorizationRepository implements AuthorizationRepository 
         row.refresh_token_expires_at,
         row.refresh_token_metadata,
       ),
-      idToken: idToken ? { ...idToken, claims: this.json(row.oidc_id_token_claims) } : null,
+      idToken: idToken ? { ...idToken, claims: this.json(row.oidc_claims) } : null,
     };
   }
 

@@ -418,6 +418,15 @@ const smtpHost: pulumi.Output<string> = mailpit
   ? mailpit.host
   : pulumi.output(configuredSmtpHost as string);
 
+/**
+ * Column encryption keys (docs/configuration.md#column-encryption): generated once and kept in
+ * the stack state, separate from each other and from the pglite filesystem key. Losing them makes
+ * encrypted columns unreadable. `columnEncryption: true` opts the guest in.
+ */
+const columnKey = new random.RandomBytes('identity-column-key', { length: 32 }).base64;
+const bidxKey = new random.RandomBytes('identity-bidx-key', { length: 32 }).base64;
+const columnEncryption = config.getBoolean('columnEncryption') ?? false;
+
 const runtimeValues = pulumi
   .all([
     publicOrigin,
@@ -429,20 +438,40 @@ const runtimeValues = pulumi
     clientSecrets.provisioner,
     generated('smtp-password', 32),
     smtpHost,
+    columnKey,
+    bidxKey,
   ])
-  .apply(([origin, jwk, owner, viewer, access, directory, provisioner, smtpPassword, smtp]) => ({
-    ISSUER_URL: config.get('issuerUrl') ?? origin,
-    AUTH_PUBLIC_ORIGIN: origin,
-    AUTH_ACTIVE_PRIVATE_JWK: jwk,
-    AUTH_ACCESS_REDIRECT_URIS: config.get('accessRedirectUris') ?? 'http://localhost:3000/callback',
-    AUTH_BOOTSTRAP_OWNER_PASSWORD: owner,
-    AUTH_BOOTSTRAP_VIEWER_PASSWORD: viewer,
-    AUTH_ACCESS_CLIENT_SECRET: access,
-    AUTH_DIRECTORY_CLIENT_SECRET: directory,
-    AUTH_PROVISIONER_CLIENT_SECRET: provisioner,
-    SMTP_PASSWORD: smtpPassword,
-    SMTP_HOST: smtp,
-  }));
+  .apply(
+    ([
+      origin,
+      jwk,
+      owner,
+      viewer,
+      access,
+      directory,
+      provisioner,
+      smtpPassword,
+      smtp,
+      column,
+      bidx,
+    ]) => ({
+      ISSUER_URL: config.get('issuerUrl') ?? origin,
+      AUTH_PUBLIC_ORIGIN: origin,
+      AUTH_ACTIVE_PRIVATE_JWK: jwk,
+      AUTH_ACCESS_REDIRECT_URIS:
+        config.get('accessRedirectUris') ?? 'http://localhost:3000/callback',
+      AUTH_BOOTSTRAP_OWNER_PASSWORD: owner,
+      AUTH_BOOTSTRAP_VIEWER_PASSWORD: viewer,
+      AUTH_ACCESS_CLIENT_SECRET: access,
+      AUTH_DIRECTORY_CLIENT_SECRET: directory,
+      AUTH_PROVISIONER_CLIENT_SECRET: provisioner,
+      SMTP_PASSWORD: smtpPassword,
+      SMTP_HOST: smtp,
+      IDENTITY_COLUMN_KEY: column,
+      IDENTITY_BIDX_KEY: bidx,
+      ...(columnEncryption ? { IDENTITY_COLUMN_ENCRYPTION: 'enabled' } : {}),
+    }),
+  );
 
 new RuntimeSecrets(
   'runtime-secrets',

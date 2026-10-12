@@ -1,5 +1,11 @@
 import { Component, Container } from '@di-framework/core/decorators';
+import { IdentityError } from '../../shared/domain/identity-error.ts';
+import {
+  type ColumnCipher,
+  ColumnEncryption,
+} from '../../shared/infrastructure/column-encryption.ts';
 import { PostgresGateway, Timestamps } from '../../shared/infrastructure/postgres-gateway.ts';
+import { Sql, sql } from '../../shared/infrastructure/sql.ts';
 import type {
   AccountChanges,
   DirectoryRepository,
@@ -47,11 +53,14 @@ interface MembershipRow {
   role: string;
 }
 
-const MEMBERSHIP_SELECT = `SELECT o.id::text AS organization_id, o.slug, o.name, o.archived_at,
-         u.id::text AS user_id, u.login, u.display_name, u.email, m.role
+function membershipSelect(cipher: ColumnCipher): Sql {
+  return sql`SELECT o.id::text AS organization_id, o.slug, o.name, o.archived_at,
+         u.id::text AS user_id, u.login, ${cipher.read('u.display_name', 'display_name', { enc: 'u.display_name_enc' })},
+         ${cipher.read('u.email', 'email', { enc: 'u.email_enc' })}, m.role
   FROM organization_memberships m
   JOIN organizations o ON o.id = m.organization_id
   JOIN users u ON u.id = m.user_id`;
+}
 
 interface MemberRow {
   id: string;
@@ -63,8 +72,12 @@ interface MemberRow {
   role: string;
 }
 
-const USER_COLUMNS = `id::text AS id, login, email, display_name, email_verified, status,
-  password_hash, system_role, avatar_url`;
+/** `email`, `display_name` and `avatar_url` are encrypted once column encryption is enabled. */
+function userColumns(cipher: ColumnCipher): Sql {
+  return sql`id::text AS id, login, ${cipher.read('email', 'email')},
+  ${cipher.read('display_name', 'display_name')}, email_verified, status, password_hash,
+  system_role, ${cipher.read('avatar_url', 'avatar_url')}`;
+}
 
 /**
  * Locks every owner row of membership `m`'s organization in `user_id` order, then counts them.
@@ -83,94 +96,117 @@ const ACTIVE_PLATFORM_ADMIN_COUNT = `(SELECT count(*) FROM (
     ORDER BY x.id FOR UPDATE
   ) AS active_admins)`;
 
+/**
+ * Once column encryption is enabled, `normalized_email` is written only as its blind index and
+ * email lookups match the blind index or a legacy plaintext `normalized_email`.
+ */
 @Container()
 export class PostgresDirectoryRepository implements DirectoryRepository {
-  constructor(@Component(PostgresGateway) private readonly db: PostgresGateway) {}
+  constructor(
+    @Component(PostgresGateway) private readonly db: PostgresGateway,
+    @Component(ColumnEncryption) private readonly encryption: ColumnEncryption,
+  ) {}
 
   transaction<T>(fn: () => Promise<T>): Promise<T> {
     return this.db.transaction(fn);
   }
 
   async listUsers(): Promise<UserAccount[]> {
-    const rows = await this.db.query<UserRow>(`SELECT ${USER_COLUMNS} FROM users ORDER BY id`);
+    const cipher = await this.encryption.cipher();
+    const rows = await this.db.query<UserRow>(
+      sql`SELECT ${userColumns(cipher)} FROM users ORDER BY id`,
+    );
     return rows.map((row) => this.user(row));
   }
 
   async findUser(id: string): Promise<UserAccount | undefined> {
-    const row = await this.db.one<UserRow>(`SELECT ${USER_COLUMNS} FROM users WHERE id = ?`, [id]);
+    const cipher = await this.encryption.cipher();
+    const row = await this.db.one<UserRow>(
+      sql`SELECT ${userColumns(cipher)} FROM users WHERE id = ${id}`,
+    );
     return row ? this.user(row) : undefined;
   }
 
   insertUser(user: NewUser): Promise<void> {
-    return this.db.write(
-      `INSERT INTO users (id, login, normalized_login, email, normalized_email, display_name, email_verified, status)
-       VALUES (?, ?, ?, ?, ?, ?, false, 'pending')`,
-      [
-        user.id,
-        user.login,
-        user.login.toLowerCase(),
-        user.email,
-        user.email.toLowerCase(),
-        user.displayName,
-      ],
-    );
+    return this.insertPerson({
+      id: user.id,
+      login: user.login,
+      email: user.email,
+      displayName: user.displayName,
+      passwordHash: null,
+      emailVerified: false,
+      systemRole: 'user',
+      status: 'pending',
+    });
   }
 
   async lockUser(id: string): Promise<UserAccount | undefined> {
+    const cipher = await this.encryption.cipher();
     const row = await this.db.one<UserRow>(
-      `SELECT ${USER_COLUMNS} FROM users WHERE id = ? FOR UPDATE`,
-      [id],
+      sql`SELECT ${userColumns(cipher)} FROM users WHERE id = ${id} FOR UPDATE`,
     );
     return row ? this.user(row) : undefined;
   }
 
   async findUserByEmailOrLogin(email: string, login: string): Promise<UserAccount | undefined> {
+    const cipher = await this.encryption.cipher();
+    const normalizedEmail = email.trim().toLowerCase();
     const row = await this.db.one<UserRow>(
-      `SELECT ${USER_COLUMNS} FROM users
-       WHERE normalized_email = ? OR normalized_login = ?
+      sql`SELECT ${userColumns(cipher)} FROM users
+       WHERE ${cipher.matches('normalized_email', 'normalized_email_bidx', normalizedEmail)}
+         OR normalized_login = ${login.trim().toLowerCase()}
        ORDER BY created_at, id LIMIT 1`,
-      [email.trim().toLowerCase(), login.trim().toLowerCase()],
     );
     return row ? this.user(row) : undefined;
   }
 
   async findActiveByLoginOrEmail(identifier: string): Promise<UserAccount | undefined> {
+    const cipher = await this.encryption.cipher();
     const normalized = identifier.trim().toLowerCase();
     const row = await this.db.one<UserRow>(
-      `SELECT ${USER_COLUMNS} FROM users
-       WHERE (normalized_login = ? OR normalized_email = ?) AND status = 'active'
+      sql`SELECT ${userColumns(cipher)} FROM users
+       WHERE (normalized_login = ${normalized}
+         OR ${cipher.matches('normalized_email', 'normalized_email_bidx', normalized)})
+         AND status = 'active'
        ORDER BY created_at, id LIMIT 1`,
-      [normalized, normalized],
     );
     return row ? this.user(row) : undefined;
   }
 
   async findUserByEmail(email: string): Promise<UserAccount | undefined> {
+    const cipher = await this.encryption.cipher();
     const row = await this.db.one<UserRow>(
-      `SELECT ${USER_COLUMNS} FROM users WHERE normalized_email = ?`,
-      [email.trim().toLowerCase()],
+      sql`SELECT ${userColumns(cipher)} FROM users
+       WHERE ${cipher.matches('normalized_email', 'normalized_email_bidx', email.trim().toLowerCase())}`,
     );
     return row ? this.user(row) : undefined;
   }
 
   insertAccount(account: NewAccount): Promise<void> {
-    return this.db.write(
-      `INSERT INTO users (id, login, normalized_login, email, normalized_email, password_hash,
-         display_name, email_verified, system_role, status)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        account.id,
-        account.login,
-        account.login.toLowerCase(),
-        account.email,
-        account.email?.toLowerCase() ?? null,
-        account.passwordHash,
-        account.displayName,
-        account.emailVerified,
-        account.systemRole,
-        account.status,
-      ],
+    return this.insertPerson(account);
+  }
+
+  /**
+   * Inserts a user. The email is unique by its normalized form: legacy rows through
+   * `normalized_email`, new rows through `normalized_email_bidx`, and a new row is refused (409)
+   * while a legacy row holds the same plaintext address.
+   */
+  private async insertPerson(person: NewAccount): Promise<void> {
+    const cipher = await this.encryption.cipher();
+    const normalizedEmail = person.email?.toLowerCase() ?? null;
+    const inserted = await this.db.writeCount(
+      sql`INSERT INTO users (id, login, normalized_login, email, email_enc, normalized_email,
+         normalized_email_bidx, password_hash, display_name, display_name_enc, email_verified,
+         system_role, status)
+       SELECT ${person.id}::uuid, ${person.login}::varchar, ${person.login.toLowerCase()}::varchar,
+         ${cipher.plain(person.email)}::varchar, ${cipher.encrypt(person.email)}::bytea,
+         ${cipher.plain(normalizedEmail)}::varchar, ${cipher.blindIndex(normalizedEmail)}::bytea,
+         ${person.passwordHash}::varchar, ${cipher.plain(person.displayName)}::varchar,
+         ${cipher.encrypt(person.displayName)}::bytea, ${person.emailVerified}::boolean,
+         ${person.systemRole}::varchar, ${person.status}::varchar
+       WHERE NOT EXISTS (SELECT 1 FROM users WHERE normalized_email = ${normalizedEmail})`,
     );
+    if (inserted === 0) throw new IdentityError(409, 'Conflict');
   }
 
   async updateAccount(id: string, changes: AccountChanges): Promise<void> {
@@ -193,11 +229,13 @@ export class PostgresDirectoryRepository implements DirectoryRepository {
     ]);
   }
 
-  updateDisplayName(id: string, displayName: string): Promise<void> {
-    return this.db.write(`UPDATE users SET display_name = ?, updated_at = now() WHERE id = ?`, [
-      displayName,
-      id,
-    ]);
+  async updateDisplayName(id: string, displayName: string): Promise<void> {
+    const cipher = await this.encryption.cipher();
+    return this.db.write(
+      sql`UPDATE users SET display_name = ${cipher.plain(displayName)},
+         display_name_enc = ${cipher.encrypt(displayName)}, updated_at = now()
+       WHERE id = ${id}`,
+    );
   }
 
   archiveUser(id: string): Promise<void> {
@@ -330,22 +368,19 @@ export class PostgresDirectoryRepository implements DirectoryRepository {
     afterId: string | undefined,
     limit: number,
   ): Promise<DirectoryMember[]> {
-    const params: unknown[] = [slug];
-    let cursor = '';
-    if (afterId) {
-      cursor = ' AND u.id > ?';
-      params.push(afterId);
-    }
-    params.push(limit);
+    const cipher = await this.encryption.cipher();
+    const cursor = afterId ? sql` AND u.id > ${afterId}` : Sql.raw('');
     const rows = await this.db.query<MemberRow>(
-      `SELECT u.id::text AS id, u.login, u.display_name, u.avatar_url, u.email, u.email_verified, m.role
+      sql`SELECT u.id::text AS id, u.login,
+         ${cipher.read('u.display_name', 'display_name', { enc: 'u.display_name_enc' })},
+         ${cipher.read('u.avatar_url', 'avatar_url', { enc: 'u.avatar_url_enc' })},
+         ${cipher.read('u.email', 'email', { enc: 'u.email_enc' })}, u.email_verified, m.role
        FROM organization_memberships m
        JOIN organizations o ON o.id = m.organization_id
        JOIN users u ON u.id = m.user_id
-       WHERE o.slug = ?${cursor}
+       WHERE o.slug = ${slug}${cursor}
        ORDER BY u.id
-       LIMIT ?`,
-      params,
+       LIMIT ${limit}`,
     );
     return rows.map((row) => this.member(row));
   }
@@ -379,23 +414,23 @@ export class PostgresDirectoryRepository implements DirectoryRepository {
 
   async membershipsForUser(userId: string): Promise<MembershipDetail[]> {
     const rows = await this.db.query<MembershipRow>(
-      `${MEMBERSHIP_SELECT} WHERE m.user_id = ? ORDER BY o.slug`,
-      [userId],
+      sql`${membershipSelect(await this.encryption.cipher())} WHERE m.user_id = ${userId}
+       ORDER BY o.slug`,
     );
     return rows.map((row) => this.membership(row));
   }
 
   async membershipsForOrganization(slug: string): Promise<MembershipDetail[]> {
     const rows = await this.db.query<MembershipRow>(
-      `${MEMBERSHIP_SELECT} WHERE o.slug = ? ORDER BY u.login`,
-      [slug],
+      sql`${membershipSelect(await this.encryption.cipher())} WHERE o.slug = ${slug}
+       ORDER BY u.login`,
     );
     return rows.map((row) => this.membership(row));
   }
 
   async allMemberships(): Promise<MembershipDetail[]> {
     const rows = await this.db.query<MembershipRow>(
-      `${MEMBERSHIP_SELECT} ORDER BY o.slug, u.login`,
+      sql`${membershipSelect(await this.encryption.cipher())} ORDER BY o.slug, u.login`,
     );
     return rows.map((row) => this.membership(row));
   }

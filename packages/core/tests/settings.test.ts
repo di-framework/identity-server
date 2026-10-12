@@ -227,3 +227,38 @@ test('the notification worker starts only when the scheduler is enabled', async 
     }
   });
 });
+
+test('column encryption: an explicit switch and two 32-byte keys, never echoed', () => {
+  const key = Buffer.alloc(32, 7).toString('base64');
+  const other = Buffer.alloc(32, 9).toString('base64url');
+  expect(loadIdentitySettings({}).encryption).toEqual({
+    columns: false,
+    columnKey: '',
+    bidxKey: '',
+  });
+  expect(
+    loadIdentitySettings({
+      IDENTITY_COLUMN_ENCRYPTION: ' enabled ',
+      IDENTITY_COLUMN_KEY: key,
+      IDENTITY_BIDX_KEY: other,
+    }).encryption,
+  ).toEqual({ columns: true, columnKey: key, bidxKey: other });
+  expect(loadIdentitySettings({ IDENTITY_COLUMN_ENCRYPTION: 'disabled' }).encryption.columns).toBe(
+    false,
+  );
+  expect(() => loadIdentitySettings({ IDENTITY_COLUMN_ENCRYPTION: 'yes' })).toThrow(
+    'IDENTITY_COLUMN_ENCRYPTION must be enabled or disabled',
+  );
+  for (const bad of ['short', 'not base64 at all!', Buffer.alloc(16).toString('base64')]) {
+    const error = (() => {
+      try {
+        loadIdentitySettings({ IDENTITY_BIDX_KEY: bad });
+      } catch (caught) {
+        return caught as Error;
+      }
+    })();
+    expect(error?.message).toBe(
+      'IDENTITY_BIDX_KEY must be at least 32 random bytes, base64 encoded',
+    );
+  }
+});

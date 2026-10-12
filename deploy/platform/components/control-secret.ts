@@ -41,7 +41,12 @@ export const RUNTIME_SECRET_NAMES: readonly string[] = [
   'AUTH_PROVISIONER_CLIENT_SECRET',
   'AUTH_CLI_CLIENT_ID',
   'AUTH_CLI_REDIRECT_URIS',
+  'IDENTITY_COLUMN_ENCRYPTION',
+  'IDENTITY_COLUMN_KEY',
+  'IDENTITY_BIDX_KEY',
 ];
+/** Column encryption keys: 32 random bytes each, base64; separate from each other. */
+export const COLUMN_KEY_NAMES: readonly string[] = ['IDENTITY_COLUMN_KEY', 'IDENTITY_BIDX_KEY'];
 export const REQUIRED_RUNTIME_SECRETS: readonly string[] = [
   'ISSUER_URL',
   'AUTH_PUBLIC_ORIGIN',
@@ -75,7 +80,35 @@ export function parseRuntimeValues(text: string, source: string): Record<string,
   const values = parsed as Record<string, string>;
   const missing = REQUIRED_RUNTIME_SECRETS.filter((name) => !values[name]?.trim());
   if (missing.length > 0) throw new Error(`missing required names: ${missing.join(', ')}`);
+  assertColumnEncryption(values, source);
   return values;
+}
+
+/**
+ * Column encryption values: each key decodes to at least 32 bytes, the two keys differ, and
+ * `IDENTITY_COLUMN_ENCRYPTION=enabled` comes with both keys (the guest would answer 503 without
+ * them). Errors name the setting, never its value.
+ */
+export function assertColumnEncryption(values: Record<string, string>, source: string): void {
+  const flag = values.IDENTITY_COLUMN_ENCRYPTION?.trim() ?? '';
+  if (flag !== '' && flag !== 'enabled' && flag !== 'disabled') {
+    throw new Error(`IDENTITY_COLUMN_ENCRYPTION in ${source} must be enabled or disabled`);
+  }
+  for (const name of COLUMN_KEY_NAMES) {
+    const key = values[name]?.trim();
+    if (key && (!/^[A-Za-z0-9+/_-]+={0,2}$/.test(key) || Buffer.from(key, 'base64').length < 32)) {
+      throw new Error(`${name} in ${source} must be at least 32 random bytes, base64 encoded`);
+    }
+  }
+  const [column, bidx] = COLUMN_KEY_NAMES.map((name) => values[name]?.trim() ?? '');
+  if (column && column === bidx) {
+    throw new Error(`IDENTITY_COLUMN_KEY and IDENTITY_BIDX_KEY in ${source} must differ`);
+  }
+  if (flag === 'enabled' && (!column || !bidx)) {
+    throw new Error(
+      `IDENTITY_COLUMN_ENCRYPTION=enabled in ${source} needs IDENTITY_COLUMN_KEY and IDENTITY_BIDX_KEY`,
+    );
+  }
 }
 
 /** A values file must be readable by its owner only (mode 0600 or stricter). */

@@ -137,6 +137,7 @@ a stack that still runs the Postgres guest. `tenant` is required too and has no 
 | `issuerUrl` | `publicOrigin` | OIDC issuer |
 | `accessRedirectUris` | `http://localhost:3000/callback` | Access client redirect URIs |
 | `smtpHost` | in-cluster Mailpit | External mail relay host; skips Mailpit and its egress grant |
+| `columnEncryption` | `false` | `true` sets `IDENTITY_COLUMN_ENCRYPTION=enabled` in `identity-control`. The column and blind-index keys are always generated (`random.RandomBytes`, 32 bytes) and kept in stack state; losing the state loses encrypted data. Needs a pglite provider with pgcrypto (docs/configuration.md#column-encryption) |
 | `mailpitClusterIP` | `10.43.250.25` | Mailpit's fixed ClusterIP; must sit in the cluster's Service range |
 | `workloadForwardPort` | `25181` | Loopback port for reaching the workload through `di-http` |
 

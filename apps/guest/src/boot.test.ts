@@ -435,3 +435,102 @@ test('transactions serialize on the single pglite connection instead of blocking
     await fixture.shutdown();
   }
 });
+
+const COLUMN_KEY = Buffer.alloc(32, 3).toString('base64');
+const BIDX_KEY = Buffer.alloc(32, 4).toString('base64');
+const encryptionOn: Array<[string, string]> = [
+  ['IDENTITY_COLUMN_ENCRYPTION', 'enabled'],
+  ['IDENTITY_COLUMN_KEY', COLUMN_KEY],
+  ['IDENTITY_BIDX_KEY', BIDX_KEY],
+];
+
+test('column encryption on pglite with pgcrypto: opt in, flows on ciphertext, fail closed', async () => {
+  await withContainer(async () => {
+    const fixture = pgliteFixture();
+    const database = pgliteDatabase(fixture.module, () => ({
+      [DATABASE_ROOT_ENV]: '/data/encrypted',
+    }));
+    const db = await database();
+    try {
+      freshRealm();
+      const serve = (request: Request) =>
+        handle(request, runtimeFor(database, guestConfig(false, undefined, encryptionOn)));
+      const report = await identityFlows(flowInputs(serve, 'enc'));
+      expect(report.organization).toMatchObject({ created: 201, duplicate: 409, read: 200 });
+      expect(report.login).toMatchObject({ signIn: 303, consent: 303, token: 200, userinfo: 200 });
+      expect(
+        await db.first<Record<string, unknown>>('SELECT enabled FROM identity_column_encryption'),
+      ).toEqual({ enabled: true });
+
+      // The bootstrap owner was written after the opt-in: ciphertext only, as a WIT blob.
+      const owner = await db.first<Record<string, unknown>>(
+        `SELECT email, normalized_email, display_name, email_enc, normalized_email_bidx
+         FROM users WHERE login = 'owner'`,
+      );
+      expect(owner).toMatchObject({ email: null, normalized_email: null, display_name: null });
+      expect(owner?.email_enc).toBeInstanceOf(Uint8Array);
+      expect(owner?.normalized_email_bidx).toBeInstanceOf(Uint8Array);
+      // bytea round trip through the adapter: the blob goes back as a parameter and decrypts.
+      expect(
+        await db.first<Record<string, unknown>>(
+          'SELECT pgp_sym_decrypt(?::bytea, ?::text) AS email',
+          [owner?.email_enc, COLUMN_KEY],
+        ),
+      ).toEqual({ email: 'owner@identity.local' });
+      for (const [table, plain, enc] of [
+        ['browser_sessions', 'attributes', 'attributes_enc'],
+        ['auth_audit_records', 'after_metadata', 'after_metadata_enc'],
+        ['oauth2_authorization', 'oidc_id_token_claims', 'oidc_id_token_claims_enc'],
+      ] as const) {
+        const counts = await db.first<{ plain: unknown; enc: unknown }>(
+          `SELECT count(${plain})::int AS plain, count(${enc})::int AS enc FROM ${table}`,
+        );
+        expect([table, Number(counts?.plain), Number(counts?.enc) > 0]).toEqual([table, 0, true]);
+      }
+
+      // A restart without the keys answers 503 and names the missing settings only.
+      freshRealm();
+      const locked = await handle(
+        new Request('https://identity.test/health'),
+        runtimeFor(database, guestConfig(false)),
+      );
+      expect(locked.status).toBe(503);
+      const body = (await locked.json()) as { error: string };
+      expect(body.error).toBe(
+        'column encryption is enabled but IDENTITY_COLUMN_KEY and IDENTITY_BIDX_KEY are not set',
+      );
+    } finally {
+      await fixture.shutdown();
+      await restoreContainer();
+    }
+  });
+}, 120_000);
+
+test('a provider without pgcrypto runs unencrypted and refuses the opt-in', async () => {
+  await withContainer(async () => {
+    const fixture = pgliteFixture(undefined, { pgcrypto: false });
+    const database = pgliteDatabase(fixture.module, () => ({
+      [DATABASE_ROOT_ENV]: '/data/no-pgcrypto',
+    }));
+    try {
+      freshRealm();
+      const plain = await handle(
+        new Request('https://identity.test/ready'),
+        runtimeFor(database, guestConfig(false)),
+      );
+      expect(plain.status).toBe(200);
+      freshRealm();
+      const refused = await handle(
+        new Request('https://identity.test/ready'),
+        runtimeFor(database, guestConfig(false, undefined, encryptionOn)),
+      );
+      expect(refused.status).toBe(503);
+      expect(((await refused.json()) as { error: string }).error).toContain(
+        'needs the pgcrypto extension',
+      );
+    } finally {
+      await fixture.shutdown();
+      await restoreContainer();
+    }
+  });
+}, 120_000);

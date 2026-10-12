@@ -1,3 +1,4 @@
+import { IdentityError } from '../../../packages/core/src/shared/domain/identity-error.ts';
 import { controlPlane } from '../../api/src/control-plane.ts';
 import { handle } from '../../client/src/server/handler.ts';
 
@@ -13,9 +14,17 @@ export async function routeRequest(
   shell?: string,
 ): Promise<Response> {
   const { pathname } = new URL(request.url);
-  if (controlPlane.handles(pathname)) return controlPlane.fetch(request);
   if (pathname.startsWith('/assets/')) return asset(pathname.slice('/assets/'.length), assets);
-  return handle(request, undefined, shell);
+  try {
+    if (controlPlane.handles(pathname)) return await controlPlane.fetch(request);
+    return await handle(request, undefined, shell);
+  } catch (error) {
+    // Column encryption is enabled but unusable here: fail closed, naming no key or value.
+    if (error instanceof IdentityError && error.status === 503) {
+      return Response.json({ ok: false, error: error.message }, { status: 503 });
+    }
+    throw error;
+  }
 }
 
 async function asset(name: string, assets: AssetSource): Promise<Response> {

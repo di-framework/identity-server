@@ -30,6 +30,8 @@ the plain name.
 | `AUTH_IDENTITY_LINK_CLIENT_ID` | `gsio-auth-client` | Default client id at external identity providers. |
 | `IDENTITY_IDENTITY_LINK__PROVIDERS` | `{}` | JSON map of allowlisted providers: `{"acme":{"issuer","authorizationEndpoint","tokenEndpoint","jwksUri","clientId","clientSecret","scopes","freshAuthenticationParameter"}}`. `google`, `github`, `gitlab`, and `okta` have built-in endpoints. |
 | `GSIO_IDENTITY_NOTIFICATION_DELAY_MS` | `5000` | Security-notification worker delay. `GSIO_IDENTITY_NOTIFICATION_SCHEDULER_ENABLED=false` turns it off. |
+| `IDENTITY_COLUMN_ENCRYPTION` | `disabled` | `enabled` opts in to pgcrypto column encryption (see [Column encryption](#column-encryption)). Any other value fails startup. |
+| `IDENTITY_COLUMN_KEY`, `IDENTITY_BIDX_KEY` | empty | Column encryption key and blind-index key: 32 random bytes each, base64, different from each other. Required once encryption is enabled. |
 
 Generate a signing key with:
 
@@ -40,10 +42,92 @@ bun scripts/generate-jwk.ts ML-DSA-65  # only after relying parties accept ML-DS
 
 ## Startup
 
-`apps/server` connects Postgres, applies the migrations, validates the signing keys, reconciles the
+`apps/server` connects Postgres, applies the migrations, validates the signing keys, loads the
+column encryption state (enabling it when opted in), reconciles the
 bootstrap owner, organization, and the three clients, starts the notification worker, then
 listens. Any failure exits the process before it accepts traffic. Bootstrap is safe on every start:
 it creates what is missing, re-hashes the client secrets, and never renames the organization.
+
+## Column encryption
+
+Optional at-rest encryption of PII and secrets with pgcrypto, for **new writes only**
+(identity-server#56, di-framework/platform#138).
+
+| Column | Protection |
+| --- | --- |
+| `users.email`, `users.display_name`, `users.avatar_url` | `pgp_sym_encrypt` into `<column>_enc` |
+| `users.normalized_email` | HMAC-SHA256 blind index `normalized_email_bidx` (UNIQUE); the three email lookups use it. The address itself is in `email_enc`. |
+| `email_challenges.email` | encrypted, plus `email_bidx` of the trimmed lower-cased address for the issuance rate limit (index on `email_bidx, purpose, created_at`) |
+| `identity_links.subject` | encrypted, plus `subject_bidx` (`UNIQUE (issuer, subject_bidx)`); the three subject lookups use it |
+| `identity_links.provider_email`, `identity_link_flows.nonce`, `identity_link_flows.code_verifier`, `identity_unlink_confirmations.subject`, `identity_security_notifications.recipient_email`, `oauth2_authorization.oidc_id_token_claims`, `browser_sessions.attributes`, `auth_audit_records.before_metadata`, `auth_audit_records.after_metadata` | encrypted |
+
+Logins (`login`, `normalized_login`) stay plaintext. Token, secret and password columns already
+hold SHA-256 or Argon2id hashes and are unchanged.
+
+**Opting in.** `V18__column_encryption.sql` always runs. It creates the pgcrypto extension (or, on
+an engine without it, logs a notice and carries on), adds the nullable `_enc` and `_bidx`
+columns and indexes, and adds the one-row `identity_column_encryption` table with
+`enabled = false`. Nothing is encrypted yet. To opt in, put both keys and
+`IDENTITY_COLUMN_ENCRYPTION=enabled` in the settings (for the guest, in `identity-control`;
+see below) and restart. At startup (`IdentityModule.prepare`, or the guest's boot before
+bootstrap) the service runs `CREATE EXTENSION IF NOT EXISTS pgcrypto`, then sets
+`enabled = true` and records an HMAC check value for each key, never the keys. Enabling is
+one-way. After that `IDENTITY_COLUMN_ENCRYPTION` no longer matters, because the database state
+decides.
+
+**Once enabled, it fails closed.**
+- Startup needs both keys, and they must match the recorded checks. A missing or different key
+  stops the Bun server at startup, and the guest answers every request with 503 and the names of
+  the missing settings. A request that reaches an unusable cipher also answers 503. Nothing falls
+  back to plaintext.
+- In the database, the `identity_reject_plaintext` trigger refuses (SQLSTATE `IDC01`, which the
+  service maps to 503) any INSERT or UPDATE that writes a new non-NULL value to a protected
+  plaintext column. This covers an instance that loaded the disabled state before another
+  instance enabled encryption. Give every instance the keys before any instance opts in.
+- An engine without pgcrypto cannot be enabled: startup fails with
+  `column encryption needs the pgcrypto extension`. The pglite provider gets pgcrypto in a
+  separate di-framework/platform change. Until that ships, the guest runs unencrypted and should
+  not be opted in.
+
+**Existing rows are not rewritten.** Rows written before the opt-in keep their plaintext. Reads
+return `coalesce(pgp_sym_decrypt(<column>_enc, key), <column>)`. Lookups match the blind index
+or the legacy plaintext column. A new user or link is refused (409) while a legacy row has the
+same normalized email or `(issuer, subject)`, so uniqueness holds across both kinds of row. When
+a legacy row is updated, only the columns that the update writes are encrypted; for example, a
+display name change encrypts the display name but leaves the legacy email plaintext. **Legacy
+plaintext stays in the table until a later re-encrypt (backfill) pass, which is a follow-up. It
+also stays in WAL, dead tuples (until VACUUM) and every backup taken before then.** Treat
+backups from before the opt-in as holding plaintext PII.
+
+**Statements.** A key is always a bound statement parameter (`pgp_sym_encrypt(?::text, ?::text,
+'cipher-algo=aes256, s2k-mode=1')`, `hmac(?::text, ?::text, 'sha256')`) and never part of SQL
+text, logs or error messages. Statements are composed with the `sql` tag
+(`packages/core/src/shared/infrastructure/sql.ts`), which only ever turns values into `?`
+bindings. `packages/core/tests/column-encryption.test.ts` records every statement and asserts
+this.
+
+### Key custody
+
+- `IDENTITY_COLUMN_KEY` (encryption) and `IDENTITY_BIDX_KEY` (blind index) are two independent
+  32-byte random values, base64 encoded. They are separate from each other and from the pglite
+  filesystem key `DI_PGLITE_KEY`, so a leak of one does not expose the others.
+- They live only in the runtime settings: `identity-control` for the guest, the stack's secret
+  state for `deploy/platform` (`random.RandomBytes`), and the process environment for the Bun
+  server. They are never stored in the database or written to logs.
+- **Losing `IDENTITY_COLUMN_KEY` makes every encrypted column unreadable, and losing
+  `IDENTITY_BIDX_KEY` breaks every lookup by email or subject.** Back both up with the same care
+  as the database backups, but store them separately from those backups.
+- Key rotation is not supported yet. Re-encrypting under a new key is the same follow-up pass as
+  the backfill. `runtime-secrets.ts column-keys` never replaces an existing key.
+- Generating keys: `bun deploy/guest/runtime-secrets.ts generate ... [--column-encryption]`
+  writes both keys into a new values file. For an existing file, run
+  `bun deploy/guest/runtime-secrets.ts column-keys --values <file> [--enable]`, which adds any
+  missing key and with `--enable` sets the switch, then `apply`. `apply` refuses a values file
+  that enables encryption without both keys, with malformed keys, or with two equal keys. With
+  Pulumi, set `columnEncryption: true` in the stack config. The keys are generated either way.
+- The new control-Secret keys are `IDENTITY_COLUMN_ENCRYPTION`, `IDENTITY_COLUMN_KEY` and
+  `IDENTITY_BIDX_KEY`. The cli-extensions control-secret key declaration must list them too
+  (coordinated with that change).
 
 ## Endpoints
 
@@ -89,8 +173,10 @@ places and never from its database:
   `AUTH_PREVIOUS_PUBLIC_JWK_SET`, `SMTP_HOST`, `SMTP_USERNAME`, `SMTP_PASSWORD`,
   `AUTH_ACCESS_REDIRECT_URIS`, `AUTH_BOOTSTRAP_OWNER_PASSWORD`, `AUTH_BOOTSTRAP_VIEWER_PASSWORD`,
   `AUTH_ACCESS_CLIENT_SECRET`, `AUTH_DIRECTORY_CLIENT_SECRET`, `AUTH_PROVISIONER_CLIENT_SECRET`,
-  `AUTH_CLI_CLIENT_ID`, `AUTH_CLI_REDIRECT_URIS` (`RUNTIME_SECRET_SETTINGS` in
-  `apps/guest/src/settings.ts`). An environment value wins over wasi:config.
+  `AUTH_CLI_CLIENT_ID`, `AUTH_CLI_REDIRECT_URIS`, and for [column encryption](#column-encryption)
+  `IDENTITY_COLUMN_ENCRYPTION`, `IDENTITY_COLUMN_KEY`, `IDENTITY_BIDX_KEY`
+  (`RUNTIME_SECRET_SETTINGS` in `apps/guest/src/settings.ts`). An environment value wins over
+  wasi:config.
 
 wasi:config cannot carry secrets or URLs (the platform rejects them), and tenant admission lets a
 workload without an environment label reference only its `<workload>-control` Secret, which
