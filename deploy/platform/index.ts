@@ -11,35 +11,35 @@
  *                     registry's NodePort. Otherwise the host runs the published GHCR image.
  *   DeploymentPatch   stop-then-start rollouts for the tenant host, and a roll whenever a
  *                     published local image's digest changes.
- *   BackingService    `directory`, the tenant's Postgres, which the platform controller
- *                     provisions; the workload binds to it by name.
- *   CliWorkload       the identity component: `di-framework platform deploy` when its
- *                     sources change, `di-framework platform destroy` on delete.
+ *   CliWorkload       the identity component, with the pglite provider composed in from GHCR
+ *                     (apps/guest/di-framework.config.json): `di-framework platform deploy`
+ *                     when its sources change, `di-framework platform destroy` on delete. Its
+ *                     database lives in the workload's persistent /data directory on the host.
  *   Mailpit           the tenant's SMTP relay in di-tenant-identity, with a platform egress
  *                     grant that lets the guest dial it; skipped when `smtpHost` is set.
- *   RuntimeSecrets    the guest's `identity_runtime_secret` rows: issuer, origin, RS256
- *                     signing key (@pulumi/tls), and passwords and client secrets
- *                     (@pulumi/random). A change rolls the tenant host so the guest reloads.
+ *   RuntimeSecrets    the guest's runtime secrets in its `identity-control` Secret: issuer,
+ *                     origin, RS256 signing key (@pulumi/tls), passwords and client secrets
+ *                     (@pulumi/random), SMTP. Rewritten after every deploy (the CLI resets that
+ *                     Secret), then the workload rolls onto them.
  *
  * `pulumi up` builds the environment; `pulumi destroy` removes it in reverse order.
  *
- * Stack config, all optional:
+ * Stack config. `database` is required and must be `pglite`; everything else is optional:
+ *   database               `pglite`, the explicit opt-in checked below (required)
  *   kubeVersion            kube release tag, or `latest` (default: latest)
  *   kubeBinary             local di-framework-kube build instead of a release
  *   kubeInstance           kube instance name (default: identity)
  *   kubeStateDir           kube --state-dir (default: kube's per-user directory)
  *   kubeconfig, context    install onto this existing cluster instead of Kubesolo
  *   httpPort               loopback gateway port of a new Kubesolo container (default: 28180)
- *   platformPackage        exact @di-framework/platform package (default: @di-framework/platform@6.0.5)
+ *   platformPackage        exact @di-framework/platform package (default: @di-framework/platform@6.0.11)
  *   values                 list of administrator Helm values documents
  *   purgeClusterOnDestroy  delete the Kubesolo cluster and its data on destroy (default: false)
  *   registry               { push, pull } of an external registry; skips the in-cluster one
  *   registryForwardPort    loopback port for pushes to the in-cluster registry (default: 25180)
  *   registryStorageClass   StorageClass for the in-cluster registry (default: cluster default)
- *   databaseDeletionPolicy `Retain` keeps the directory database's data when the stack is
- *                          destroyed; `Delete` removes it (default: Retain)
- *   tenantHostImage        tenant host image the nodes pull
- *                          (default: ghcr.io/di-framework/wash:2.8.0-wasi-tls, pinned by digest)
+ *   tenantHostImage        tenant host image the nodes pull (default:
+ *                          ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive, pinned by digest)
  *   tenantHostLocalImage   local engine image to publish and run as the tenant host instead,
  *                          such as localhost/di-framework/wash:2.8.0-wasi-tls
  *   registryNodePort       NodePort the node pulls the published host image through (default: 30500)
@@ -72,8 +72,6 @@ const APPLICATION = 'identity';
 /** Target in di-framework.deploy.toml, and the tenant declared in platform.json. */
 const TARGET = 'identity';
 const TENANT = 'identity';
-/** Postgres BackingService the guest binds to (`serviceName` in apps/guest/src/bindings.ts). */
-const DATABASE = 'directory';
 
 interface ExternalRegistry {
   push: string;
@@ -83,6 +81,20 @@ interface ExternalRegistry {
 const config = new pulumi.Config();
 const workspaceRoot = resolve(__dirname, '../..');
 
+/**
+ * Earlier versions of this program ran the guest on a Postgres BackingService (`directory`). An
+ * update of such a stack with this version deletes that BackingService and starts the guest on an
+ * empty pglite database, which is the authproto cutover and needs its own sign-off
+ * (docs/guest-http-api.md#authproto-cutover). Every stack therefore opts in explicitly.
+ */
+if (config.get('database') !== 'pglite') {
+  throw new Error(
+    'this program deploys identity on pglite; run `pulumi config set database pglite` for a new ' +
+      'stack. A stack that still has the Postgres `directory` BackingService must not be updated ' +
+      'before the cutover in docs/guest-http-api.md#authproto-cutover.',
+  );
+}
+
 const externalRegistry = config.getObject<ExternalRegistry>('registry');
 if (externalRegistry !== undefined && (!externalRegistry.push || !externalRegistry.pull)) {
   throw new Error('registry must set both push and pull');
@@ -91,12 +103,14 @@ const registryForwardPort =
   config.getNumber('registryForwardPort', { min: 1024, max: 65535 }) ?? 25180;
 
 /**
- * The tenant host must provide wasi:tls, which the stock wash image does not. The platform
- * repo publishes its `platform/tenant-host` build (wash 2.8.0 with `--features wasi-tls`) to
- * GHCR for amd64 and arm64; the host runs it pinned by digest.
+ * The tenant host must provide wasi:tls, which the stock wash image does not, and must keep the
+ * guest's pglite database to one component instance (the exclusive-instance pool policy,
+ * di-framework/platform#136). The platform repo publishes that `platform/tenant-host` build
+ * (wash 2.8.0, `--features wasi-tls`, patches 0001 exclusive-instance and 0002 insecure-registry
+ * allowlist) to GHCR for amd64 and arm64; the host runs it pinned by digest.
  */
 const PUBLISHED_HOST_IMAGE =
-  'ghcr.io/di-framework/wash:2.8.0-wasi-tls@sha256:ee89fd4bce4f9f35f4cd09c63d3cbdd07bea3071b5d372f82c9f49b9741c3669';
+  'ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:0ee414e9db4b0d4fc923eb477f1b1afd20f707b8ab3e552957575ff4f8e6a528';
 
 /**
  * To run an unpublished host build, `tenantHostLocalImage` names it in the local engine. It
@@ -143,7 +157,7 @@ const kube = new KubeInstance('kube', {
   existingKubeconfig: config.get('kubeconfig'),
   existingContext: config.get('context'),
   httpPort: config.getNumber('httpPort', { min: 1024, max: 65535 }) ?? 28180,
-  platformPackage: config.get('platformPackage') ?? '@di-framework/platform@6.0.5',
+  platformPackage: config.get('platformPackage') ?? '@di-framework/platform@6.0.11',
   platformConfig: {
     ...JSON.parse(readFileSync(join(__dirname, 'platform.json'), 'utf8')),
     tenantHostImage,
@@ -234,8 +248,9 @@ if (localHostImage && hostRepository && inCluster && registryForward) {
  * A server-side-apply patch of fields the platform controller leaves alone on the tenant host
  * Deployment. Tenant host pods run under a ResourceQuota with no room for a second host, so
  * the default start-then-stop rolling update never finishes; this one stops first, for every
- * roll (an image change, new runtime secrets). With a published local image it also rolls the
- * host whenever that image's digest changes, since its tag is mutable.
+ * roll. Stopping first also keeps two hosts from opening the pglite database at once. With a
+ * published local image it also rolls the host whenever that image's digest changes, since its
+ * tag is mutable.
  */
 const hostRollout = new k8s.apps.v1.DeploymentPatch(
   'tenant-host-rollout',
@@ -257,34 +272,6 @@ const hostRollout = new k8s.apps.v1.DeploymentPatch(
   { provider, dependsOn: hostImage ? [hostImage] : [] },
 );
 
-const databaseDeletionPolicy = config.get('databaseDeletionPolicy') ?? 'Retain';
-if (databaseDeletionPolicy !== 'Retain' && databaseDeletionPolicy !== 'Delete') {
-  throw new Error('databaseDeletionPolicy must be Retain or Delete');
-}
-
-const database = new k8s.apiextensions.CustomResource(
-  DATABASE,
-  {
-    apiVersion: 'platform.di-framework.dev/v1alpha1',
-    kind: 'BackingService',
-    metadata: {
-      name: DATABASE,
-      namespace: `di-tenant-${TENANT}`,
-      annotations: {
-        // Wait for the platform controller to provision Postgres before deploying.
-        'pulumi.com/waitFor': 'condition=Ready',
-        'pulumi.com/timeoutSeconds': '600',
-      },
-    },
-    spec: {
-      type: 'postgres',
-      className: 'postgres-dedicated',
-      deletionPolicy: databaseDeletionPolicy,
-    },
-  },
-  { provider },
-);
-
 const localCli = join(workspaceRoot, 'node_modules', '.bin', 'di-framework');
 
 const identity = new CliWorkload(
@@ -298,6 +285,7 @@ const identity = new CliWorkload(
     environment: {
       IDENTITY_KUBECONFIG: kube.kubeconfig,
       IDENTITY_KUBE_CONTEXT: context,
+      IDENTITY_TENANT: TENANT,
       IDENTITY_REGISTRY_PUSH: registryPush,
       IDENTITY_REGISTRY_PULL: registryPull,
     },
@@ -314,7 +302,7 @@ const identity = new CliWorkload(
     ]),
   },
   {
-    dependsOn: [database, ...(inCluster ? [inCluster] : []), hostRollout],
+    dependsOn: [...(inCluster ? [inCluster] : []), hostRollout],
   },
 );
 
@@ -390,44 +378,20 @@ const runtimeValues = pulumi
     SMTP_HOST: smtp,
   }));
 
-const runtimeSecrets = new RuntimeSecrets(
+new RuntimeSecrets(
   'runtime-secrets',
   {
     kubeconfig: kube.kubeconfig,
     context,
+    tenantNamespace: `di-tenant-${TENANT}`,
     runtimeNamespace: `di-runtime-${TENANT}`,
-    service: DATABASE,
+    workload: APPLICATION,
     workloadHost: APPLICATION,
     localPort: config.getNumber('workloadForwardPort', { min: 1024, max: 65535 }) ?? 25181,
+    deployment: identity.deployedAt,
     values: runtimeValues,
   },
   { dependsOn: [identity] },
-);
-
-/**
- * A running guest keeps the settings it booted with, so a changed value rolls the tenant host
- * and the guest boots again. The annotation is a digest, never the values.
- */
-new k8s.apps.v1.DeploymentPatch(
-  'tenant-host-secrets',
-  {
-    metadata: { name: `hostgroup-tenant-${TENANT}`, namespace: `di-runtime-${TENANT}` },
-    spec: {
-      strategy: { type: 'RollingUpdate', rollingUpdate: { maxSurge: 0, maxUnavailable: 1 } },
-      template: {
-        metadata: {
-          annotations: {
-            'identity.di-framework.dev/runtime-secrets': pulumi.unsecret(
-              runtimeValues.apply((values) =>
-                createHash('sha256').update(JSON.stringify(values)).digest('hex'),
-              ),
-            ),
-          },
-        },
-      },
-    },
-  },
-  { provider, dependsOn: [runtimeSecrets] },
 );
 
 export const kubeconfig = kube.kubeconfig;

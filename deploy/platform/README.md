@@ -5,6 +5,7 @@ One Pulumi program builds identity on wasmCloud end to end:
 ```sh
 cd deploy/platform
 pulumi install      # once, after cloning
+pulumi config set database pglite   # once per stack; see below
 pulumi up
 pulumi destroy
 ```
@@ -14,20 +15,19 @@ pulumi destroy
 | `KubeInstance` (`components/kube.ts`) | Downloads the [di-framework-kube](https://github.com/di-framework/kube) release for this machine, verifies it against `checksums.txt`, and caches it. It runs `di-framework-kube up` on create and update, and `down` on delete. kube creates a Kubesolo container, or uses an existing cluster, and installs `@di-framework/platform` with the tenants in `platform.json` and the tenant host image below. |
 | `InClusterRegistry` (`components/registry.ts`) | Plain-HTTP OCI registry in the platform namespace: PVC, Deployment, and a ClusterIP Service for component pulls, plus a NodePort Service when a local tenant host image is published. It is skipped when the stack sets an external `registry`. |
 | `PublishedImage` (`components/image.ts`) | Only with `tenantHostLocalImage`: publishes that local tenant host build to the registry. The engine saves it as an OCI layout and `oras` copies it through a port-forward. |
-| `DeploymentPatch` `tenant-host-rollout` | Switches the tenant host to stop-then-start updates, because the tenant quota has no room for a second host pod. With a published local image, it also rolls the host whenever that image's digest changes. |
-| `BackingService` `directory` | The tenant's Postgres, provisioned by the platform controller. Pulumi waits for `Ready`. |
-| `CliWorkload` (`components/workload.ts`) | The identity component. It runs `di-framework platform deploy identity` when its sources change, and `di-framework platform destroy identity` on delete. |
+| `DeploymentPatch` `tenant-host-rollout` | Switches the tenant host to stop-then-start updates, because the tenant quota has no room for a second host pod, and so two hosts never open the database at once. With a published local image, it also rolls the host whenever that image's digest changes. |
+| `CliWorkload` (`components/workload.ts`) | The identity component, with the pglite provider composed in. It runs `di-framework platform deploy identity` when its sources change, and `di-framework platform destroy identity` on delete. |
 | `Mailpit` (`components/mailpit.ts`) | SMTP relay in `di-tenant-identity` on a fixed ClusterIP, plus the platform egress grant that lets the guest dial it. Skipped when `smtpHost` is set. |
 | `RandomPassword`, `tls.PrivateKey` | Bootstrap passwords, client secrets, the SMTP password, and the RS256 signing key, generated once and kept in state. |
-| `RuntimeSecrets` (`components/secrets.ts`) | Writes those values to the guest's `identity_runtime_secret` table and waits until `/health` answers 200. |
-| `DeploymentPatch` `tenant-host-secrets` | Restarts the tenant host when the values change, so the guest boots with them. |
+| `RuntimeSecrets` (`components/secrets.ts`) | Writes those values to the workload's `identity-control` Secret after every deploy, rolls the workload onto them, and waits until `/health` answers 200. |
 
 `pulumi up` creates them in that order and `pulumi destroy` removes them in reverse.
 
 ## How the deploy works
 
-`di-framework platform deploy` builds `apps/guest` into a Wasm component and pushes
-it with `oras`. It then applies the `WorkloadDeployment`, `Service`, and bindings in
+`di-framework platform deploy` builds `apps/guest` into a Wasm component, composes the
+pglite provider into it (pulled from GHCR by the digest in `apps/guest/di-framework.config.json`),
+and pushes it with `oras`. It then applies the `WorkloadDeployment`, `Service`, and bindings in
 `di-tenant-identity`. The CLI keeps owning those generated manifests; the
 `CliWorkload` resource only decides when to run it.
 
@@ -54,14 +54,32 @@ temp directory:
 
 A failure reports the log path, its last lines, and the CLI's error message.
 
+## Database
+
+The guest runs on embedded PostgreSQL 17: the `di-framework:pglite` provider component
+(platform repo, `platform/pglite-component`), which `di-framework platform build` composes into
+the guest from `ghcr.io/di-framework/pglite-component`, pinned by digest in
+`apps/guest/di-framework.config.json` (`pglite.image`). There is no Postgres BackingService and no
+database network endpoint. The CLI renders the workload with one replica, `deployPolicy:
+Recreate`, the platform's persistent storage at `/data`, `DI_PGLITE_DATA_DIR=/data/pglite`, and
+the `di-framework.dev/exclusive-instance` component config, so the host serves every request from
+one component instance that holds the database's single connection.
+
+The data directory is a host path the platform manages for the workload, not a PVC. Back it up
+at the file level; the backup agent's `pg_dump` over the network does not apply. Encryption at
+rest is planned as a separately composed `wasi:filesystem` layer between the guest and the
+provider, which is why the provider stays a separate component.
+
 ## Tenant host image
 
 The identity component imports `wasi:tls`, which the stock `ghcr.io/wasmcloud/wash:2.8.0`
-host does not provide. The tenant host runs the platform repo's `platform/tenant-host` build
-instead: wash 2.8.0 with the `wasi-tls` feature and the Postgres invocation-lease patch,
-published as `ghcr.io/di-framework/wash:2.8.0-wasi-tls` for amd64 and arm64. The program
-pins it by digest with pull policy `IfNotPresent`. Set `tenantHostImage` to run a different
-pullable image.
+host does not provide, and its database needs the exclusive-instance pool policy. The tenant
+host runs the platform repo's `platform/tenant-host` build instead: wash 2.8.0 with the
+`wasi-tls` feature and patches 0001 (exclusive instance) and 0002 (insecure-registry allowlist),
+published as `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive` for amd64 and arm64. The
+program pins it by digest with pull policy `IfNotPresent`. Set `tenantHostImage` to run a
+different pullable image; without the exclusive patch, `platform deploy` warns and concurrent
+requests can open the database twice.
 
 To try an unpublished host build, build it and name it in `tenantHostLocalImage`:
 
@@ -88,7 +106,11 @@ is a loopback address. Each rebuild rolls the host.
 
 ## Stack config
 
-All keys are optional.
+`database` is required and must be `pglite`. Earlier versions of this program ran the guest on
+a Postgres BackingService; updating such a stack deletes that BackingService and starts the guest
+on an empty pglite database. That is the authproto cutover, which needs its own sign-off
+(`docs/guest-http-api.md#authproto-cutover`), so every stack opts in explicitly. Do not set it on
+a stack that still runs the Postgres guest. All other keys are optional.
 
 | Key | Default | Purpose |
 | --- | --- | --- |
@@ -98,18 +120,17 @@ All keys are optional.
 | `kubeStateDir` | kube's default | kube `--state-dir` |
 | `kubeconfig`, `context` | unset | Install onto this existing cluster instead of Kubesolo |
 | `httpPort` | `28180` | Gateway port of a new Kubesolo container, fixed at creation |
-| `platformPackage` | `@di-framework/platform@6.0.5` | Platform package kube installs |
+| `platformPackage` | `@di-framework/platform@6.0.11` | Platform package kube installs |
 | `values` | unset | List of administrator Helm values documents |
 | `purgeClusterOnDestroy` | `false` | Also delete the Kubesolo cluster and its data on destroy |
 | `registry` | unset | `{ push, pull }` of an external registry; skips the in-cluster one |
 | `registryForwardPort` | `25180` | Loopback port for pushes to the in-cluster registry |
 | `registryStorageClass` | cluster default | StorageClass for the in-cluster registry |
-| `tenantHostImage` | `ghcr.io/di-framework/wash:2.8.0-wasi-tls` by digest | Tenant host image the nodes pull |
+| `tenantHostImage` | `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive` by digest | Tenant host image the nodes pull |
 | `tenantHostLocalImage` | unset | Local engine image to publish and run as the tenant host instead |
 | `registryNodePort` | `30500` | NodePort the node pulls a published local host image through |
 | `containerEngine` | first of `podman`, `docker` that answers | Engine that holds `tenantHostLocalImage` |
 | `platformNamespace` | `wasmcloud` | Namespace kube installs the platform into |
-| `databaseDeletionPolicy` | `Retain` | `Delete` also removes the `directory` database's data on destroy |
 | `publicOrigin` | `url` output | identity's public origin |
 | `issuerUrl` | `publicOrigin` | OIDC issuer |
 | `accessRedirectUris` | `http://localhost:3000/callback` | Access client redirect URIs |
@@ -155,21 +176,29 @@ curl "$(pulumi stack output url)/health"
 ## Runtime secrets
 
 The guest reads the issuer URL, public origin, signing key, SMTP host and password,
-bootstrap passwords, and client secrets from the `identity_runtime_secret` table in the
-`directory` database (`V13__runtime_secrets.sql`), because wasi:config refuses them.
+bootstrap passwords, and client secrets from its WASI environment, which the platform fills
+from the workload's `identity-control` Secret (`localResources.environment.secretFrom`).
+wasi:config refuses secrets and URLs, and tenant admission lets a workload without an
+environment label reference only its `<workload>-control` Secret. Nothing secret is stored in
+the database; migration `V16` removes what the earlier Postgres guest kept there.
 
-The program generates them with `@pulumi/random` and `@pulumi/tls` and keeps them,
-encrypted, in stack state. The database's network policy admits only host pods, so
-`RuntimeSecrets` writes the rows with `psql` inside the Postgres pod through
-`kubectl exec`. It manages only its own row names and leaves the guest's bootstrap
-fingerprint alone. It then waits up to 10 minutes for `/health`, since the first boot
-hashes the bootstrap secrets with Argon2id on QuickJS.
+The program generates the values with `@pulumi/random` and `@pulumi/tls` and keeps them,
+encrypted, in stack state. `di-framework platform deploy` rewrites `identity-control` on every
+deploy with only its control token, so `RuntimeSecrets` writes the whole Secret again after each
+deploy (a fresh control token, the identity, and the values, sent to kubectl on stdin), sets
+`IDENTITY_RUNTIME_REVISION` in the workload's environment config to roll it, and waits up to 10
+minutes for `/health`. Until then the guest answers 503 and names the missing settings; it never
+starts with the default issuer or without a signing key.
 
 ```sh
 pulumi stack output --show-secrets bootstrapOwnerPassword
 ```
 
 To rotate a value, replace its resource: `pulumi up --replace <urn>`.
+
+Without Pulumi, `deploy/guest/deploy.sh <instance> <values-file>` does the same steps;
+`bun deploy/guest/runtime-secrets.ts generate` creates a values file. See
+`docs/configuration.md#wasmcloud-guest`.
 
 ## Mail
 
@@ -196,9 +225,13 @@ literal `ip:port`. So Mailpit's Service has a fixed ClusterIP, kube puts
   `di-user-<user>-<tenant>-token ... does not exist`; that can take a few minutes. Wait for
   the Secret in the platform namespace, then run `pulumi up` again. The platform README
   documents this.
-- An interrupted `pulumi destroy` can leave `directory` deleting, held by a binding from the
-  identity workload. Run `di-framework platform destroy identity --target identity`, then
-  `pulumi up --refresh`.
+- A `di-framework platform deploy` run outside this program resets `identity-control` to the CLI's
+  control token only. The guest then answers 503 until the next `pulumi up` (or
+  `deploy/guest/runtime-secrets.ts apply`) writes the values again.
+- Stacks created before the switch to pglite still have the `directory` BackingService in state.
+  The next `pulumi up` deletes it; with `databaseDeletionPolicy` `Retain` (the old default) the
+  platform keeps its data. Export anything you need first: the pglite guest starts from an empty
+  database (see `docs/guest-http-api.md#authproto-cutover`).
 
 ## State
 

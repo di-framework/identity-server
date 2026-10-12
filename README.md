@@ -67,6 +67,7 @@ A `CONTRIBUTING.md` file is not in this repository yet. Changes are expected to 
 * Bootstrap of the first owner, organization, and clients; `/health` and `/ready`
 * A `gas` Pulumi provider that provisions through the admin API
 * Postgres persistence with versioned SQL migrations and an emitted OpenAPI document
+* A wasmCloud component (`apps/guest`) on the embedded pglite PostgreSQL provider, with runtime secrets in its `identity-control` Secret ([guest docs](docs/guest-http-api.md#11-pglite-identity-server50))
 
 ## Communications
 

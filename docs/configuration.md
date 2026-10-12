@@ -76,6 +76,53 @@ bun start
 Then sign in at `http://localhost:4180/login` as `owner`, and read passwordless and security mail
 in Mailpit at `http://localhost:8025`.
 
+## wasmCloud guest
+
+`apps/guest` is the same service as a wasmCloud component. It reads the settings above from two
+places and never from its database:
+
+- **wasi:config** (`IdentityConfig` in `apps/guest/src/bindings.ts`): the non-secret values
+  compiled into the guest (signing algorithm, SMTP port and sender, bootstrap ids and names,
+  client ids, notification flags).
+- **The WASI environment**, which the platform fills from the workload's `identity-control`
+  Kubernetes Secret: `ISSUER_URL`, `AUTH_PUBLIC_ORIGIN`, `AUTH_ACTIVE_PRIVATE_JWK`,
+  `AUTH_PREVIOUS_PUBLIC_JWK_SET`, `SMTP_HOST`, `SMTP_USERNAME`, `SMTP_PASSWORD`,
+  `AUTH_ACCESS_REDIRECT_URIS`, `AUTH_BOOTSTRAP_OWNER_PASSWORD`, `AUTH_BOOTSTRAP_VIEWER_PASSWORD`,
+  `AUTH_ACCESS_CLIENT_SECRET`, `AUTH_DIRECTORY_CLIENT_SECRET`, `AUTH_PROVISIONER_CLIENT_SECRET`,
+  `AUTH_CLI_CLIENT_ID`, `AUTH_CLI_REDIRECT_URIS` (`RUNTIME_SECRET_SETTINGS` in
+  `apps/guest/src/settings.ts`). An environment value wins over wasi:config.
+
+wasi:config cannot carry secrets or URLs (the platform rejects them), and tenant admission lets a
+workload without an environment label reference only its `<workload>-control` Secret, which
+cli-plugin-platform creates for the control token. The guest refuses to boot without
+`ISSUER_URL`, `AUTH_PUBLIC_ORIGIN` and `AUTH_ACTIVE_PRIVATE_JWK`: every request answers 503 with
+`runtime settings missing from the identity-control Secret: <names>`.
+
+`di-framework platform deploy` (cli-plugin-platform 6.1.2) rewrites `identity-control` on each
+deploy with only `DI_CONTROL_TOKEN` and `DI_CONTROL_IDENTITY`. As a tenant developer it cannot
+replace a copy that holds more keys (the platform's `tenant-secret-update` policy refuses a replace
+that drops a key), and as an administrator it silently drops them. A deploy is therefore three
+steps, which `deploy/guest/deploy.sh <instance> <values-file>` runs:
+
+1. delete `identity-control`;
+2. `di-framework platform deploy identity --target identity`;
+3. `bun deploy/guest/runtime-secrets.ts apply`, which writes the whole Secret (a fresh control
+   token, the identity, and the values; the guest has no cron or queue invokers that use the
+   token) through kubectl's raw create/replace, which tenant developers may use without reading
+   Secrets, and rolls the workload by setting `IDENTITY_RUNTIME_REVISION` in its environment
+   config.
+
+`bun deploy/guest/runtime-secrets.ts generate --out <file> --origin <url> --smtp-host <host>`
+creates a values file (mode 0600) for a new instance. The `deploy/platform` Pulumi program does
+the same with values it keeps in stack state.
+
+The database is embedded PostgreSQL 17, the `di-framework:pglite` provider composed into the
+component at build time (`pglite` in `apps/guest/di-framework.config.json`, pinned by GHCR
+digest). Its root is `DI_PGLITE_DATA_DIR` (default `/data/pglite`), inside the workload's
+persistent `/data` directory. The tenant host must run the exclusive-instance wash build
+(`ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive`), which serves the workload from one
+component instance so the database has one opener.
+
 ## Provisioning with Pulumi
 
 `packages/provider` is the `gas` provider in TypeScript. See its README for resources and
