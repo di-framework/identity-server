@@ -369,6 +369,21 @@ test('the import refuses exports that do not match, and leaves nothing behind', 
   );
   expect(gap.error).toContain('migrating the new database to V15 applied 1, 2, 4');
 
+  // A schema with a sequence or an identity column is refused: the import does not reset them.
+  const withV15 = (extra: string) =>
+    embeddedMigrations.map((migration) =>
+      migration.version === '15' ? { ...migration, sql: `${migration.sql};\n${extra}` } : migration,
+    );
+  const sequence = await attempt((copy) => copy, withV15('CREATE SEQUENCE extra_seq'));
+  expect(sequence.error).toContain(
+    'V15 has 1 sequences and 0 identity or generated columns, which this import does not carry; refusing',
+  );
+  const identity = await attempt(
+    (copy) => copy,
+    withV15('CREATE TABLE counted (n int GENERATED ALWAYS AS IDENTITY)'),
+  );
+  expect(identity.error).toContain('identity or generated columns');
+
   // The directory itself: modes, digests and state rows are checked before any import.
   writeFileSync(join(dir, 'tables', 'users.json'), '[]', { mode: 0o600 });
   expect(() => loadExport(dir)).toThrow('users.json does not match its digest');

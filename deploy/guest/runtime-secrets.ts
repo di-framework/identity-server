@@ -34,9 +34,12 @@
  *   bun deploy/guest/runtime-secrets.ts guard --kubeconfig <path> --tenant <name> [--context <name>]
  *       [--instance <name>]
  *     Fails when di-tenant-<tenant> still has the Postgres `directory` BackingService (the
- *     Postgres-era guest, i.e. authproto). `apply` runs the same check first. With --instance
- *     authproto it also fails unless the tenant is not `identity` and IDENTITY_AUTHPROTO_CUTOVER
- *     is `authproto/<tenant>` (the signed-off cutover, docs/guest-http-api.md#authproto-cutover).
+ *     Postgres-era guest, i.e. authproto). When the target is authproto (the instance is named
+ *     authproto, the kubeconfig is authproto's in DI_FRAMEWORK_KUBE_STATE_DIR or kube's default
+ *     state directory, or the cluster has a `directory` BackingService in any namespace), it also
+ *     fails unless the tenant is not `identity`, IDENTITY_AUTHPROTO_CUTOVER is exactly
+ *     `authproto/<tenant>` and the tenant host runs the exclusive-instance wash build (the
+ *     signed-off cutover, docs/guest-http-api.md#authproto-cutover). `apply` runs it first.
  *
  *   bun deploy/guest/runtime-secrets.ts apply --values <file> --kubeconfig <path> --tenant <name>
  *       [--context <name>] [--config <file>]
@@ -53,24 +56,27 @@
  */
 import { createHash, generateKeyPairSync, randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
+import { homedir } from 'node:os';
+import { join, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import {
   applyRuntimeSecrets,
   assertDeployable,
-  assertInstanceAllowed,
+  assertDeployTarget,
   assertPrivateMode,
   COLUMN_KEY_NAMES,
   CUTOVER_CONFIRM_ENV,
+  defaultKubeStateDir,
   ensurePgliteKey,
   type Kubectl,
+  kubeconfigIsLegacy,
   newPgliteKey,
   type PgliteKeyCheck,
   PLAINTEXT_OPT_OUT,
   parseGuestConfig,
+  parseJsonQuietly,
   parseRuntimeValues,
   pgliteKeyCheckValues,
-  refuseLegacyTenant,
 } from '../platform/components/control-secret.ts';
 
 const { positionals, values: args } = parseArgs({
@@ -174,8 +180,35 @@ function preflight(): { values: Record<string, string>; workload: string } {
   return { values, workload: config.name };
 }
 
+/**
+ * The target check (assertDeployTarget): authproto, recognised by the instance argument, by
+ * its kubeconfig in kube's state directory or by any `directory` BackingService on the cluster,
+ * only as the confirmed cutover into a new tenant on the exclusive host build.
+ */
+async function guard(tenant: string): Promise<void> {
+  const kubeconfig = required('kubeconfig');
+  const stateDir =
+    process.env.DI_FRAMEWORK_KUBE_STATE_DIR?.trim() ||
+    defaultKubeStateDir(process.platform, homedir(), process.env);
+  const legacyKubeconfig = kubeconfigIsLegacy(kubeconfig, {
+    stateDir,
+    resolve: (path) => resolve(path),
+    read: (path) => (existsSync(path) ? readFileSync(path, 'utf8') : undefined),
+  });
+  const allowed = await assertDeployTarget(kubectl, {
+    instance: args.instance,
+    tenant,
+    confirmation: process.env[CUTOVER_CONFIRM_ENV],
+    legacyKubeconfig,
+  });
+  if (allowed === 'authproto-cutover') {
+    console.log(`authproto cutover confirmed for the new tenant ${tenant}`);
+  }
+}
+
 async function apply(): Promise<void> {
   const { values, workload } = preflight();
+  await guard(required('tenant'));
   printKcvs(values);
   const result = await applyRuntimeSecrets(kubectl, {
     tenant: required('tenant'),
@@ -236,7 +269,7 @@ function columnKeys(): void {
   const path = required('values');
   assertPrivateMode(statSync(path).mode, path);
   // Parsed before validation, so a file that opted in without its keys can be repaired here.
-  const values = JSON.parse(readFileSync(path, 'utf8')) as Record<string, string>;
+  const values = parseJsonQuietly<Record<string, string>>(readFileSync(path, 'utf8'), path);
   const added: string[] = [];
   for (const name of COLUMN_KEY_NAMES) {
     if (values[name]?.trim()) continue;
@@ -260,13 +293,7 @@ try {
       break;
     case 'guard': {
       const tenant = required('tenant');
-      const allowed = args.instance
-        ? assertInstanceAllowed(args.instance, tenant, process.env[CUTOVER_CONFIRM_ENV])
-        : 'other-instance';
-      await refuseLegacyTenant(kubectl, `di-tenant-${tenant}`);
-      if (allowed === 'authproto-cutover') {
-        console.log(`authproto cutover confirmed for the new tenant ${tenant}`);
-      }
+      await guard(tenant);
       console.log(`di-tenant-${tenant} has no Postgres directory BackingService`);
       break;
     }

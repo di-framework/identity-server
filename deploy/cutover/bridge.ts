@@ -15,6 +15,7 @@ import type {
   WasmPgRow,
   WasmPgValue,
 } from '../../apps/guest/src/database.ts';
+import { parseJsonQuietly } from '../platform/components/control-secret.ts';
 
 /** One line out, and the next reply line in (without the prefix). */
 export interface Channel {
@@ -70,7 +71,7 @@ export function bridgeModule(channel: Channel): WasmPgliteModule {
   const call = <T>(request: Record<string, unknown>, map: (ok: unknown) => T) => {
     const next = queue.then(async () => {
       channel.send(JSON.stringify(request));
-      const reply = JSON.parse(await channel.receive()) as Reply;
+      const reply = parseJsonQuietly<Reply>(await channel.receive(), 'a runner reply');
       return 'ok' in reply
         ? { tag: 'ok' as const, val: map(reply.ok) }
         : { tag: 'err' as const, val: reply.err };

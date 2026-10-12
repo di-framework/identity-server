@@ -5,9 +5,11 @@ import {
   applyRuntimeSecrets,
   assertColumnEncryption,
   assertDeployable,
+  assertDeployTarget,
   assertInstanceAllowed,
   assertPgliteKeys,
   assertPrivateMode,
+  assertTenantName,
   COLUMN_KEY_NAMES,
   CUTOVER_CONFIRM_ENV,
   checkStoredPgliteKey,
@@ -18,9 +20,12 @@ import {
   type GuestConfig,
   type Kubectl,
   type KubectlResult,
+  kubeconfigIsLegacy,
+  kubeconfigServer,
   newPgliteKey,
   PGLITE_KEY_NAMES,
   parseGuestConfig,
+  parseJsonQuietly,
   parseRuntimeValues,
   pgliteKeyCheckValue,
   pgliteKeyCheckValues,
@@ -306,18 +311,22 @@ describe('the Pulumi preflight before any resource', () => {
 
   test('refuses the authproto instance by name, without touching the cluster', () => {
     const probe = io([`${state}/authproto`, `${state}/authproto/kubeconfig`]);
-    expect(() => preflightCluster({ instance: 'authproto', stateDir: state }, probe.io)).toThrow(
-      'authproto runs the Postgres-era identity guest; deploying there is the cutover',
-    );
+    expect(() =>
+      preflightCluster({ instance: 'authproto', tenant: 't', stateDir: state }, probe.io),
+    ).toThrow('authproto runs the Postgres-era identity guest; deploying there is the cutover');
     expect(probe.calls).toEqual([]);
   });
 
   test('the signed-off cutover lifts the authproto refusal only for a confirmed new tenant', () => {
     expect(CUTOVER_CONFIRM_ENV).toBe('IDENTITY_AUTHPROTO_CUTOVER');
     expect(assertInstanceAllowed('pgprove', 'identity', undefined)).toBe('other-instance');
-    expect(assertInstanceAllowed('authproto', 'identity-pg', ' authproto/identity-pg ')).toBe(
+    expect(assertInstanceAllowed('authproto', 'identity-pg', 'authproto/identity-pg')).toBe(
       'authproto-cutover',
     );
+    // Exact match only: no trimming.
+    expect(() =>
+      assertInstanceAllowed('authproto', 'identity-pg', ' authproto/identity-pg '),
+    ).toThrow('set IDENTITY_AUTHPROTO_CUTOVER=authproto/identity-pg. Refusing');
     expect(() => assertInstanceAllowed('authproto', 'identity-pg', undefined)).toThrow(
       'set IDENTITY_AUTHPROTO_CUTOVER=authproto/identity-pg. Refusing',
     );
@@ -327,6 +336,120 @@ describe('the Pulumi preflight before any resource', () => {
     expect(() => assertInstanceAllowed('authproto', 'identity', 'authproto/identity')).toThrow(
       'tenant identity on authproto runs the Postgres-era identity guest',
     );
+    // Tenant names are DNS-1123 labels, so `Identity` or ` identity` cannot slip past.
+    for (const tenant of ['Identity', ' identity', 'identity ', '', '-a', 'a'.repeat(64)]) {
+      expect(() => assertInstanceAllowed('pgprove', tenant, undefined)).toThrow(
+        'is not a DNS-1123 label',
+      );
+    }
+    expect(() => assertTenantName('a'.repeat(63))).not.toThrow();
+  });
+
+  test('authproto is recognised by its kubeconfig path or API server, whatever the name', () => {
+    const files: Record<string, string> = {
+      '/state/authproto/kubeconfig': 'clusters:\n- cluster:\n    server: https://127.0.0.1:45000\n',
+      '/copy/kc': "    server: 'https://127.0.0.1:45000'\n",
+      '/other/kc': 'server: https://127.0.0.1:46000',
+    };
+    const io = {
+      stateDir: '/state',
+      resolve: (path: string) => path.replace('/state/./', '/state/'),
+      read: (path: string) => files[path],
+    };
+    expect(kubeconfigServer(files['/copy/kc'] as string)).toBe('https://127.0.0.1:45000');
+    expect(kubeconfigServer('kind: Config')).toBeUndefined();
+    expect(kubeconfigIsLegacy('/state/./authproto/kubeconfig', io)).toBe(true);
+    expect(kubeconfigIsLegacy('/copy/kc', io)).toBe(true);
+    expect(kubeconfigIsLegacy('/other/kc', io)).toBe(false);
+    expect(kubeconfigIsLegacy('/missing', io)).toBe(false);
+    expect(kubeconfigIsLegacy('/other/kc', { ...io, read: () => undefined })).toBe(false);
+  });
+
+  test('deploy.sh and runtime-secrets.ts check the cluster, not only the instance name', async () => {
+    const kubectl = (responses: Record<string, Partial<KubectlResult>>) => {
+      const calls: string[][] = [];
+      const run: Kubectl = async (args) => {
+        calls.push(args);
+        const key = Object.keys(responses).find((part) => args.join(' ').includes(part));
+        return { code: 0, stdout: '', stderr: '', ...(key ? responses[key] : {}) };
+      };
+      return { run, calls };
+    };
+    const exclusive = {
+      'get deployment hostgroup-tenant-identity-pg': {
+        stdout: 'ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@sha256:00',
+      },
+    };
+    const target = { tenant: 'identity-pg', confirmation: undefined, legacyKubeconfig: false };
+
+    // A clean cluster: no confirmation needed, and no host image check.
+    const clean = kubectl({ '--all-namespaces': { stdout: 'di-tenant-pgprove/cache\n' } });
+    expect(await assertDeployTarget(clean.run, { ...target, instance: 'pgprove' })).toBe(
+      'other-target',
+    );
+    expect(clean.calls).toHaveLength(2);
+
+    // A `directory` in another namespace makes it authproto, whatever the instance says.
+    const legacy = { '--all-namespaces': { stdout: 'di-tenant-identity/directory\n' } };
+    await expect(
+      assertDeployTarget(kubectl(legacy).run, { ...target, instance: 'pgprove' }),
+    ).rejects.toThrow(
+      'the cluster has the Postgres BackingService di-tenant-identity/directory, so the target runs the Postgres-era identity guest; deploying there is the cutover',
+    );
+    const confirmed = { ...target, confirmation: 'authproto/identity-pg' };
+    expect(
+      await assertDeployTarget(kubectl({ ...legacy, ...exclusive }).run, {
+        ...confirmed,
+        instance: 'pgprove',
+      }),
+    ).toBe('authproto-cutover');
+    // The kubeconfig alone, or the name alone, is enough too.
+    await expect(
+      assertDeployTarget(kubectl({}).run, { ...target, legacyKubeconfig: true }),
+    ).rejects.toThrow("the kubeconfig is authproto's");
+    await expect(
+      assertDeployTarget(kubectl({}).run, { ...target, instance: 'authproto' }),
+    ).rejects.toThrow('the instance is authproto');
+    // Confirmed, but the tenant host is not the exclusive build, or cannot be read.
+    await expect(
+      assertDeployTarget(
+        kubectl({ 'hostgroup-tenant': { stdout: 'ghcr.io/di-framework/wash:2.8.0-wasi-tls' } }).run,
+        { ...confirmed, instance: 'authproto' },
+      ),
+    ).rejects.toThrow(
+      'does not run the exclusive-instance wash build (ghcr.io/di-framework/wash:2.8.0-wasi-tls)',
+    );
+    await expect(
+      assertDeployTarget(kubectl({ 'hostgroup-tenant': { code: 1 } }).run, {
+        ...confirmed,
+        instance: 'authproto',
+      }),
+    ).rejects.toThrow('(kubectl exit 1)');
+    // The tenant itself must not have `directory`, and a failed listing refuses.
+    await expect(
+      assertDeployTarget(
+        kubectl({ 'di-tenant-identity-pg get': { stdout: 'backingservice/directory' } }).run,
+        { ...target, instance: 'pgprove' },
+      ),
+    ).rejects.toThrow('di-tenant-identity-pg has the Postgres BackingService `directory`');
+    await expect(
+      assertDeployTarget(kubectl({ '--all-namespaces': { code: 1 } }).run, target),
+    ).rejects.toThrow('cannot list BackingServices (kubectl exit 1); refusing to deploy');
+    await expect(assertDeployTarget(kubectl({}).run, { ...target, tenant: 'Bad' })).rejects.toThrow(
+      'is not a DNS-1123 label',
+    );
+  });
+
+  test('JSON errors name the input, never echo it', () => {
+    expect(parseJsonQuietly<{ a: number }>('{"a":1}', 'x').a).toBe(1);
+    expect(() => parseJsonQuietly('hunter2secret', 'the values')).toThrow(
+      'the values is not JSON (13 bytes)',
+    );
+    try {
+      parseJsonQuietly('{"k": hunter2secret}', 'x');
+    } catch (error) {
+      expect(String(error)).not.toContain('hunter2');
+    }
   });
 
   test('a confirmed authproto stack is still refused while the cluster has `directory`', () => {
@@ -351,14 +474,18 @@ describe('the Pulumi preflight before any resource', () => {
 
   test('a managed instance that does not exist yet is new', () => {
     const probe = io([]);
-    expect(preflightCluster({ instance: 'fresh', stateDir: state }, probe.io)).toBe('new-instance');
+    expect(preflightCluster({ instance: 'fresh', tenant: 't', stateDir: state }, probe.io)).toBe(
+      'new-instance',
+    );
     expect(probe.calls).toEqual([]);
   });
 
   test('an existing managed instance is checked through its kubeconfig in the state directory', () => {
     const files = [`${state}/other`, `${state}/other/kubeconfig`];
     const clean = io(files, { stdout: 'di-tenant-other/cache\n' });
-    expect(preflightCluster({ instance: 'other', stateDir: state }, clean.io)).toBe('checked');
+    expect(preflightCluster({ instance: 'other', tenant: 't', stateDir: state }, clean.io)).toBe(
+      'checked',
+    );
     expect(clean.calls[0]?.kubeconfig).toBe(`${state}/other/kubeconfig`);
     expect(clean.calls[0]?.args.slice(0, 3)).toEqual([
       'get',
@@ -368,21 +495,21 @@ describe('the Pulumi preflight before any resource', () => {
 
     // A `directory` in any namespace refuses: `kube up` rewrites the whole platform install.
     const legacy = io(files, { stdout: 'di-tenant-pgprove/cache\ndi-tenant-identity/directory\n' });
-    expect(() => preflightCluster({ instance: 'other', stateDir: state }, legacy.io)).toThrow(
-      'other has the Postgres BackingService di-tenant-identity/directory',
-    );
+    expect(() =>
+      preflightCluster({ instance: 'other', tenant: 't', stateDir: state }, legacy.io),
+    ).toThrow('other has the Postgres BackingService di-tenant-identity/directory');
 
     const down = io(files, { code: 1 });
-    expect(() => preflightCluster({ instance: 'other', stateDir: state }, down.io)).toThrow(
-      'cannot list BackingServices on other (kubectl exit 1)',
-    );
+    expect(() =>
+      preflightCluster({ instance: 'other', tenant: 't', stateDir: state }, down.io),
+    ).toThrow('cannot list BackingServices on other (kubectl exit 1)');
   });
 
   test('an existing instance without a kubeconfig fails closed', () => {
     const probe = io([`${state}/broken`]);
-    expect(() => preflightCluster({ instance: 'broken', stateDir: state }, probe.io)).toThrow(
-      'kube instance broken exists in /state/di-framework-kube but has no kubeconfig',
-    );
+    expect(() =>
+      preflightCluster({ instance: 'broken', tenant: 't', stateDir: state }, probe.io),
+    ).toThrow('kube instance broken exists in /state/di-framework-kube but has no kubeconfig');
     expect(probe.calls).toEqual([]);
   });
 
@@ -390,7 +517,7 @@ describe('the Pulumi preflight before any resource', () => {
     const legacy = io([], { stdout: 'di-tenant-identity/directory' });
     expect(() =>
       preflightCluster(
-        { instance: 'new-name', stateDir: state, kubeconfig: '/kc', context: 'ctx' },
+        { instance: 'new-name', tenant: 't', stateDir: state, kubeconfig: '/kc', context: 'ctx' },
         legacy.io,
       ),
     ).toThrow('Refusing');
@@ -442,13 +569,16 @@ describe('one resolved kube target for the preflight and for kube', () => {
     const kubectlCalls: string[] = [];
     const files = [`${defaultDir}/other`, `${defaultDir}/other/kubeconfig`];
     expect(() =>
-      preflightCluster(target, {
-        exists: (path) => files.includes(path),
-        kubectl: (kubeconfig) => {
-          kubectlCalls.push(kubeconfig);
-          return { code: 0, stdout: 'di-tenant-identity/directory', stderr: '' };
+      preflightCluster(
+        { ...target, tenant: 't' },
+        {
+          exists: (path) => files.includes(path),
+          kubectl: (kubeconfig) => {
+            kubectlCalls.push(kubeconfig);
+            return { code: 0, stdout: 'di-tenant-identity/directory', stderr: '' };
+          },
         },
-      }),
+      ),
     ).toThrow('Refusing');
     expect(kubectlCalls).toEqual([`${defaultDir}/other/kubeconfig`]);
   });
@@ -483,13 +613,16 @@ describe('one resolved kube target for the preflight and for kube', () => {
     });
     const calls: string[] = [];
     expect(() =>
-      preflightCluster(target, {
-        exists: () => true,
-        kubectl: (kubeconfig) => {
-          calls.push(kubeconfig);
-          return { code: 0, stdout: '', stderr: '' };
+      preflightCluster(
+        { ...target, tenant: 't' },
+        {
+          exists: () => true,
+          kubectl: (kubeconfig) => {
+            calls.push(kubeconfig);
+            return { code: 0, stdout: '', stderr: '' };
+          },
         },
-      }),
+      ),
     ).toThrow('authproto runs the Postgres-era identity guest; deploying there is the cutover');
     expect(calls).toEqual([]);
   });

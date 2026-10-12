@@ -43,6 +43,7 @@ import {
   splitRuntimeRows,
   versionNumber,
 } from './source.ts';
+import { serveLine } from './tests/support/fake-runner.ts';
 
 const work = mkdtempSync(join(tmpdir(), 'identity-cutover-units-'));
 afterAll(() => rmSync(work, { recursive: true, force: true }));
@@ -322,56 +323,24 @@ describe('the runner bridge', () => {
     expect(wire[4]).toEqual({ tag: 'blob', val: '00ff' });
     expect(JSON.parse(JSON.stringify(wire)).map(fromWire)).toEqual(values);
     expect(replyLine('@pglite {"ok":null}')).toBe('{"ok":null}');
+    // Non-finite reals travel as JavaScript spells them, which the runner's f64 parser reads.
+    for (const val of [Number.POSITIVE_INFINITY, Number.NEGATIVE_INFINITY]) {
+      expect(fromWire(JSON.parse(JSON.stringify(toWire({ tag: 'real', val }))))).toEqual({
+        tag: 'real',
+        val,
+      });
+    }
+    expect(toWire({ tag: 'real', val: Number.NaN })).toEqual({ tag: 'real', val: 'NaN' });
+    expect(Number.isNaN(fromWire({ tag: 'real', val: 'NaN' }).val)).toBe(true);
     expect(replyLine('engine noise')).toBeUndefined();
   });
 
   test('the guest adapter runs over the protocol the runner speaks', async () => {
     // The runner's side of the protocol, served by the in-process engine.
     const fixture = pgliteFixture();
-    let connection: Record<string, (...args: unknown[]) => unknown> | undefined;
+    const state = {};
     const pending: string[] = [];
-    const serve = async (line: string): Promise<string> => {
-      const request = JSON.parse(line) as {
-        op: string;
-        sql?: string;
-        path?: string;
-        name?: string;
-        params?: Array<{ tag: string; val?: unknown }>;
-      };
-      const params = (request.params ?? []).map(fromWire);
-      let result: { tag: string; val: unknown };
-      if (request.op === 'open') {
-        // The fixture returns the connection itself, or an `err` result.
-        const opened = (await fixture.module.open(request.path as string)) as Record<
-          string,
-          unknown
-        >;
-        if (opened.tag === 'err') return JSON.stringify({ err: opened.val });
-        connection = opened as typeof connection;
-        result = { tag: 'ok', val: null };
-      } else if (request.op === 'nonsense') {
-        return JSON.stringify({ err: { tag: 'other', val: 'unknown op' } });
-      } else {
-        const db = connection as Record<string, (...args: unknown[]) => unknown>;
-        const method = request.op.replace(/-(\w)/g, (_, c: string) => c.toUpperCase());
-        const args = request.name ? [request.name] : request.sql ? [request.sql, params] : [];
-        result = (await db[method]?.(...args)) as { tag: string; val: unknown };
-      }
-      if (result.tag === 'err') return JSON.stringify({ err: result.val });
-      const encodeRow = (row: Array<[string, WasmPgValue]>) =>
-        row.map(([name, value]) => [name, toWire(value)]);
-      const ok =
-        request.op === 'run'
-          ? String(result.val)
-          : request.op === 'query'
-            ? (result.val as Array<Array<[string, WasmPgValue]>>).map(encodeRow)
-            : request.op === 'first'
-              ? result.val
-                ? encodeRow(result.val as Array<[string, WasmPgValue]>)
-                : null
-              : null;
-      return JSON.stringify({ ok });
-    };
+    const serve = (line: string) => serveLine(fixture, state, line);
     const channel: Channel = {
       send(line) {
         pending.push(line);
@@ -549,16 +518,16 @@ describe('the install plan', () => {
       namespace: 'kube-system',
       node: 'n',
       image: 'busybox:1.37.0',
-      workloadsDir: `/var/lib/kubesolo/di-tenants/${uid}/workloads`,
+      target: `/var/lib/kubesolo/di-tenants/${uid}/workloads/identity`,
     }) as { spec: Record<string, unknown> };
     expect(pod.spec).toMatchObject({
       nodeName: 'n',
       automountServiceAccountToken: false,
       volumes: [
         {
-          name: 'workloads',
+          name: 'target',
           hostPath: {
-            path: `/var/lib/kubesolo/di-tenants/${uid}/workloads`,
+            path: `/var/lib/kubesolo/di-tenants/${uid}/workloads/identity`,
             type: 'DirectoryOrCreate',
           },
         },
@@ -568,7 +537,7 @@ describe('the install plan', () => {
     expect(container?.securityContext).toMatchObject({
       allowPrivilegeEscalation: false,
       readOnlyRootFilesystem: true,
-      capabilities: { drop: ['ALL'], add: ['CHOWN', 'FOWNER', 'DAC_OVERRIDE'] },
+      capabilities: { drop: ['ALL'], add: ['CHOWN', 'DAC_OVERRIDE'] },
     });
   });
 });

@@ -33,7 +33,12 @@ const fresh = (name: string) => join(work, `${files++}-${name}`);
 function run(args: string[], env: Record<string, string> = {}) {
   const child = Bun.spawnSync(['bun', script, ...args], {
     cwd: root,
-    env: { PATH: process.env.PATH ?? '', HOME: process.env.HOME ?? '', ...env },
+    env: {
+      PATH: process.env.PATH ?? '',
+      HOME: process.env.HOME ?? '',
+      DI_FRAMEWORK_KUBE_STATE_DIR: join(work, 'no-state'),
+      ...env,
+    },
   });
   return {
     code: child.exitCode,
@@ -190,7 +195,7 @@ describe('deploy.sh', () => {
     // STUB_READY is what the WorkloadDeployment's Ready condition reads (default True).
     record(
       'kubectl',
-      `case "$*" in *" create --raw "*|*" replace --raw "*) cat >"${calls}/$n.stdin" ;; *" get workloaddeployment "*) printf '%s' "\${STUB_READY:-True}" ;; esac\nexit 0`,
+      `case "$*" in *" create --raw "*|*" replace --raw "*) cat >"${calls}/$n.stdin" ;; *" get workloaddeployment "*) printf '%s' "\${STUB_READY:-True}" ;; *" --all-namespaces "*) printf '%s' "\${STUB_BACKINGSERVICES:-}" ;; *" get deployment hostgroup-tenant-"*) printf '%s' "\${STUB_HOST_IMAGE:-ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive}" ;; esac\nexit 0`,
     );
     return { bin, calls };
   }
@@ -207,6 +212,7 @@ describe('deploy.sh', () => {
           HOME: process.env.HOME ?? '',
           IDENTITY_KUBECONFIG: join(work, 'kubeconfig'),
           IDENTITY_KUBE_CONTEXT: 'test',
+          DI_FRAMEWORK_KUBE_STATE_DIR: join(work, 'no-state'),
         },
       });
     for (const _ of [1, 2]) {
@@ -254,6 +260,7 @@ describe('deploy.sh', () => {
         HOME: process.env.HOME ?? '',
         IDENTITY_KUBECONFIG: join(work, 'kubeconfig'),
         IDENTITY_KUBE_CONTEXT: 'test',
+        DI_FRAMEWORK_KUBE_STATE_DIR: join(work, 'no-state'),
         ...extra,
       },
     });
@@ -298,15 +305,16 @@ describe('deploy.sh', () => {
 
   test('authproto only as the confirmed cutover into a new tenant, refused before the build', () => {
     const { path } = generate();
-    const run = (tenant: string, extra: Record<string, string> = {}) => {
+    const run = (instance: string, tenant: string, extra: Record<string, string> = {}) => {
       const { bin, calls } = stubs();
-      const result = Bun.spawnSync(['sh', deployScript, 'authproto', tenant, path], {
+      const result = Bun.spawnSync(['sh', deployScript, instance, tenant, path], {
         cwd: root,
         env: {
           PATH: `${bin}:${process.env.PATH ?? ''}`,
           HOME: process.env.HOME ?? '',
           IDENTITY_KUBECONFIG: join(work, 'kubeconfig'),
           IDENTITY_KUBE_CONTEXT: 'test',
+          DI_FRAMEWORK_KUBE_STATE_DIR: join(work, 'no-state'),
           ...extra,
         },
       });
@@ -317,17 +325,27 @@ describe('deploy.sh', () => {
         argv: argvOf(calls),
       };
     };
-    const unconfirmed = run('identity-pg');
+    const built = (argv: string[]) => argv.some((line) => line.startsWith('di-framework'));
+    const unconfirmed = run('authproto', 'identity-pg');
     expect(unconfirmed.code).not.toBe(0);
     expect(unconfirmed.stderr).toContain(
       'set IDENTITY_AUTHPROTO_CUTOVER=authproto/identity-pg. Refusing',
     );
-    expect(unconfirmed.argv.some((line) => line.startsWith('di-framework'))).toBe(false);
-    const legacy = run('identity', { IDENTITY_AUTHPROTO_CUTOVER: 'authproto/identity' });
+    expect(built(unconfirmed.argv)).toBe(false);
+    const legacy = run('authproto', 'identity', {
+      IDENTITY_AUTHPROTO_CUTOVER: 'authproto/identity',
+    });
     expect(legacy.code).not.toBe(0);
     expect(legacy.stderr).toContain('tenant identity on authproto runs the Postgres-era');
-    expect(legacy.argv.some((line) => line.startsWith('di-framework'))).toBe(false);
-    const confirmed = run('identity-pg', { IDENTITY_AUTHPROTO_CUTOVER: 'authproto/identity-pg' });
+    expect(built(legacy.argv)).toBe(false);
+    const padded = run('authproto', 'identity-pg', {
+      IDENTITY_AUTHPROTO_CUTOVER: 'authproto/identity-pg ',
+    });
+    expect(padded.code).not.toBe(0);
+    expect(built(padded.argv)).toBe(false);
+    const confirmed = run('authproto', 'identity-pg', {
+      IDENTITY_AUTHPROTO_CUTOVER: 'authproto/identity-pg',
+    });
     expect(confirmed.code).toBe(0);
     expect(confirmed.out).toContain('authproto cutover confirmed for the new tenant identity-pg');
     expect(confirmed.argv).toContain('di-framework platform build');
@@ -339,6 +357,64 @@ describe('deploy.sh', () => {
         ),
       ),
     ).toBe(true);
+    const plainHost = run('authproto', 'identity-pg', {
+      IDENTITY_AUTHPROTO_CUTOVER: 'authproto/identity-pg',
+      STUB_HOST_IMAGE: 'ghcr.io/di-framework/wash:2.8.0-wasi-tls',
+    });
+    expect(plainHost.code).not.toBe(0);
+    expect(plainHost.stderr).toContain('does not run the exclusive-instance wash build');
+    expect(built(plainHost.argv)).toBe(false);
+  });
+
+  test("another instance name does not get past the guard on authproto's cluster", () => {
+    const { path } = generate();
+    const state = join(work, `state-${files++}`);
+    Bun.spawnSync(['mkdir', '-p', join(state, 'authproto')]);
+    writeFileSync(join(state, 'authproto', 'kubeconfig'), 'server: https://127.0.0.1:45999\n', {
+      mode: 0o600,
+    });
+    const deploy = (env: Record<string, string>) => {
+      const { bin: stubBin, calls } = stubs();
+      const result = Bun.spawnSync(['sh', deployScript, 'pgprove', 'identity-pg', path], {
+        cwd: root,
+        env: {
+          PATH: `${stubBin}:${process.env.PATH ?? ''}`,
+          HOME: process.env.HOME ?? '',
+          IDENTITY_KUBE_CONTEXT: 'test',
+          DI_FRAMEWORK_KUBE_STATE_DIR: state,
+          IDENTITY_KUBECONFIG: join(work, 'kubeconfig'),
+          ...env,
+        },
+      });
+      return {
+        code: result.exitCode,
+        stderr: result.stderr.toString(),
+        built: argvOf(calls).some((line) => line.startsWith('di-framework')),
+      };
+    };
+    // IDENTITY_KUBECONFIG=<authproto's kubeconfig> deploy.sh pgprove ...
+    const byPath = deploy({ IDENTITY_KUBECONFIG: join(state, 'authproto', 'kubeconfig') });
+    expect(byPath).toMatchObject({ built: false });
+    expect(byPath.code).not.toBe(0);
+    expect(byPath.stderr).toContain("the kubeconfig is authproto's");
+    // A copy of it elsewhere names the same API server.
+    const copy = join(work, `copy-${files++}`);
+    writeFileSync(copy, "server: 'https://127.0.0.1:45999'\n", { mode: 0o600 });
+    const byServer = deploy({ IDENTITY_KUBECONFIG: copy });
+    expect(byServer.code).not.toBe(0);
+    expect(byServer.stderr).toContain("the kubeconfig is authproto's");
+    // Any cluster with `directory` in another namespace.
+    const byCluster = deploy({ STUB_BACKINGSERVICES: 'di-tenant-identity/directory\n' });
+    expect(byCluster).toMatchObject({ built: false });
+    expect(byCluster.stderr).toContain(
+      'the cluster has the Postgres BackingService di-tenant-identity/directory',
+    );
+    // Confirmed, the same deploy goes ahead.
+    const confirmed = deploy({
+      STUB_BACKINGSERVICES: 'di-tenant-identity/directory\n',
+      IDENTITY_AUTHPROTO_CUTOVER: 'authproto/identity-pg',
+    });
+    expect(confirmed).toMatchObject({ code: 0, built: true });
   });
 
   test('refuses a values file without the data directory key before touching the cluster', () => {
@@ -351,6 +427,7 @@ describe('deploy.sh', () => {
         HOME: process.env.HOME ?? '',
         IDENTITY_KUBECONFIG: join(work, 'kubeconfig'),
         IDENTITY_KUBE_CONTEXT: 'test',
+        DI_FRAMEWORK_KUBE_STATE_DIR: join(work, 'no-state'),
       },
     });
     expect(result.exitCode).not.toBe(0);

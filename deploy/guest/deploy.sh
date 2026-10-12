@@ -16,10 +16,13 @@
 #
 # The script refuses a tenant whose di-tenant-<tenant> namespace still has the Postgres
 # `directory` BackingService, i.e. the Postgres-era guest on authproto, however the kubeconfig and
-# tenant were chosen. It refuses the instance `authproto` too, except for the signed-off cutover
+# tenant were chosen. It treats the target as authproto when the instance is named `authproto`,
+# when the kubeconfig is authproto's (its path in kube's state directory, or the same API server),
+# or when the cluster has a `directory` BackingService in any namespace, whatever the instance
+# argument says. Such a target is refused except for the signed-off cutover
 # (docs/guest-http-api.md#authproto-cutover): a new tenant (never `identity`), confirmed with
-# IDENTITY_AUTHPROTO_CUTOVER=authproto/<tenant> in the environment. The check runs before the
-# build, so a refusal changes nothing.
+# exactly IDENTITY_AUTHPROTO_CUTOVER=authproto/<tenant> in the environment, whose tenant host runs
+# the exclusive-instance wash build. The check runs before the build, so a refusal changes nothing.
 #
 # The workload, and its `<workload>-control` Secret, are named by `name` in
 # apps/guest/di-framework.config.json. That config encrypts the data directory at rest
@@ -57,6 +60,8 @@ fi
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 state_dir="${DI_FRAMEWORK_KUBE_STATE_DIR:-$HOME/Library/Application Support/di-framework-kube}"
+# runtime-secrets.ts guard recognises authproto's kubeconfig in the same state directory.
+export DI_FRAMEWORK_KUBE_STATE_DIR="$state_dir"
 secrets="$root/deploy/guest/runtime-secrets.ts"
 
 export IDENTITY_TENANT="$tenant"
@@ -67,7 +72,8 @@ export IDENTITY_REGISTRY_PULL="${IDENTITY_REGISTRY_PULL:-examples-registry.wasmc
 
 # Values file (mode 0600, known names) against the guest config; prints the workload name.
 workload="$(bun "$secrets" preflight --values "$values")"
-# The target tenant must not run the Postgres-era guest; authproto only as the confirmed cutover.
+# The target tenant must not run the Postgres-era guest; authproto (by name, kubeconfig or
+# cluster) only as the confirmed cutover.
 bun "$secrets" guard --instance "$instance" --kubeconfig "$IDENTITY_KUBECONFIG" --context "$IDENTITY_KUBE_CONTEXT" --tenant "$tenant"
 
 # Build before touching the cluster, so a build failure leaves the running guest and its Secret.

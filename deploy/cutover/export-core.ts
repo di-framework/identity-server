@@ -11,9 +11,20 @@
  * files, never to stdout, a log or an error message.
  */
 import { createHash } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, readdirSync, statSync, writeFileSync } from 'node:fs';
-import { join } from 'node:path';
-import { parseRuntimeValues } from '../platform/components/control-secret.ts';
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readdirSync,
+  renameSync,
+  rmdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from 'node:fs';
+import { basename, dirname, join } from 'node:path';
+import { parseJsonQuietly, parseRuntimeValues } from '../platform/components/control-secret.ts';
 import {
   EXCLUDED_TABLES,
   type ExportManifest,
@@ -100,12 +111,18 @@ interface RawSnapshot {
  * the supported range and runtime rows the new guest cannot take, before anything is written.
  */
 export async function readSource(session: SourceSession): Promise<Snapshot> {
-  const inventory = JSON.parse(await session(INVENTORY_SQL)) as Inventory;
+  const inventory = parseJsonQuietly<Inventory>(
+    await session(INVENTORY_SQL),
+    'the inventory psql returned',
+  );
   for (const table of inventory.tables) {
     identifier(table.name);
     for (const column of table.columns) identifier(column);
   }
-  const raw = JSON.parse(await session(snapshotSql(inventory))) as RawSnapshot;
+  const raw = parseJsonQuietly<RawSnapshot>(
+    await session(snapshotSql(inventory)),
+    'the snapshot psql returned',
+  );
   const version = sourceVersion({ guest: raw.guest, runner: raw.runner });
   const runtime = splitRuntimeRows(raw.runtime);
   const max = (list: string[] | null) =>
@@ -147,14 +164,19 @@ export function privateFile(path: string, data: string | Uint8Array): void {
 }
 
 /**
- * Writes the export directory: `tables/<name>.json`, `values.json` (the deploy.sh values file:
- * every runtime secret row under its own name), `state.json` (bootstrap state rows) and
+ * Writes the export directory `out`: `tables/<name>.json`, `values.json` (the deploy.sh values
+ * file: every runtime secret row under its own name), `state.json` (bootstrap state rows) and
  * `manifest.json`. `backup`, when given, writes a pg_dump of the source into the directory and
- * returns its file name and digest; it runs after the data files and before the manifest. The
- * values are checked as `runtime-secrets.ts` checks a values file before anything is written.
+ * returns its file name and digest; it runs after the data files and before the manifest.
+ *
+ * Everything is written into a new 0700 sibling of `out` and renamed to `out` only once the
+ * backup and the manifest are written, so `out` either holds a complete export or does not
+ * exist. On any error the sibling, with whatever secrets it already held, is removed. `out`
+ * must not exist or be an empty directory. The values are checked as `runtime-secrets.ts`
+ * checks a values file before anything is written.
  */
 export async function writeExport(
-  dir: string,
+  out: string,
   snapshot: Snapshot,
   options: {
     createdAt: string;
@@ -162,7 +184,36 @@ export async function writeExport(
   },
 ): Promise<ExportManifest> {
   parseRuntimeValues(JSON.stringify(snapshot.runtime.values), 'the runtime secret rows');
-  privateDirectory(dir);
+  const replaceEmpty = assertFreshTarget(out);
+  mkdirSync(dirname(out), { recursive: true });
+  const dir = mkdtempSync(join(dirname(out), `.${basename(out)}.partial-`));
+  try {
+    chmodSync(dir, 0o700);
+    const manifest = await fillExport(dir, snapshot, options);
+    if (replaceEmpty) rmdirSync(out);
+    renameSync(dir, out);
+    return manifest;
+  } catch (error) {
+    rmSync(dir, { recursive: true, force: true });
+    const reason = error instanceof Error ? error.message : String(error);
+    throw new Error(`${reason}; the partial export was removed, ${out} was not written`);
+  }
+}
+
+/** `out` may not exist yet, or be an empty directory (then true: it is replaced). */
+function assertFreshTarget(out: string): boolean {
+  if (!existsSync(out)) return false;
+  if (!statSync(out).isDirectory() || readdirSync(out).length > 0) {
+    throw new Error(`${out} exists and is not an empty directory; refusing to write into it`);
+  }
+  return true;
+}
+
+async function fillExport(
+  dir: string,
+  snapshot: Snapshot,
+  options: Parameters<typeof writeExport>[2],
+): Promise<ExportManifest> {
   const tablesDir = join(dir, 'tables');
   privateDirectory(tablesDir);
   const tables: TableManifest[] = snapshot.tables.map((table) => {
@@ -194,6 +245,131 @@ export async function writeExport(
     backup: options.backup ? await options.backup(dir) : null,
   };
   privateFile(join(dir, 'manifest.json'), `${JSON.stringify(manifest, null, 2)}\n`);
+  return manifest;
+}
+
+/** A process run to completion: exit code, raw stdout, stderr text. */
+export type Run = (
+  argv: string[],
+  input?: string,
+) => Promise<{ code: number; stdout: Uint8Array; stderr: string }>;
+
+/** Where psql and pg_dump run: the database pod, or a local container for rehearsals. */
+export type ExportTarget =
+  | { podman: string }
+  | {
+      kubeconfig: string;
+      context?: string;
+      namespace: string;
+      pod?: string;
+      service?: string;
+      container?: string;
+    };
+
+/** A failed psql or pg_dump: exit code and at most 400 characters of stderr. */
+export function failure(what: string, result: { code: number; stderr: string }): Error {
+  // psql and pg_dump errors name objects, not values; keep them short anyway.
+  return new Error(`${what} failed (exit ${result.code}): ${result.stderr.trim().slice(0, 400)}`);
+}
+
+async function execPrefix(run: Run, target: ExportTarget): Promise<string[]> {
+  if ('podman' in target) return ['podman', 'exec', '-i', target.podman];
+  const kubectl = (...rest: string[]) => [
+    'kubectl',
+    '--kubeconfig',
+    target.kubeconfig,
+    ...(target.context ? ['--context', target.context] : []),
+    '--namespace',
+    target.namespace,
+    ...rest,
+  ];
+  let pod = target.pod;
+  if (!pod) {
+    if (!target.service) throw new Error('--pod or --service is required');
+    const listed = await run(
+      kubectl(
+        'get',
+        'pods',
+        '-l',
+        `app=di-bs-${target.service}`,
+        '-o',
+        'jsonpath={range .items[?(@.status.phase=="Running")]}{.metadata.name}{"\\n"}{end}',
+      ),
+    );
+    const pods = new TextDecoder().decode(listed.stdout).split('\n').filter(Boolean);
+    if (listed.code !== 0 || pods.length !== 1) {
+      throw new Error(
+        `expected one Running pod labelled app=di-bs-${target.service}, found ${pods.length} (kubectl exit ${listed.code}); pass --pod`,
+      );
+    }
+    pod = pods[0] as string;
+  }
+  return kubectl('exec', '-i', pod, ...(target.container ? ['-c', target.container] : []), '--');
+}
+
+/**
+ * The whole export (export.ts): psql for the inventory and the snapshot, each in a read-only
+ * transaction with the SQL on stdin, then `writeExport` with `pg_dump -Fc` as the backup unless
+ * `backup` is false. Logs names and counts only.
+ */
+export async function exportCommand(
+  options: {
+    out: string;
+    target: ExportTarget;
+    user: string;
+    database: string;
+    backup: boolean;
+    createdAt: string;
+  },
+  deps: { run: Run; log: (line: string) => void },
+): Promise<ExportManifest> {
+  const prefix = await execPrefix(deps.run, options.target);
+  const login = ['-U', options.user, '-d', options.database];
+  const psql = [
+    ...prefix,
+    'psql',
+    '-X',
+    '-q',
+    '-A',
+    '-t',
+    '-v',
+    'ON_ERROR_STOP=1',
+    ...login,
+    '-f',
+    '-',
+  ];
+  const session: SourceSession = async (sql) => {
+    const result = await deps.run(psql, `BEGIN READ ONLY;\n${sql};\nCOMMIT;\n`);
+    if (result.code !== 0) throw failure('psql', result);
+    return new TextDecoder().decode(result.stdout).replace(/\n$/, '');
+  };
+  const snapshot = await readSource(session);
+  const backup = options.backup
+    ? async (dir: string) => {
+        const result = await deps.run([...prefix, 'pg_dump', '-Fc', ...login]);
+        if (result.code !== 0) throw failure('pg_dump', result);
+        const file = 'directory.dump';
+        privateFile(join(dir, file), result.stdout);
+        return { file, sha256: sha256(result.stdout) };
+      }
+    : undefined;
+  const manifest = await writeExport(options.out, snapshot, {
+    createdAt: options.createdAt,
+    backup,
+  });
+  const { source } = manifest;
+  deps.log(`exported ${options.out} (mode 0700; files 0600; holds secrets and PII)`);
+  deps.log(
+    `source schema V${source.version} (identity_schema_migrations max ${source.guestHistoryMax}, _migrations ${source.runnerHistoryMax ?? 'absent'}, server ${source.serverVersionNum})`,
+  );
+  for (const table of manifest.tables) deps.log(`  ${table.name}: ${table.count} rows`);
+  deps.log(`values.json: ${manifest.runtimeRows.values.join(', ')}`);
+  deps.log(`state.json: ${manifest.runtimeRows.state.join(', ') || 'none'}`);
+  deps.log(`not carried: ${manifest.runtimeRows.dropped.join(', ') || 'none'}`);
+  deps.log(`backup: ${manifest.backup ? `${manifest.backup.file} (pg_dump -Fc)` : 'none'}`);
+  deps.log(
+    `next: bun deploy/guest/runtime-secrets.ts pglite-key --values ${join(options.out, 'values.json')}`,
+  );
   return manifest;
 }
 

@@ -16,7 +16,7 @@ import { join } from 'node:path';
 import type { SqlDatabase } from '../../apps/guest/src/database.ts';
 import type { EmbeddedMigration } from '../../apps/guest/src/flyway.ts';
 import { applySchema } from '../../apps/guest/src/migrations.ts';
-import { assertPrivateMode } from '../platform/components/control-secret.ts';
+import { assertPrivateMode, parseJsonQuietly } from '../platform/components/control-secret.ts';
 import {
   EXCLUDED_TABLES,
   type ExportManifest,
@@ -52,7 +52,10 @@ export function loadExport(dir: string): LoadedExport {
     }
     rows.set(table.name, text);
   }
-  const state = JSON.parse(read(join(dir, 'state.json'))) as Record<string, string>;
+  const state = parseJsonQuietly<Record<string, string>>(
+    read(join(dir, 'state.json')),
+    join(dir, 'state.json'),
+  );
   const unexpected = Object.keys(state).filter((name) => !STATE_ROW_NAMES.includes(name));
   if (unexpected.length > 0) {
     throw new Error(`state.json holds rows that are not bootstrap state: ${unexpected.join(', ')}`);
@@ -121,7 +124,19 @@ export interface ImportReport {
 }
 
 const columnsOf = (value: unknown): string[] =>
-  (typeof value === 'string' ? JSON.parse(value) : value) as string[];
+  (typeof value === 'string' ? parseJsonQuietly(value, 'a column list') : value) as string[];
+
+/**
+ * Sequences and identity columns whose position the import would not carry. V1..V15 have none
+ * (every key is a uuid, a varchar or composite); a schema that gains one must reset it after
+ * the load, so the import refuses until it does.
+ */
+const COUNTERS_SQL = `SELECT
+  (SELECT count(*)::int FROM pg_sequences WHERE schemaname = 'public') AS sequences,
+  (SELECT count(*)::int FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+     JOIN pg_namespace n ON n.oid = c.relnamespace
+   WHERE n.nspname = 'public' AND a.attnum > 0 AND NOT a.attisdropped
+     AND (a.attidentity <> '' OR a.attgenerated <> '')) AS identities`;
 
 /**
  * Migrates the empty database `db` to the export's source version and loads the export. Refuses
@@ -148,6 +163,12 @@ export async function importExport(
     throw new Error(`migrating the new database to V${version} applied ${applied.join(', ')}`);
   }
 
+  const counters = await db.first<{ sequences: unknown; identities: unknown }>(COUNTERS_SQL);
+  if (Number(counters?.sequences) !== 0 || Number(counters?.identities) !== 0) {
+    throw new Error(
+      `V${version} has ${Number(counters?.sequences)} sequences and ${Number(counters?.identities)} identity or generated columns, which this import does not carry; refusing`,
+    );
+  }
   const target = (await db.query<{ name: string; columns: unknown }>(TARGET_TABLES_SQL))
     .map((row) => ({ name: String(row.name), columns: columnsOf(row.columns) }))
     .filter((table) => !EXCLUDED_TABLES.includes(table.name));
@@ -223,6 +244,20 @@ function assertSameSchema(target: readonly TargetTable[], manifest: ExportManife
       throw new Error(`${table.name}: the export's columns differ from the new schema's`);
     }
   }
+}
+
+/** Plaintext that must not appear on disk: engine strings and the users' logins and emails. */
+export function needlesOf(rows: ReadonlyMap<string, string>): string[] {
+  const users = parseJsonQuietly<Array<Record<string, unknown>>>(
+    rows.get('users') ?? '[]',
+    'the exported users',
+  );
+  const fromUsers = users.flatMap((user) =>
+    [user.login, user.email].filter(
+      (value): value is string => typeof value === 'string' && value.length >= 6,
+    ),
+  );
+  return ['PostgreSQL', 'pg_catalog', 'template1', ...fromUsers];
 }
 
 /** What `verifyCiphertext` found on disk. Counts only. */

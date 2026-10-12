@@ -23,23 +23,23 @@
  * migrations on its first start. Afterwards every file of <data-dir> is checked to be encfs
  * ciphertext under the key's KCV, and searched for plaintext.
  *
- * <data-dir> must be new or empty; it ends up mode 0700, ready for install.ts. Prints names,
+ * <data-dir> must be new or empty; it ends up mode 0700, ready for install.ts. A failed import
+ * removes the partly written <data-dir> again. Prints names,
  * counts and the KCV only. Engine output is not printed; pglite-encfs lines on stderr are.
  */
-import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join, resolve } from 'node:path';
+import { resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { embeddedMigrations } from '../../apps/guest/src/migrations.ts';
 import {
-  assertPrivateMode,
-  PGLITE_KEY,
-  parseRuntimeValues,
-  pgliteKeyCheckValue,
-} from '../platform/components/control-secret.ts';
-import { privateDirectory } from './export-core.ts';
-import { importExport, loadExport, verifyCiphertext } from './import-core.ts';
-import { checkProvider, composeRunner, DEFAULTS, describe, startRunner } from './runner.ts';
+  composeRunner,
+  DEFAULTS,
+  describe,
+  importCommand,
+  runSync,
+  startRunner,
+  tool,
+  wasmtimeArgv,
+} from './runner.ts';
 
 const { values: args } = parseArgs({
   options: {
@@ -58,74 +58,32 @@ function required(name: keyof typeof args): string {
   return value;
 }
 
-/** Plaintext that must not appear on disk: engine strings and the users' logins and emails. */
-function needlesOf(rows: Map<string, string>): string[] {
-  const users = JSON.parse(rows.get('users') ?? '[]') as Array<Record<string, unknown>>;
-  const fromUsers = users.flatMap((user) =>
-    [user.login, user.email].filter(
-      (value): value is string => typeof value === 'string' && value.length >= 6,
-    ),
-  );
-  return ['PostgreSQL', 'pg_catalog', 'template1', ...fromUsers];
-}
-
-async function main(): Promise<void> {
-  const exportDir = required('export');
-  const valuesPath = required('values');
-  const out = resolve(required('out'));
-  const loaded = loadExport(exportDir);
-  assertPrivateMode(statSync(valuesPath).mode, valuesPath);
-  const values = parseRuntimeValues(readFileSync(valuesPath, 'utf8'), valuesPath);
-  const key = values[PGLITE_KEY];
-  if (!key) {
-    throw new Error(
-      `${valuesPath} has no ${PGLITE_KEY}; run \`bun deploy/guest/runtime-secrets.ts pglite-key --values ${valuesPath}\` first`,
-    );
-  }
-  const kcv = pgliteKeyCheckValue(key);
-  console.log(`${PGLITE_KEY} KCV ${kcv}`);
-  checkProvider(args.provider as string, args.guest as string);
-  const work = mkdtempSync(join(tmpdir(), 'identity-cutover-'));
-  try {
-    const composed = composeRunner({
-      provider: args.provider as string,
-      runner: args.runner as string,
-      out: join(work, 'runner.composed.wasm'),
-    });
-    privateDirectory(out);
-    const runner = await startRunner(composed, out, key);
-    let report: Awaited<ReturnType<typeof importExport>>;
-    try {
-      report = await importExport(runner.database, loaded, embeddedMigrations);
-      await runner.database.exec('CHECKPOINT');
-    } finally {
-      const code = await runner.stop();
-      if (code !== 0) console.error(`wasmtime exited ${code}`);
-    }
-    console.log(`imported into ${out} (source schema V${report.sourceVersion})`);
-    console.log(`migrations applied: V1..V${report.migrationsApplied.at(-1)}`);
-    for (const table of report.tables) {
-      console.log(`  ${table.name}: ${table.imported}/${table.expected} rows`);
-    }
-    console.log(`bootstrap state rows: ${report.stateRows.join(', ') || 'none'}`);
-    console.log(`identity_runtime_secret rows V16 would delete: ${report.rowsV16WouldDelete}`);
-    const disk = verifyCiphertext(out, kcv, needlesOf(loaded.rows));
-    console.log(
-      `on disk: ${disk.files} files, ${disk.encrypted} encfs ciphertext under KCV ${kcv}, ${disk.empty} empty, ${disk.plaintext.length} without a header; .di-encfs KCV matches: ${disk.markerKcvMatches}; plaintext needles found: ${disk.needlesFound}`,
-    );
-    if (disk.plaintext.length > 0 || !disk.markerKcvMatches || disk.needlesFound > 0) {
-      throw new Error(
-        'the data directory is not fully encrypted under this key; do not install it',
-      );
-    }
-    console.log(`next: bun deploy/cutover/install.ts --data ${out} ... (dry run first)`);
-  } finally {
-    rmSync(work, { recursive: true, force: true });
-  }
-}
-
 try {
-  await main();
+  const warn = (line: string) => console.error(line);
+  await importCommand(
+    {
+      exportDir: required('export'),
+      valuesPath: required('values'),
+      out: resolve(required('out')),
+      provider: args.provider as string,
+      guest: args.guest as string,
+      migrations: embeddedMigrations,
+    },
+    {
+      compose: (out) =>
+        composeRunner(
+          { provider: args.provider as string, runner: args.runner as string, out },
+          {
+            run: runSync,
+            tool: (name) => tool(name, process.env),
+            log: (line) => console.log(line),
+          },
+        ),
+      start: (composed, dataDir, key) => startRunner(wasmtimeArgv(composed, dataDir), key, warn),
+      log: (line) => console.log(line),
+      warn,
+    },
+  );
 } catch (error) {
   console.error(`import: ${describe(error)}`);
   process.exitCode = 2;

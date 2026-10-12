@@ -7,7 +7,7 @@
  * Nothing here logs, prints or puts a value in an error message: errors name tables, columns
  * and row names only.
  */
-import { RUNTIME_SECRET_NAMES } from '../platform/components/control-secret.ts';
+import { parseJsonQuietly, RUNTIME_SECRET_NAMES } from '../platform/components/control-secret.ts';
 
 /**
  * Source schema versions the tools accept. V13 created `identity_runtime_secret`, which the
@@ -172,7 +172,7 @@ export interface ExportManifest {
 
 /** Parses and checks `manifest.json`. */
 export function parseManifest(text: string, source: string): ExportManifest {
-  const manifest = JSON.parse(text) as ExportManifest;
+  const manifest = parseJsonQuietly<ExportManifest>(text, source);
   if (manifest?.format !== 1) throw new Error(`${source} is not a cutover export manifest`);
   const { min, max } = SUPPORTED_SOURCE_VERSIONS;
   const version = manifest.source?.version;

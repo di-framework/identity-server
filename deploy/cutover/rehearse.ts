@@ -36,6 +36,7 @@ import { Browser } from '../../apps/server/tests/support/browser.ts';
 import {
   assertPrivateMode,
   PGLITE_KEY,
+  parseJsonQuietly,
   parseRuntimeValues,
 } from '../platform/components/control-secret.ts';
 import { loadExport } from './import-core.ts';
@@ -45,7 +46,10 @@ import {
   DATABASE_ROOT,
   DEFAULTS,
   describe,
+  runSync,
   startRunner,
+  tool,
+  wasmtimeArgv,
 } from './runner.ts';
 import { RUNTIME_SECRET_TABLE, V16_KEPT_ROW_NAMES } from './source.ts';
 
@@ -84,12 +88,17 @@ async function main(): Promise<void> {
   try {
     const copy = join(work, 'data');
     cpSync(required('data'), copy, { recursive: true });
-    const composed = composeRunner({
-      provider: args.provider as string,
-      runner: args.runner as string,
-      out: join(work, 'runner.composed.wasm'),
-    });
-    const runner = await startRunner(composed, copy, key);
+    const composed = composeRunner(
+      {
+        provider: args.provider as string,
+        runner: args.runner as string,
+        out: join(work, 'runner.composed.wasm'),
+      },
+      { run: runSync, tool: (name) => tool(name, process.env), log: (line) => console.log(line) },
+    );
+    const runner = await startRunner(wasmtimeArgv(composed, copy), key, (line) =>
+      console.error(line),
+    );
     try {
       await rehearse(runner.database, values, loaded);
     } finally {
@@ -186,7 +195,10 @@ async function rehearse(
     await fetch(new Request(`${origin}/.well-known/openid-configuration`))
   ).json()) as { issuer?: string };
   record('issuer', discovery.issuer === values.ISSUER_URL, 'discovery issuer equals ISSUER_URL');
-  const kid = (JSON.parse(values.AUTH_ACTIVE_PRIVATE_JWK as string) as { kid?: string }).kid;
+  const kid = parseJsonQuietly<{ kid?: string }>(
+    values.AUTH_ACTIVE_PRIVATE_JWK as string,
+    'AUTH_ACTIVE_PRIVATE_JWK',
+  ).kid;
   const jwks = (await (await fetch(new Request(`${origin}/oauth2/jwks`))).json()) as {
     keys: Array<{ kid?: string }>;
   };

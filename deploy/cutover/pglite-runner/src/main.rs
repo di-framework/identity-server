@@ -26,21 +26,41 @@ fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Hex to bytes; total: odd lengths and non-hex characters (ASCII or not) are errors.
 fn unhex(text: &str) -> Result<Vec<u8>, String> {
-    if !text.len().is_multiple_of(2) {
+    let digit = |byte: u8| -> Result<u8, String> {
+        (byte as char)
+            .to_digit(16)
+            .map(|value| value as u8)
+            .ok_or_else(|| "invalid hex".to_string())
+    };
+    let bytes = text.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
         return Err("odd hex length".into());
     }
-    (0..text.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&text[i..i + 2], 16).map_err(|e| e.to_string()))
+    bytes
+        .chunks(2)
+        .map(|pair| Ok(digit(pair[0])? << 4 | digit(pair[1])?))
         .collect()
+}
+
+/// A float as JavaScript's `String(number)` spells the non-finite ones (`NaN`, `Infinity`,
+/// `-Infinity`), which both `Number()` and Rust's `f64` parser read back.
+fn real_text(value: f64) -> String {
+    if value.is_nan() {
+        "NaN".into()
+    } else if value.is_infinite() {
+        (if value > 0.0 { "Infinity" } else { "-Infinity" }).into()
+    } else {
+        value.to_string()
+    }
 }
 
 fn to_json(value: &Value) -> Json {
     match value {
         Value::Null => json!({"tag": "null"}),
         Value::Integer(v) => json!({"tag": "integer", "val": v.to_string()}),
-        Value::Real(v) => json!({"tag": "real", "val": v.to_string()}),
+        Value::Real(v) => json!({"tag": "real", "val": real_text(*v)}),
         Value::Text(v) => json!({"tag": "text", "val": v}),
         Value::Blob(v) => json!({"tag": "blob", "val": hex(v)}),
         Value::Boolean(v) => json!({"tag": "boolean", "val": v}),

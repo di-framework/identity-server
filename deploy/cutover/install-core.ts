@@ -6,9 +6,12 @@
  * Where the directory goes is the platform's rule (di-framework/platform
  * `platform/platform/src/tenancy/workload-storage.ts`): the controller mounts
  * `<storageRoot>/di-tenants/<tenant uid>/workloads/<key>` into the tenant host at
- * `/var/lib/di-framework/workloads/<key>`, `<key>` being the workload's name, and a root init
- * container hands that directory (not its contents) to the host uid 65532. The guest sees it as
- * `/data`. So the files are copied there owned by 65532, directories 0700 and files 0600.
+ * `/var/lib/di-framework/workloads/<key>`, and a root init container hands that directory (not its
+ * contents) to the host uid 65532. The guest sees it as `/data`. `<key>` is the workload's
+ * `di-framework.dev/workload` label, else its `di-framework.dev/application` label, else its name
+ * (`storageKey`); cli-plugin-platform sets `di-framework.dev/application` to the config's `name`,
+ * so for the identity guest it is `identity`. The files are copied there owned by 65532,
+ * directories 0700 and files 0600.
  *
  * Every function takes an injected kubectl; nothing here prints or returns file contents.
  */
@@ -177,16 +180,18 @@ export async function singleNode(kubectl: Kubectl): Promise<string> {
 }
 
 /**
- * The helper pod: the fixed image the platform's own storage init uses, root with only the
- * capabilities a copy and chown need, the tenant's `workloads` directory mounted at
- * `/workloads`, pinned to the node. It sleeps until install.ts removes it.
+ * The helper pod: the fixed image the platform's own storage init uses, root with only CHOWN
+ * (hand the files to the host uid) and DAC_OVERRIDE (write into a directory the host uid may
+ * already own), pinned to the node, with exactly the target directory mounted at `/target`
+ * (`DirectoryOrCreate`). The archive is extracted without its owners, so root owns the files
+ * while their modes are set, and only then are they handed over. It sleeps until removed.
  */
 export function helperPod(options: {
   name: string;
   namespace: string;
   node: string;
   image: string;
-  workloadsDir: string;
+  target: string;
 }): Record<string, unknown> {
   return {
     apiVersion: 'v1',
@@ -212,17 +217,12 @@ export function helperPod(options: {
             runAsNonRoot: false,
             allowPrivilegeEscalation: false,
             readOnlyRootFilesystem: true,
-            capabilities: { drop: ['ALL'], add: ['CHOWN', 'FOWNER', 'DAC_OVERRIDE'] },
+            capabilities: { drop: ['ALL'], add: ['CHOWN', 'DAC_OVERRIDE'] },
           },
-          volumeMounts: [{ name: 'workloads', mountPath: '/workloads' }],
+          volumeMounts: [{ name: 'target', mountPath: '/target' }],
         },
       ],
-      volumes: [
-        {
-          name: 'workloads',
-          hostPath: { path: options.workloadsDir, type: 'DirectoryOrCreate' },
-        },
-      ],
+      volumes: [{ name: 'target', hostPath: { path: options.target, type: 'DirectoryOrCreate' } }],
     },
   };
 }
@@ -256,4 +256,149 @@ export function entries(listing: string): string[] {
     .split('\n')
     .map((line) => line.trim())
     .filter(Boolean);
+}
+
+/** kubectl that may take binary stdin (the archive). */
+export type InstallKubectl = (
+  args: string[],
+  input?: string | Uint8Array,
+) => Promise<{ code: number | null; stdout: string; stderr: string }>;
+
+export interface InstallOptions {
+  data: string;
+  /** The values file's DI_PGLITE_KEY KCV. */
+  kcv: string;
+  tenant: string;
+  workload: string;
+  storageRoot?: string;
+  node?: string;
+  image: string;
+  namespace: string;
+  /** Install although the tenant already has the WorkloadDeployment (its host may race us). */
+  allowExistingWorkload: boolean;
+  yes: boolean;
+  podName: string;
+}
+
+/**
+ * The install (install.ts). Reads and checks everything first (marker KCV against the values,
+ * the tenant's `directory`, the tenant uid, the storage root, the node, no WorkloadDeployment
+ * yet); without `yes` it stops there. With `yes` it runs the helper pod, refuses a non-empty
+ * target before sending anything, extracts the archive, sets modes then owner, compares every
+ * digest and owner, and always deletes the pod: a failed delete is an error that names the pod.
+ */
+export async function installCommand(
+  options: InstallOptions,
+  deps: {
+    kubectl: InstallKubectl;
+    refuseLegacyTenant: (namespace: string) => Promise<void>;
+    log: (line: string) => void;
+    warn: (line: string) => void;
+  },
+): Promise<'dry-run' | 'installed'> {
+  const tree = localTree(options.data);
+  if (tree.markerKcv !== options.kcv) {
+    throw new Error(
+      `${options.data} is encrypted under KCV ${tree.markerKcv}, the values file's key has KCV ${options.kcv}; refusing`,
+    );
+  }
+  const kubectl: Kubectl = (args, input) =>
+    deps.kubectl(args, input).then((result) => ({ ...result }));
+  await deps.refuseLegacyTenant(`di-tenant-${options.tenant}`);
+  const uid = await tenantUid(kubectl, options.tenant);
+  const root = options.storageRoot ?? (await discoverStorageRoot(kubectl));
+  const target = workloadStoragePath(root, uid, options.workload);
+  const node = options.node ?? (await singleNode(kubectl));
+  const existing = await kubectl([
+    '--namespace',
+    `di-tenant-${options.tenant}`,
+    'get',
+    'workloaddeployment',
+    options.workload,
+    '--ignore-not-found',
+    '-o',
+    'name',
+  ]);
+  if (existing.code !== 0) {
+    throw new Error(
+      `cannot check for WorkloadDeployment ${options.workload} (kubectl exit ${existing.code})`,
+    );
+  }
+  if (existing.stdout.trim() && !options.allowExistingWorkload) {
+    throw new Error(
+      `WorkloadDeployment ${options.workload} already exists in di-tenant-${options.tenant}; its host may initialise the directory first. Install before deploying, or pass --allow-existing-workload`,
+    );
+  }
+  deps.log(`tenant ${options.tenant} (uid ${uid}), node ${node}`);
+  deps.log(`target ${target} (the guest's /data)`);
+  deps.log(
+    `source ${options.data}: ${tree.files.length} files, ${tree.directories.length} directories, ${tree.bytes} bytes; .di-encfs KCV ${tree.markerKcv} = values KCV`,
+  );
+  if (!options.yes) {
+    deps.log('dry run: nothing changed. Re-run with --yes to install.');
+    return 'dry-run';
+  }
+
+  const pod = options.podName;
+  const namespace = options.namespace;
+  const manifest = helperPod({ name: pod, namespace, node, image: options.image, target });
+  const created = await kubectl(['create', '-f', '-'], JSON.stringify(manifest));
+  if (created.code !== 0) throw new Error(`cannot create the helper pod: ${created.stderr.trim()}`);
+  const exec = async (script: string, input?: Uint8Array) => {
+    const result = await deps.kubectl(
+      ['--namespace', namespace, 'exec', ...(input ? ['-i'] : []), pod, '--', 'sh', '-c', script],
+      input,
+    );
+    if (result.code !== 0) {
+      throw new Error(
+        `helper step failed (exit ${result.code}): ${result.stderr.trim().slice(0, 300)}`,
+      );
+    }
+    return result.stdout;
+  };
+  let failed: unknown;
+  try {
+    const ready = await kubectl([
+      '--namespace',
+      namespace,
+      'wait',
+      '--for=condition=Ready',
+      `pod/${pod}`,
+      '--timeout=180s',
+    ]);
+    if (ready.code !== 0) throw new Error(`the helper pod did not start: ${ready.stderr.trim()}`);
+    const present = entries(await exec('ls -A /target'));
+    if (present.length > 0) {
+      throw new Error(`${target} is not empty (${present.length} entries); refusing to install`);
+    }
+    await exec('tar -x -o -f - -C /target', tarball(options.data, tree));
+    await exec(
+      'cd /target && find . -type d -exec chmod 700 {} + && find . -type f -exec chmod 600 {} + && ' +
+        `chown -R ${HOST_UID}:${HOST_UID} .`,
+    );
+    const digests = compareDigests(
+      tree,
+      await exec('cd /target && find . -type f -exec sha256sum {} +'),
+    );
+    const foreign = entries(await exec(`cd /target && find . ! -user ${HOST_UID}`));
+    deps.log(
+      `installed: ${digests.matched}/${tree.files.length} files match, ${digests.missing.length} missing, ${digests.changed.length} changed, ${digests.extra.length} extra; ${foreign.length} not owned by ${HOST_UID}`,
+    );
+    if (
+      digests.missing.length + digests.changed.length + digests.extra.length + foreign.length >
+      0
+    ) {
+      throw new Error('the installed directory does not match; do not start the guest on it');
+    }
+  } catch (error) {
+    failed = error;
+  }
+  const removed = await kubectl(['--namespace', namespace, 'delete', 'pod', pod, '--wait=false']);
+  if (removed.code !== 0) {
+    const message = `could not delete the helper pod ${namespace}/${pod} (kubectl exit ${removed.code}); it mounts ${target} as root. Delete it by hand: kubectl --namespace ${namespace} delete pod ${pod}`;
+    if (failed) deps.warn(message);
+    else throw new Error(message);
+  }
+  if (failed) throw failed;
+  return 'installed';
 }
