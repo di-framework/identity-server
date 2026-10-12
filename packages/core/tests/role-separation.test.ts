@@ -123,3 +123,62 @@ test('the service role works with DML only and cannot undo the latch', async () 
   }
   expect((await service.query('SELECT version FROM _migrations')).length).toBeGreaterThan(0);
 });
+
+test('a temp table cannot shadow the latch for the plaintext-reject trigger', async () => {
+  // Runs after the opt-in above: the real latch is enabled. A session holding the service
+  // credentials creates `pg_temp.identity_column_encryption` claiming encryption is off; pg_temp
+  // comes first in the default search_path, so an unpinned trigger function would read it.
+  await service.exec(
+    `CREATE TEMP TABLE identity_column_encryption
+       (enabled boolean, column_key_check text, bidx_key_check text);
+     INSERT INTO identity_column_encryption VALUES (false, NULL, NULL)`,
+  );
+  try {
+    expect(
+      await service.first<Record<string, unknown>>(
+        'SELECT enabled FROM identity_column_encryption',
+      ),
+    ).toEqual({ enabled: false });
+    const refused = await Promise.all(
+      [
+        `INSERT INTO auth_audit_records (id, action, before_metadata, after_metadata)
+         VALUES (gen_random_uuid(), 'roles.shadow', '{}', '{"leak":1}')`,
+        `INSERT INTO users (id, login, normalized_login, email, display_name)
+         VALUES (gen_random_uuid(), 'shadow', 'shadow', 'shadow@example.com', 'Shadow')`,
+        `INSERT INTO email_challenges (id, email, token_hash, purpose, expires_at)
+         VALUES (gen_random_uuid(), 'shadow@example.com', repeat('a', 64), 'sign_in', now())`,
+      ].map((statement) =>
+        service.run(statement).then(
+          () => 'succeeded',
+          (error: unknown) => {
+            const record = error as { errno?: unknown; code?: unknown };
+            return String(record.errno ?? record.code);
+          },
+        ),
+      ),
+    );
+    expect(refused).toEqual(['IDC01', 'IDC01', 'IDC01']);
+  } finally {
+    await service.exec('DROP TABLE pg_temp.identity_column_encryption');
+  }
+  expect(
+    await owner.first<Record<string, unknown>>(
+      `SELECT (SELECT count(*)::int FROM auth_audit_records WHERE action = 'roles.shadow') AS audit,
+              (SELECT count(*)::int FROM users WHERE login = 'shadow') AS users`,
+    ),
+  ).toEqual({ audit: 0, users: 0 });
+  // V20 pins both column encryption trigger functions, so no caller search_path reaches them.
+  expect(
+    await owner.query(
+      `SELECT proname, proconfig FROM pg_proc
+       WHERE proname IN ('identity_reject_plaintext', 'identity_column_encryption_guard')
+       ORDER BY proname`,
+    ),
+  ).toEqual([
+    {
+      proname: 'identity_column_encryption_guard',
+      proconfig: ['search_path=pg_catalog, pg_temp'],
+    },
+    { proname: 'identity_reject_plaintext', proconfig: ['search_path=pg_catalog, pg_temp'] },
+  ]);
+});
