@@ -60,6 +60,7 @@ import {
   ensurePgliteKey,
   type Kubectl,
   newPgliteKey,
+  type PgliteKeyCheck,
   PLAINTEXT_OPT_OUT,
   parseGuestConfig,
   parseRuntimeValues,
@@ -133,6 +134,15 @@ const kubectl: Kubectl = async (argv, input) => {
   return { code: await child.exited, stdout, stderr };
 };
 
+const PGLITE_KEY_CHECK_MESSAGES: Record<PgliteKeyCheck, (secret: string) => string> = {
+  new: (secret) => `${secret} had no DI_PGLITE_KEY yet`,
+  matched: (secret) => `${secret} already holds this DI_PGLITE_KEY (same KCV)`,
+  rotation: (secret) =>
+    `rotation: ${secret} holds the values' DI_PGLITE_KEY_PREVIOUS; the guest re-wraps its files on the next start`,
+  unverified: (secret) =>
+    `cannot read ${secret} as this user, so its DI_PGLITE_KEY was not compared. Replacing it is irreversible: the KCV above must match your custody record`,
+};
+
 /** Prints `name KCV <hex>` lines: one-way values that identify a key, safe to record. */
 function printKcvs(values: Record<string, string>, stream: typeof console.log = console.log): void {
   for (const [name, kcv] of Object.entries(pgliteKeyCheckValues(values))) {
@@ -168,6 +178,7 @@ async function apply(): Promise<void> {
     token: secret(32),
     revision: createHash('sha256').update(randomBytes(16)).digest('hex').slice(0, 16),
   });
+  console.log(PGLITE_KEY_CHECK_MESSAGES[result.pgliteKey](`${workload}-control`));
   console.log(`wrote di-tenant-${args.tenant}/${workload}-control: ${result.names.join(', ')}`);
   console.log(
     `rolled workloaddeployment/${workload} (IDENTITY_RUNTIME_REVISION=${result.revision})`,

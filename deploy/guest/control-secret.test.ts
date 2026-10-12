@@ -8,6 +8,7 @@ import {
   assertPgliteKeys,
   assertPrivateMode,
   COLUMN_KEY_NAMES,
+  checkStoredPgliteKey,
   controlSecretDocument,
   decodePgliteKey,
   defaultKubeStateDir,
@@ -25,7 +26,6 @@ import {
   REQUIRED_RUNTIME_SECRETS,
   REVISION_KEY,
   refuseLegacyTenant,
-  resetControlSecret,
   resolveKubeTarget,
   rollWorkload,
   writeControlSecret,
@@ -272,48 +272,18 @@ test('apply guards, writes and rolls, and reports names only', async () => {
     token: 'token-material',
     revision: 'r2',
   });
-  expect(result).toEqual({ names: Object.keys(VALUES).sort(), revision: 'r2' });
+  expect(result).toEqual({
+    names: Object.keys(VALUES).sort(),
+    revision: 'r2',
+    pgliteKey: 'unverified',
+  });
   expect(calls.map((call) => call.args[2] ?? call.args[0])).toEqual([
     'get',
+    'auth',
     '/api/v1/namespaces/di-tenant-pgprove/secrets',
     'patch',
   ]);
   expect(controlSecretDocument('n', 'w', {}, 't')).toContain('"w-control"');
-});
-
-test('CliWorkload refuses a legacy tenant before it deletes the control Secret', async () => {
-  const legacy = scripted({ stdout: 'backingservice.platform.di-framework.dev/directory' });
-  await expect(
-    resetControlSecret(legacy.kubectl, {
-      namespace: 'di-tenant-identity',
-      name: 'identity-control',
-    }),
-  ).rejects.toThrow('refusing to deploy');
-  expect(legacy.calls).toHaveLength(1);
-  expect(legacy.calls[0]?.args[2]).toBe('get');
-
-  const clean = scripted({ stdout: '' }, {});
-  await resetControlSecret(clean.kubectl, {
-    namespace: 'di-tenant-pgprove',
-    name: 'identity-control',
-  });
-  expect(clean.calls[1]?.args).toEqual([
-    '--namespace',
-    'di-tenant-pgprove',
-    'delete',
-    'secret',
-    'identity-control',
-    '--ignore-not-found',
-    '--wait=false',
-  ]);
-
-  const failed = scripted({ stdout: '' }, { code: 1, stderr: 'Forbidden' });
-  await expect(
-    resetControlSecret(failed.kubectl, {
-      namespace: 'di-tenant-pgprove',
-      name: 'identity-control',
-    }),
-  ).rejects.toThrow('deleting identity-control failed: Forbidden');
 });
 
 describe('the Pulumi preflight before any resource', () => {
@@ -620,6 +590,17 @@ describe('guest config and deploy preflight', () => {
     expect(() =>
       assertDeployable(encrypted, VALUES, { allowPlaintext: true, source: 'v' }),
     ).toThrow('v has no DI_PGLITE_KEY, which the encrypted data directory needs');
+    const keyless = (() => {
+      try {
+        assertDeployable(encrypted, VALUES, { allowPlaintext: false, source: 'v' });
+      } catch (error) {
+        return String(error);
+      }
+    })();
+    expect(keyless).toContain('If identity already has a data directory');
+    expect(keyless).toContain('an encrypted build refuses it (every request answers 503');
+    expect(keyless).toContain('docs/configuration.md#existing-plaintext-deployments');
+    expect(keyless).toContain('only for a new, empty data directory');
     expect(() =>
       assertDeployable({ ...encrypted, controlSecretKeys: ['ISSUER_URL'] }, keyed, {
         allowPlaintext: false,
@@ -642,5 +623,122 @@ describe('guest config and deploy preflight', () => {
         { allowPlaintext: true, source: 'v' },
       ),
     ).toThrow('v holds DI_PGLITE_KEY, so its data directory is encrypted');
+  });
+});
+
+describe('the data directory key already in the cluster', () => {
+  const options = (values: Record<string, string>) => ({
+    namespace: 'di-tenant-pgprove',
+    name: 'identity-control',
+    values,
+  });
+  /** `auth can-i` answers yes, then the read returns the stored key (base64 of its text). */
+  const readable = (stored?: string, read: Partial<KubectlResult> = {}) =>
+    scripted(
+      { stdout: 'yes\n' },
+      {
+        stdout: stored === undefined ? '' : Buffer.from(stored).toString('base64'),
+        ...read,
+      },
+    );
+  const keyed = { ...VALUES, DI_PGLITE_KEY: PGLITE_KEY };
+
+  test('a caller that may not read the Secret compares nothing and sends no read', async () => {
+    for (const answer of [
+      { code: 1, stdout: 'no\n' },
+      { code: 0, stdout: 'no\n' },
+    ]) {
+      const { kubectl, calls } = scripted(answer);
+      expect(await checkStoredPgliteKey(kubectl, options(keyed))).toBe('unverified');
+      expect(calls).toHaveLength(1);
+      expect(calls[0]?.args).toEqual([
+        '--namespace',
+        'di-tenant-pgprove',
+        'auth',
+        'can-i',
+        'get',
+        'secrets/identity-control',
+      ]);
+    }
+  });
+
+  test('no Secret or no key yet, the same key, or a rotation from the stored key', async () => {
+    const absent = readable();
+    expect(await checkStoredPgliteKey(absent.kubectl, options(keyed))).toBe('new');
+    expect(absent.calls[1]?.args).toEqual([
+      '--namespace',
+      'di-tenant-pgprove',
+      'get',
+      'secret',
+      'identity-control',
+      '--ignore-not-found',
+      '-o',
+      'jsonpath={.data.DI_PGLITE_KEY}',
+    ]);
+    const same = readable(PGLITE_KEY.replace(/=$/, ''));
+    expect(await checkStoredPgliteKey(same.kubectl, options(keyed))).toBe('matched');
+    const rotating = readable(PGLITE_KEY);
+    expect(
+      await checkStoredPgliteKey(
+        rotating.kubectl,
+        options({ ...VALUES, DI_PGLITE_KEY: OTHER_PGLITE_KEY, DI_PGLITE_KEY_PREVIOUS: PGLITE_KEY }),
+      ),
+    ).toBe('rotation');
+  });
+
+  test('a different key, a dropped key, or a failed read is refused with KCVs only', async () => {
+    const message = async (
+      stored: string | undefined,
+      values: Record<string, string>,
+      read = {},
+    ) => {
+      const { kubectl } = readable(stored, read);
+      try {
+        await checkStoredPgliteKey(kubectl, options(values));
+      } catch (error) {
+        const text = String(error);
+        for (const key of [PGLITE_KEY, OTHER_PGLITE_KEY])
+          expect(text).not.toContain(key.slice(0, 16));
+        return text;
+      }
+      throw new Error('accepted');
+    };
+    const otherKcv = pgliteKeyCheckValue(OTHER_PGLITE_KEY);
+    expect(await message(PGLITE_KEY, { ...VALUES, DI_PGLITE_KEY: OTHER_PGLITE_KEY })).toContain(
+      `di-tenant-pgprove/identity-control holds DI_PGLITE_KEY with KCV ${PGLITE_KCV}, the values hold KCV ${otherKcv}`,
+    );
+    // A previous key that is not the stored one is not a rotation of this volume.
+    expect(
+      await message(PGLITE_KEY, {
+        ...VALUES,
+        DI_PGLITE_KEY: OTHER_PGLITE_KEY,
+        DI_PGLITE_KEY_PREVIOUS: Buffer.alloc(32, 5).toString('base64'),
+      }),
+    ).toContain('put that key in DI_PGLITE_KEY_PREVIOUS');
+    expect(await message(PGLITE_KEY, VALUES)).toContain(
+      `holds DI_PGLITE_KEY (KCV ${PGLITE_KCV}) and the values have none`,
+    );
+    expect(await message('not-a-key', keyed)).toContain('with KCV invalid');
+    expect(await message(undefined, keyed, { code: 1, stderr: 'boom' })).toContain(
+      'reading di-tenant-pgprove/identity-control failed (kubectl exit 1); refusing to replace it',
+    );
+  });
+
+  test('apply checks before it writes: a mismatch changes nothing in the cluster', async () => {
+    const { kubectl, calls } = scripted(
+      { stdout: '' },
+      { stdout: 'yes' },
+      { stdout: Buffer.from(PGLITE_KEY).toString('base64') },
+    );
+    await expect(
+      applyRuntimeSecrets(kubectl, {
+        tenant: 'pgprove',
+        workload: 'identity',
+        values: { ...VALUES, DI_PGLITE_KEY: OTHER_PGLITE_KEY },
+        token: 'token-material',
+        revision: 'r3',
+      }),
+    ).rejects.toThrow('would lock the guest out');
+    expect(calls.map((call) => call.args[2])).toEqual(['get', 'auth', 'get']);
   });
 });

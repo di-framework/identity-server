@@ -334,7 +334,7 @@ values with `--column-encryption`. Only statuses, counts, booleans and KCVs were
 
 The first `deploy.sh` stopped at the CLI's readiness wait (exit 3) while the tenant host rolled
 to mount the new directory; the workload was Ready after 110 s and `apply` was run on its own,
-as documented. After the pod deletion the host container restarted once on a NATS connection
+as documented then. `deploy.sh` now waits for Ready itself and continues to `apply`. After the pod deletion the host container restarted once on a NATS connection
 refusal at startup, unrelated to the layer. Key rotation was not exercised live (the platform's
 `make smoke` covers it).
 
@@ -399,11 +399,18 @@ therefore deploys the pglite guest into a **new tenant** and never into `identit
 2. Create a new tenant on the instance (for example `identity-pg`) with the exclusive tenant host
    image, and deploy the pglite guest there with `deploy/guest/deploy.sh <instance> <new tenant>
    <values>`, the values taken from the export (keeping the issuer, origin and signing key keeps
-   issued tokens valid). The `authproto` name refusal in `deploy.sh` and the Pulumi preflight is
-   what the sign-off lifts, by a deliberate change, not a flag.
+   issued tokens valid). The export has no data directory key, and `deploy.sh` refuses a values
+   file without one, so first run `bun deploy/guest/runtime-secrets.ts pglite-key --values
+   <values>` (correct here: the new tenant's data directory is new and empty), back the key up
+   apart from any volume backup, and record the KCV it prints
+   (docs/configuration.md#data-directory-encryption). The `authproto` name refusal in `deploy.sh`
+   and the Pulumi preflight is what the sign-off lifts, by a deliberate change, not a flag.
 3. Load the data into the new database. There is no network path into pglite; this needs a
-   one-off import (for example a guest admin endpoint or a one-shot component on the same data
-   directory) that does not exist yet.
+   one-off import (for example a guest admin endpoint, or a one-shot component on the same data
+   directory) that does not exist yet. A one-shot component must be composed like the guest,
+   with the pinned pglite-encfs layer between pglite and the host, and get the same
+   `DI_PGLITE_KEY` in its environment: the directory is encrypted from the guest's first start,
+   and a plaintext provider is refused there.
 4. Move the public route to the new tenant once the new guest is verified, then retire the old
    workload and, after a final backup, the `directory` BackingService and tenant `identity`.
 

@@ -268,7 +268,11 @@ export function assertDeployable(
   if (config.encryption !== undefined) {
     if (values[PGLITE_KEY] === undefined) {
       throw new Error(
-        `${options.source} has no ${PGLITE_KEY}, which the encrypted data directory needs; add one with \`runtime-secrets.ts pglite-key\` (a new volume only)`,
+        `${options.source} has no ${PGLITE_KEY}, which the encrypted data directory needs. ` +
+          `If ${config.name} already has a data directory (deployed before identity-server#62), ` +
+          'it is plaintext and an encrypted build refuses it (every request answers 503; the data ' +
+          'stays as it is): see docs/configuration.md#existing-plaintext-deployments. Add a key with ' +
+          '`runtime-secrets.ts pglite-key` only for a new, empty data directory',
       );
     }
     return pgliteKeyCheckValues(values);
@@ -430,7 +434,78 @@ export async function rollWorkload(
   }
 }
 
-/** Guard, write, roll. Returns the names written and the revision. */
+/** How the data directory key about to be written compares with the one in the cluster. */
+export type PgliteKeyCheck =
+  /** The cluster has no key yet (no Secret, or a Secret without one). */
+  | 'new'
+  /** The cluster's key has the same KCV. */
+  | 'matched'
+  /** The cluster's key is the values' DI_PGLITE_KEY_PREVIOUS: a rotation. */
+  | 'rotation'
+  /** The caller may not read the Secret, so nothing was compared. */
+  | 'unverified';
+
+/**
+ * Refuses to replace the data directory key in the cluster with a different one. A new key does
+ * not open a volume encrypted under the old one, and the Secret may hold the only other copy.
+ *
+ * When the caller may read `<workload>-control` (an administrator, the Pulumi program), the stored
+ * `DI_PGLITE_KEY` is compared by KCV: the same key, or the stored key supplied as
+ * `DI_PGLITE_KEY_PREVIOUS` (a rotation), may be written; anything else, including dropping the
+ * key, is refused before the Secret changes. Errors show KCVs, never keys.
+ *
+ * Tenant developers may not read Secrets (`kubectl auth can-i` decides that without sending a
+ * read), so for them nothing is compared and the result is `unverified`: the write goes ahead as
+ * before, and the caller must check the printed KCV against its custody record.
+ */
+export async function checkStoredPgliteKey(
+  kubectl: Kubectl,
+  options: { namespace: string; name: string; values: Record<string, string> },
+): Promise<PgliteKeyCheck> {
+  const allowed = await kubectl([
+    '--namespace',
+    options.namespace,
+    'auth',
+    'can-i',
+    'get',
+    `secrets/${options.name}`,
+  ]);
+  if (allowed.code !== 0 || allowed.stdout.trim() !== 'yes') return 'unverified';
+  const read = await kubectl([
+    '--namespace',
+    options.namespace,
+    'get',
+    'secret',
+    options.name,
+    '--ignore-not-found',
+    '-o',
+    `jsonpath={.data.${PGLITE_KEY}}`,
+  ]);
+  if (read.code !== 0) {
+    throw new Error(
+      `reading ${options.namespace}/${options.name} failed (kubectl exit ${read.code}); refusing to replace it`,
+    );
+  }
+  if (read.stdout.trim() === '') return 'new';
+  const stored = Buffer.from(read.stdout.trim(), 'base64').toString('utf8');
+  const storedKcv = decodePgliteKey(stored) === undefined ? 'invalid' : pgliteKeyCheckValue(stored);
+  const target = `${options.namespace}/${options.name}`;
+  const next = options.values[PGLITE_KEY];
+  if (next === undefined) {
+    throw new Error(
+      `${target} holds ${PGLITE_KEY} (KCV ${storedKcv}) and the values have none; writing them would remove the data directory key. Refusing`,
+    );
+  }
+  const nextKcv = pgliteKeyCheckValue(next);
+  if (nextKcv === storedKcv) return 'matched';
+  const previous = options.values[PGLITE_PREVIOUS_KEY];
+  if (previous !== undefined && pgliteKeyCheckValue(previous) === storedKcv) return 'rotation';
+  throw new Error(
+    `${target} holds ${PGLITE_KEY} with KCV ${storedKcv}, the values hold KCV ${nextKcv}. Writing it would lock the guest out of its data directory. Use the key with KCV ${storedKcv}, or, to rotate, put that key in ${PGLITE_PREVIOUS_KEY}. Refusing`,
+  );
+}
+
+/** Guard, check the stored key, write, roll. Returns the names written, the revision and the key check. */
 export async function applyRuntimeSecrets(
   kubectl: Kubectl,
   options: {
@@ -440,41 +515,21 @@ export async function applyRuntimeSecrets(
     token: string;
     revision: string;
   },
-): Promise<{ names: string[]; revision: string }> {
+): Promise<{ names: string[]; revision: string; pgliteKey: PgliteKeyCheck }> {
   const namespace = `di-tenant-${options.tenant}`;
   await refuseLegacyTenant(kubectl, namespace);
+  const pgliteKey = await checkStoredPgliteKey(kubectl, {
+    namespace,
+    name: `${options.workload}-control`,
+    values: options.values,
+  });
   await writeControlSecret(kubectl, { ...options, namespace });
   await rollWorkload(kubectl, {
     namespace,
     workload: options.workload,
     revision: options.revision,
   });
-  return { names: Object.keys(options.values).sort(), revision: options.revision };
-}
-
-/**
- * Deletes the control Secret before a CLI deploy, after refusing a tenant that still runs the
- * Postgres-era guest. The CLI rewrites `<workload>-control` with only its control token, and a
- * tenant developer's replace is refused while it holds more keys. A plain delete: tenant
- * developers may delete Secrets but not read them.
- */
-export async function resetControlSecret(
-  kubectl: Kubectl,
-  options: { namespace: string; name: string },
-): Promise<void> {
-  await refuseLegacyTenant(kubectl, options.namespace);
-  const deleted = await kubectl([
-    '--namespace',
-    options.namespace,
-    'delete',
-    'secret',
-    options.name,
-    '--ignore-not-found',
-    '--wait=false',
-  ]);
-  if (deleted.code !== 0) {
-    throw new Error(`deleting ${options.name} failed: ${deleted.stderr.trim().slice(-300)}`);
-  }
+  return { names: Object.keys(options.values).sort(), revision: options.revision, pgliteKey };
 }
 
 /** The di-framework-kube instance that runs the Postgres-era guest; never a target here. */

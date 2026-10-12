@@ -30,8 +30,17 @@
 # roll the workload onto them. The values file is only read: the data directory key it holds is
 # never regenerated, so every deploy reuses it. On a first deploy the Secret does not exist yet;
 # the CLI creates it with only its control keys, and until the last step the guest answers 503
-# (the encryption layer refuses to start without its key, and changes nothing). If a step after
-# the build fails, fix the cause and run
+# (the encryption layer refuses to start without its key, and changes nothing).
+#
+# The first deploy of a new workload usually outlasts the CLI's fixed readiness wait (30 x 2 s):
+# the tenant host rolls to mount the new data directory. The CLI then exits 3 with "did not become
+# ready". That case is expected, so this script polls the WorkloadDeployment's Ready condition for
+# up to IDENTITY_READY_TIMEOUT seconds (default 300) and continues to the last step. It polls
+# instead of `kubectl wait`, which exited at once without its error on these WorkloadDeployments
+# in the proving-grounds harness. Waiting is safe: the key is in the values file, the Secret does
+# not have it yet, and the layer refuses the empty directory without writing to it.
+#
+# If a step after the build fails, fix the cause and run
 #   bun deploy/guest/runtime-secrets.ts apply --values <file> --kubeconfig <kc> --tenant <tenant>
 # on its own: it rewrites the Secret and rolls the workload.
 set -eu
@@ -66,10 +75,34 @@ bun "$secrets" guard --kubeconfig "$IDENTITY_KUBECONFIG" --context "$IDENTITY_KU
 # Build before touching the cluster, so a build failure leaves the running guest and its Secret.
 (cd "$root/apps/guest" && di-framework platform build)
 
-(cd "$root/apps/guest" && di-framework platform deploy "$workload" --target identity --yes) || {
-  echo "deploy of $workload failed; once fixed, run: bun $secrets apply --values $values --kubeconfig <kubeconfig> --tenant $tenant" >&2
+recovery="bun $secrets apply --values $values --kubeconfig $IDENTITY_KUBECONFIG --context $IDENTITY_KUBE_CONTEXT --tenant $tenant"
+deploy_log="$(mktemp "${TMPDIR:-/tmp}/identity-deploy.XXXXXX")"
+trap 'rm -f "$deploy_log"' EXIT
+if (cd "$root/apps/guest" && di-framework platform deploy "$workload" --target identity --yes) >"$deploy_log" 2>&1; then
+  status=0
+else
+  status=$?
+fi
+cat "$deploy_log"
+if [ "$status" -eq 3 ] && grep -q 'did not become ready' "$deploy_log"; then
+  timeout="${IDENTITY_READY_TIMEOUT:-300}"
+  echo "the CLI stopped waiting for $workload to become Ready (expected on a first deploy); waiting up to ${timeout}s" >&2
+  waited=0
+  until [ "$(kubectl --kubeconfig "$IDENTITY_KUBECONFIG" --context "$IDENTITY_KUBE_CONTEXT" \
+    --namespace "di-tenant-$tenant" get workloaddeployment "$workload" \
+    -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null)" = True ]; do
+    if [ "$waited" -ge "$timeout" ]; then
+      echo "$workload is not Ready after ${timeout}s; once it is, run: $recovery" >&2
+      exit 3
+    fi
+    sleep 5
+    waited=$((waited + 5))
+  done
+  echo "$workload is Ready after ${waited}s more" >&2
+elif [ "$status" -ne 0 ]; then
+  echo "deploy of $workload failed (exit $status); once fixed, run: $recovery" >&2
   exit 3
-}
+fi
 
 bun "$secrets" apply --values "$values" \
   --kubeconfig "$IDENTITY_KUBECONFIG" --context "$IDENTITY_KUBE_CONTEXT" --tenant "$tenant"

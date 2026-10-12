@@ -21,8 +21,8 @@
  *                     origin, RS256 signing key (@pulumi/tls), passwords and client secrets
  *                     (@pulumi/random), SMTP, and the data directory key DI_PGLITE_KEY
  *                     (@pulumi/random; its KCV is the `pgliteKeyCheckValue` output). Rewritten
- *                     after every deploy (`CliWorkload` resets that
- *                     Secret), then the workload rolls onto them.
+ *                     after every deploy, which keeps the Secret's declared keys, then the
+ *                     workload rolls onto them.
  *
  * `pulumi up` builds the environment; `pulumi destroy` removes it in reverse order.
  *
@@ -59,7 +59,7 @@
 
 import { spawnSync } from 'node:child_process';
 import { createHash, createPrivateKey } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { join, resolve } from 'node:path';
 import * as k8s from '@pulumi/kubernetes';
@@ -69,6 +69,7 @@ import * as tls from '@pulumi/tls';
 import { parse } from 'yaml';
 import {
   PGLITE_KEY,
+  parseGuestConfig,
   pgliteKeyCheckValues,
   preflightCluster,
   resolveKubeTarget,
@@ -80,8 +81,6 @@ import { InClusterRegistry } from './components/registry';
 import { RuntimeSecrets } from './components/secrets';
 import { CliWorkload, sourceDigest } from './components/workload';
 
-/** Project name in apps/guest/di-framework.config.json. */
-const APPLICATION = 'identity';
 /** Target in di-framework.deploy.toml. */
 const TARGET = 'identity';
 
@@ -92,6 +91,13 @@ interface ExternalRegistry {
 
 const config = new pulumi.Config();
 const workspaceRoot = resolve(__dirname, '../..');
+/**
+ * Project name in apps/guest/di-framework.config.json: the WorkloadDeployment and its
+ * `<name>-control` Secret. Read from the config, as deploy/guest/deploy.sh and
+ * `runtime-secrets.ts apply` do, so the two deploy paths cannot name different workloads.
+ */
+const guestConfigPath = join(workspaceRoot, 'apps', 'guest', 'di-framework.config.json');
+const APPLICATION = parseGuestConfig(readFileSync(guestConfigPath, 'utf8'), guestConfigPath).name;
 
 /**
  * The tenant the platform declares and the guest deploys into. Required, with no default: the
@@ -357,12 +363,11 @@ const identity = new CliWorkload(
       IDENTITY_REGISTRY_PULL: registryPull,
     },
     registryForward,
-    resetControlSecret: {
-      kubeconfig: kube.kubeconfig,
-      context,
-      namespace: `di-tenant-${TENANT}`,
-      name: `${APPLICATION}-control`,
-    },
+    // Only the tenant check, no control Secret delete before the deploy: every runtime value is
+    // declared in `controlSecretKeys`, and with this admin kubeconfig the CLI reads the Secret,
+    // refuses undeclared keys and carries the declared ones (DI_PGLITE_KEY included) over with a
+    // fresh token. `RuntimeSecrets` then writes the values again and rolls the workload.
+    guardTenant: { kubeconfig: kube.kubeconfig, context, namespace: `di-tenant-${TENANT}` },
     // Everything the guest component bundles: the guest, the API, the server, core,
     // the client assets, and the dependency and deploy manifests.
     sourceDigest: sourceDigest(workspaceRoot, [
@@ -430,15 +435,24 @@ const smtpHost: pulumi.Output<string> = mailpit
  * the stack state, separate from each other and from the pglite filesystem key. Losing them makes
  * encrypted columns unreadable. `columnEncryption: true` opts the guest in.
  */
-const columnKey = new random.RandomBytes('identity-column-key', { length: 32 }).base64;
-const bidxKey = new random.RandomBytes('identity-bidx-key', { length: 32 }).base64;
+/**
+ * `protect`: these keys are the only way to read data that already exists. A replace (`pulumi up
+ * --replace`, a rename without an alias, a changed `length`) or a `pulumi destroy` would generate
+ * new ones, while the data stays behind (`platform destroy` keeps the workload's storage). Either
+ * now needs an explicit `pulumi state unprotect` first.
+ */
+const keep = { protect: true };
+const columnKey = new random.RandomBytes('identity-column-key', { length: 32 }, keep).base64;
+const bidxKey = new random.RandomBytes('identity-bidx-key', { length: 32 }, keep).base64;
 const columnEncryption = config.getBoolean('columnEncryption') ?? false;
 /**
  * The pglite-encfs data directory key (docs/configuration.md#data-directory-encryption): generated
  * once and kept in the stack state. Losing it loses the database; replacing it locks the guest
  * out of its volume. `pgliteKeyCheckValue` identifies it without revealing it.
  */
-const pgliteKey = new random.RandomBytes('identity-pglite-key', { length: 32 }).base64;
+// Protected (see `keep`): a new key cannot open the volume, so replacing or destroying this
+// resource is a key change, and `platform destroy` leaves the encrypted directory behind.
+const pgliteKey = new random.RandomBytes('identity-pglite-key', { length: 32 }, keep).base64;
 export const pgliteKeyCheckValue = pulumi.unsecret(
   pgliteKey.apply((key) => pgliteKeyCheckValues({ [PGLITE_KEY]: key })[PGLITE_KEY] as string),
 );

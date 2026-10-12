@@ -182,10 +182,15 @@ describe('deploy.sh', () => {
         { mode: 0o755 },
       );
     };
-    record('di-framework', 'exit 0');
+    // STUB_DEPLOY_EXIT makes `platform deploy` stop as the CLI does when its readiness wait ends.
+    record(
+      'di-framework',
+      `case "$*" in "platform deploy"*) if [ -n "\${STUB_DEPLOY_EXIT:-}" ]; then echo "WorkloadDeployment x did not become ready"; exit "$STUB_DEPLOY_EXIT"; fi ;; esac\nexit 0`,
+    );
+    // STUB_READY is what the WorkloadDeployment's Ready condition reads (default True).
     record(
       'kubectl',
-      `case "$*" in *" create --raw "*|*" replace --raw "*) cat >"${calls}/$n.stdin" ;; esac\nexit 0`,
+      `case "$*" in *" create --raw "*|*" replace --raw "*) cat >"${calls}/$n.stdin" ;; *" get workloaddeployment "*) printf '%s' "\${STUB_READY:-True}" ;; esac\nexit 0`,
     );
     return { bin, calls };
   }
@@ -215,7 +220,9 @@ describe('deploy.sh', () => {
     }
     expect(readFileSync(path, 'utf8')).toBe(before);
 
-    const entries = readdirSync(calls).sort((a, b) => Number.parseInt(a, 10) - Number.parseInt(b, 10));
+    const entries = readdirSync(calls).sort(
+      (a, b) => Number.parseInt(a, 10) - Number.parseInt(b, 10),
+    );
     const argv = entries
       .filter((name) => name.endsWith('.args'))
       .map((name) => readFileSync(join(calls, name), 'utf8').trim());
@@ -236,6 +243,57 @@ describe('deploy.sh', () => {
         values.DI_PGLITE_KEY as string,
       );
     }
+  });
+
+  /** deploy.sh against the stubs, with `extra` in its environment. */
+  function deployWith(path: string, bin: string, extra: Record<string, string>) {
+    const result = Bun.spawnSync(['sh', deployScript, 'pgprove', 'pgprove', path], {
+      cwd: root,
+      env: {
+        PATH: `${bin}:${process.env.PATH ?? ''}`,
+        HOME: process.env.HOME ?? '',
+        IDENTITY_KUBECONFIG: join(work, 'kubeconfig'),
+        IDENTITY_KUBE_CONTEXT: 'test',
+        ...extra,
+      },
+    });
+    return { code: result.exitCode, stderr: result.stderr.toString() };
+  }
+  const argvOf = (calls: string) =>
+    readdirSync(calls)
+      .filter((name) => name.endsWith('.args'))
+      .map((name) => readFileSync(join(calls, name), 'utf8').trim());
+
+  test('a first deploy that outlasts the CLI readiness wait waits for Ready, then applies', () => {
+    const { path } = generate();
+    const { bin, calls } = stubs();
+    const result = deployWith(path, bin, { STUB_DEPLOY_EXIT: '3' });
+    expect(result.code).toBe(0);
+    expect(result.stderr).toContain('the CLI stopped waiting for identity to become Ready');
+    expect(result.stderr).toContain('identity is Ready after 0s more');
+    const argv = argvOf(calls);
+    expect(argv.some((line) => line.includes(' get workloaddeployment identity '))).toBe(true);
+    expect(argv.some((line) => line.includes('patch workloaddeployment identity'))).toBe(true);
+  });
+
+  test('not Ready in time, or another deploy failure, prints the exact recovery command', () => {
+    const { path } = generate();
+    const notReady = stubs();
+    const late = deployWith(path, notReady.bin, {
+      STUB_DEPLOY_EXIT: '3',
+      STUB_READY: 'False',
+      IDENTITY_READY_TIMEOUT: '0',
+    });
+    expect(late.code).toBe(3);
+    const recovery = `run: bun ${script} apply --values ${path} --kubeconfig ${join(work, 'kubeconfig')} --context test --tenant pgprove`;
+    expect(late.stderr).toContain(`identity is not Ready after 0s; once it is, ${recovery}`);
+    expect(argvOf(notReady.calls).some((line) => line.includes('patch'))).toBe(false);
+
+    const broken = stubs();
+    const failed = deployWith(path, broken.bin, { STUB_DEPLOY_EXIT: '2' });
+    expect(failed.code).toBe(3);
+    expect(failed.stderr).toContain(`deploy of identity failed (exit 2); once fixed, ${recovery}`);
+    expect(argvOf(broken.calls).some((line) => line.includes('workloaddeployment'))).toBe(false);
   });
 
   test('refuses a values file without the data directory key before touching the cluster', () => {
