@@ -6,7 +6,8 @@ This is the record of moving the Bun identity HTTP surface onto the existing `id
 > component and reads its runtime secrets from the `identity-control` Secret; see
 > [11. pglite](#11-pglite-identity-server50). Sections 1 to 10 record the Postgres-era guest that
 > still serves the `authproto` instance (tenant `identity`, `directory` BackingService) until the
-> [authproto cutover](#authproto-cutover), which has not happened. Its database adapter, the
+> [authproto cutover](#authproto-cutover), which has not happened (its tooling is built and proven
+> offline; the runbook is in that section). Its database adapter, the
 > `identity_runtime_secret` rows and the `psql` seeding described there no longer apply to new
 > deploys.
 
@@ -371,50 +372,207 @@ on the fresh instance. Neither can be pointed at a deployed guest as written:
 
 ### authproto cutover
 
-Not done; it needs explicit sign-off. `authproto` still runs the Postgres guest on tenant
-`identity` with the `directory` BackingService and the `identity_runtime_secret` rows, deployed
-from an earlier commit. `deploy/guest/deploy.sh` and the Pulumi program refuse any tenant whose
-namespace has the `directory` BackingService, the Pulumi program also refuses any stack without
-`database: pglite`, and neither has a default tenant.
+Signed off on 2026-10-12: **migrate everything**, the data and the runtime secrets (issuer, public
+origin, signing key, bootstrap passwords, client secrets, SMTP), into a pglite guest in a **new
+tenant** on authproto. The tools below are built and proven offline against a synthetic
+Postgres-era database (see [Proof](#proof-of-the-cutover-tooling)); the cluster steps (tenant,
+install, deploy) are not proven live yet. Nothing here has run against authproto.
+
+#### What moves, and how
+
+| Step | Tool | What it does |
+| --- | --- | --- |
+| Export | `deploy/cutover/export.ts` | One read-only statement over `kubectl exec ... psql` reads the schema history, every table's rows (as PostgreSQL's own `json_agg` text) and count, and the `identity_runtime_secret` rows, as one snapshot. Writes a mode 0700 directory: `manifest.json` (version, tables, columns, counts, digests; no values), `tables/<t>.json`, `values.json` (the deploy.sh values file), `state.json`, and `directory.dump` (`pg_dump -Fc` of the whole database, for rollback). Files are 0600 and nothing is printed but names and counts. |
+| Key | `deploy/guest/runtime-secrets.ts pglite-key` | Adds `DI_PGLITE_KEY` to `values.json` (a new data directory needs a new key) and prints its KCV. |
+| Import | `deploy/cutover/import.ts` | Runs the guest's own encrypted provider (`apps/guest/.di-framework/di-framework-pglite.encrypted.wasm`, checked to be byte for byte the provider inside `apps/guest/dist/identity.wasm`) under `wasmtime`, plugged into a small wasip2 runner (`deploy/cutover/pglite-runner`, Rust) that serves `di-framework:pglite/database` to the guest's own adapter over stdin/stdout. Initialises a fresh encrypted directory, migrates it to the source version with the guest's migration code, loads every table and the bootstrap fingerprints in one transaction, checks the counts inside it, then checks every file on disk is encfs ciphertext under the key's KCV and contains no engine string or user login or email. |
+| Rehearse | `deploy/cutover/rehearse.ts` | Boots the guest's request handler in-process on a **copy** of the imported directory, through the same provider: `/ready`, the later migrations, no bootstrap reconcile, issuer and signing key `kid`, owner and viewer sign-in, the three bootstrap clients' secrets, row counts. |
+| Install | `deploy/cutover/install.ts` | Dry run by default. With `--yes`, a helper pod on the node (the platform's storage-init image, root with CHOWN, FOWNER, DAC_OVERRIDE only) copies the directory into `<storageRoot>/di-tenants/<tenant uid>/workloads/identity` (what the platform mounts as the guest's `/data`), owner 65532, directories 0700, files 0600, then compares every file's SHA-256. Refuses a non-empty target, a tenant with `directory`, and a directory whose marker KCV is not the values file's. |
+| Deploy | `deploy/guest/deploy.sh` | Unchanged path, with the guard lifted for this case only (below). |
+
+Decisions and what they rest on:
+
+- **Supported sources: V13..V15.** The Postgres-era guest records its migrations in
+  `identity_schema_migrations`. authproto was deployed from the last Postgres-era commit
+  (`23be792`, before #53 added V16), whose guest embeds V1..V15, so authproto is expected at
+  **V15**; `export.ts` prints the version it found. V13 created `identity_runtime_secret`; V16 and
+  later have deleted the secret rows, so such a source is refused. A source whose `_migrations`
+  (the Bun server's history) is ahead of the guest's is refused too.
+- **JSON, not a `pg_dump` script, carries the data.** A plain `pg_dump` is a psql script
+  (`pg_dump` 16.10 and later wrap it in `\restrict`, and `COPY ... FROM stdin` needs psql), which
+  the provider's `exec` cannot run. `json_agg` and `json_populate_recordset` move every value in
+  PostgreSQL's own text form, and the importer names every column. `pg_dump -Fc` is still taken,
+  as the rollback backup.
+- **Runtime secret rows.** The old guest merged every row over wasi:config, and every setting it
+  read is a name of the new guest's environment, so each row goes to `values.json` under its own
+  name. Any other name is refused (it changed the old guest's settings; dropping it silently
+  would change the new guest's). `bootstrap_fingerprint` and `bootstrap_client_fingerprints` go
+  to `state.json` and are inserted into the new `identity_runtime_secret`, so V16 deletes nothing
+  (the import checks it) and the new guest, given the same settings, finds the same fingerprint
+  and does not reconcile bootstrap. `bootstrap_lease` is dropped. The signing key lives only in
+  `AUTH_ACTIVE_PRIVATE_JWK`, so carrying it keeps the issuer, the `kid` and every issued token.
+- **The database is `template1`** (di-framework/platform#212): the runner opens the provider with
+  its defaults, as the guest does, at the guest's `DI_PGLITE_DATA_DIR` (`/data/pglite`).
+- **Later migrations run in the guest.** V16 deletes no imported row; V17 strips old secrets from
+  imported sessions; V18..V20 install column encryption, off unless `IDENTITY_COLUMN_ENCRYPTION`
+  is set (new writes only).
+
+#### Guards
+
+`deploy/guest/deploy.sh` and `runtime-secrets.ts guard --instance` still refuse `authproto`,
+except for a tenant other than `identity` with `IDENTITY_AUTHPROTO_CUTOVER=authproto/<tenant>` in
+the environment, and still refuse any tenant whose `di-tenant-<tenant>` has the `directory`
+BackingService. The Pulumi program accepts `kubeInstance: authproto` only with
+`cutoverConfirm: authproto/<tenant>`, and still refuses any cluster with a `directory`
+BackingService, because `kube up` would rewrite authproto's whole install, tenant `identity`
+included; so the cutover uses `deploy.sh`, not Pulumi.
 
 > **Gate: export the runtime-secret rows before any migration at V16 or later touches
 > `directory`.** V16 deletes every `identity_runtime_secret` row except the bootstrap state. On
 > authproto those rows may be the only copy of the signing key (`AUTH_ACTIVE_PRIVATE_JWK`) and the
 > client secrets. Any migrator from this repository at or after V16 does it: the pglite guest
 > never connects to Postgres, but the Bun server (`bun start`, `applyMigrations`) with
-> `DATABASE_URL` pointed at `directory` would. Export first (`SELECT name, value FROM
-> identity_runtime_secret`, to an encrypted store, never a log), and check the export before
-> running anything newer than V15 there. A `DELETE` does not erase the values: they stay in dead
-> tuples until `VACUUM`, in WAL until it is recycled, and in every existing `pg_dump` or volume
-> backup until rotation. Treat those as secret-bearing until then.
+> `DATABASE_URL` pointed at `directory` would. Export first (step 3 below), and check the export
+> before running anything newer than V15 there. A `DELETE` does not erase the values: they stay in
+> dead tuples until `VACUUM`, in WAL until it is recycled, and in every existing `pg_dump` or
+> volume backup until rotation. Treat those as secret-bearing until then.
 
-The guards refuse a deploy to any tenant, and any Pulumi run on any cluster, that still has the
-`directory` BackingService, and they refuse the instance name `authproto` outright. The cutover
-therefore deploys the pglite guest into a **new tenant** and never into `identity` while
-`directory` exists. Every step needs the user's sign-off first; none is automated here.
+#### Runbook
 
-1. Freeze writes on the Postgres guest, and export the directory data (`pg_dump --data-only` of the
-   identity tables) and the runtime secret rows (names and values, kept out of logs), per the
-   gate above.
-2. Create a new tenant on the instance (for example `identity-pg`) with the exclusive tenant host
-   image, and deploy the pglite guest there with `deploy/guest/deploy.sh <instance> <new tenant>
-   <values>`, the values taken from the export (keeping the issuer, origin and signing key keeps
-   issued tokens valid). The export has no data directory key, and `deploy.sh` refuses a values
-   file without one, so first run `bun deploy/guest/runtime-secrets.ts pglite-key --values
-   <values>` (correct here: the new tenant's data directory is new and empty), back the key up
-   apart from any volume backup, and record the KCV it prints
-   (docs/configuration.md#data-directory-encryption). The `authproto` name refusal in `deploy.sh`
-   and the Pulumi preflight is what the sign-off lifts, by a deliberate change, not a flag.
-3. Load the data into the new database. There is no network path into pglite; this needs a
-   one-off import (for example a guest admin endpoint, or a one-shot component on the same data
-   directory) that does not exist yet. A one-shot component must be composed like the guest,
-   with the pinned pglite-encfs layer between pglite and the host, and get the same
-   `DI_PGLITE_KEY` in its environment: the directory is encrypted from the guest's first start,
-   and a plaintext provider is refused there.
-4. Move the public route to the new tenant once the new guest is verified, then retire the old
-   workload and, after a final backup, the `directory` BackingService and tenant `identity`.
+Run from an identity-server checkout at the commit that adds these tools, on the machine that
+holds authproto's kubeconfig. Needs Bun, kubectl, wasmtime 48, `wac` (`WAC=<path>`, or
+`DF_SQLITE_TOOLS_DIR/bin/wac` as for the build), `wasm-tools`, rustup (the runner builds with the
+toolchain in `deploy/cutover/pglite-runner/rust-toolchain.toml` on first use), and
+cli-plugin-platform 6.2.0 or later. Keep `$OUT` on an encrypted volume; it will hold every
+secret and all user data.
 
-Open choices for that change: whether to migrate the data or start from a fresh bootstrap; how
-to import into pglite; and the backup of the pglite data directory (the backup agent only runs
-`pg_dump` over the network today).
+```sh
+KC="$HOME/Library/Application Support/di-framework-kube/authproto/kubeconfig"
+CTX="$(kubectl --kubeconfig "$KC" config current-context)"
+NEW=identity-pg                     # the new tenant; any DNS label but `identity`
+OUT=/path/on/encrypted/volume/authproto-cutover
+mkdir -m 700 -p "$OUT"
+export WAC=/path/to/wac
+```
 
+1. **Build the guest** (the import uses the provider this build composes):
+   `(cd apps/guest && di-framework platform build)`. It must log
+   `Composing the PGlite encryption layer into the provider`.
+2. **Freeze writes on the Postgres guest.** Record its replicas, then stop it:
+   `kubectl --kubeconfig "$KC" -n di-tenant-identity get workloaddeployment identity -o jsonpath='{.spec.replicas}'`,
+   then
+   `kubectl --kubeconfig "$KC" -n di-tenant-identity patch workloaddeployment identity --type merge -p '{"spec":{"replicas":0}}'`,
+   and check that `Host: identity.identity.localhost` no longer answers `/health`. Anything
+   written after step 3 is lost.
+3. **Export** (read-only on `directory`):
+   `bun deploy/cutover/export.ts --kubeconfig "$KC" --context "$CTX" --namespace di-runtime-identity --service directory --out "$OUT/export"`.
+   Expect `source schema V15`. If it refuses unknown runtime rows, review them; do not edit the
+   tool's mapping.
+4. **Check the issuer route.** `jq -r .ISSUER_URL "$OUT/export/values.json"` (a public URL). If
+   its host is `<name>.identity.localhost`, the platform gateway routes it only to tenant
+   `identity`, so after the cutover that URL does not reach the new tenant: decide how the issuer
+   is served (see open questions) before step 12.
+5. **Key:** `bun deploy/guest/runtime-secrets.ts pglite-key --values "$OUT/export/values.json"`.
+   Record the KCV it prints, and back the key (the whole `values.json`) up apart from any volume
+   backup. Optional: `runtime-secrets.ts column-keys --values "$OUT/export/values.json" --enable`
+   to opt in to column encryption (new writes only).
+6. **Import:**
+   `bun deploy/cutover/import.ts --export "$OUT/export" --values "$OUT/export/values.json" --out "$OUT/data"`.
+   Every table must read `n/n rows`, `rows V16 would delete: 0`, and the disk line
+   `0 without a header; .di-encfs KCV matches: true; plaintext needles found: 0`.
+7. **Rehearse:**
+   `bun deploy/cutover/rehearse.ts --data "$OUT/data" --values "$OUT/export/values.json" --export "$OUT/export"`.
+   Every line must be `ok`, including `bootstrap not reconciled`.
+8. **Create the new tenant** (it gets the platform's tenant host image; the guest needs the
+   exclusive-instance build, `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive`, so check
+   `kubectl --kubeconfig "$KC" get deploy -A -o jsonpath='{range .items[*]}{.spec.template.spec.containers[*].image}{"\n"}{end}' | grep wash`
+   first). With the installation label of the existing tenant
+   (`kubectl --kubeconfig "$KC" get tenants.platform.di-framework.dev identity -o jsonpath='{.metadata.labels}'`):
+   ```sh
+   kubectl --kubeconfig "$KC" apply -f - <<EOF
+   apiVersion: platform.di-framework.dev/v1alpha1
+   kind: Tenant
+   metadata:
+     name: $NEW
+     labels: { <installation label key>: <value> }
+   spec: {}
+   EOF
+   kubectl --kubeconfig "$KC" wait tenants.platform.di-framework.dev/$NEW --for=condition=Ready --timeout=300s
+   ```
+9. **Install** (dry run, then for real):
+   `bun deploy/cutover/install.ts --data "$OUT/data" --values "$OUT/export/values.json" --kubeconfig "$KC" --context "$CTX" --tenant "$NEW"`,
+   check the target path and counts, and repeat with `--yes`. Expect
+   `installed: N/N files match, 0 missing, 0 changed, 0 extra; 0 not owned by 65532`.
+10. **Deploy** (registry port-forward as for authproto's earlier deploys):
+    `kubectl --kubeconfig "$KC" -n wasmcloud port-forward svc/examples-registry 25001:5000 &`, then
+    `IDENTITY_AUTHPROTO_CUTOVER=authproto/$NEW deploy/guest/deploy.sh authproto "$NEW" "$OUT/export/values.json"`.
+    It logs `authproto cutover confirmed for the new tenant`, builds, deploys, waits for Ready and
+    writes `identity-control`.
+11. **Verify** through the gateway (`Host: identity.$NEW.localhost`):
+    `bun apps/guest/scripts/live-check.ts --values "$OUT/export/values.json" --url http://127.0.0.1:<gateway port> --host identity.$NEW.localhost --slug unused --read-only`,
+    and compare `curl -s -H "Host: identity.$NEW.localhost" http://127.0.0.1:<gateway port>/oauth2/jwks | jq -r '.keys[].kid'`
+    with `jq -r '.AUTH_ACTIVE_PRIVATE_JWK | fromjson | .kid' "$OUT/export/values.json"` (a public
+    key id).
+12. **Move the public route** to the new tenant (step 4), then, after a final backup, retire the
+    old workload, the `directory` BackingService and tenant `identity`. Destroy `$OUT` once the
+    new guest is backed up; `directory.dump` and the old volume stay secret-bearing until then.
+
+**Rollback** before step 12: the export never writes to `directory`, so restore the old guest's
+replicas from step 2 and remove the new tenant's workload. The data written to the new guest
+after step 10 is not copied back.
+
+#### Proof of the cutover tooling
+
+2026-10-12. The live pgprove run was not possible: `kubesolo-pgprove` (stopped with exit 137)
+restarted in a loop because Kubesolo could not pull `rancher/local-path-provisioner` through the
+podman machine's TLS (the post-quantum key share drop described in the proving-grounds notes), and
+importing the image into its containerd needs a privileged host-PID helper that was not
+authorised. Everything up to the cluster was run locally instead:
+
+- **Source:** `postgres:16-alpine` (16.15), `--rm`, populated by the Postgres-era guest itself
+  (identity-server `23be792`, the commit authproto runs, `handle()` on Bun over the same
+  no-affinity binding bridge its boot test uses): migrations V1..V15, the runtime secret rows as
+  the Postgres-era Pulumi program wrote them (with an RS256 test key generated for this proof),
+  bootstrap, three organizations, a browser OAuth client and a service client registered through
+  the admin API, five password users, memberships, the owner's sign-in and consent, two refresh
+  token families (one rotated once), a viewer session, and a stale `bootstrap_lease` row.
+- **Export, key, import, rehearse** as in the runbook, with `--podman <container>` in place of
+  the kubectl target. Then the **current guest code** (in-process on Bun) on a copy of the
+  imported directory through the encrypted provider under wasmtime 48.0.1, with the exported
+  values, for the checks that need the seed's own secrets.
+
+| Check | Result |
+| --- | --- |
+| Export | V15 found; 15 tables with counts (users 7, organizations 4, memberships 6, registered clients 5, client lifecycle 5, authorizations 3, consents 2, refresh history 1, sessions 2, audit 9); 11 settings to `values.json`, 2 fingerprint rows to `state.json`, `bootstrap_lease` not carried; directory 0700, files 0600 |
+| Export refusals | an extra runtime row (`SMTP_PORT`): refused, no directory written; V12, V16, gaps, `_migrations` ahead, a name that is not an identifier: refused (tests) |
+| Import (31 s) | V1..V15 applied by the guest's migration code; every table `n/n`; fingerprint rows carried; `identity_runtime_secret` rows V16 would delete: 0 |
+| On disk | 1756 files: 1570 encfs ciphertext under the key's KCV, 186 empty, 0 without a header; `.di-encfs` KCV equals `runtime-secrets.ts kcv`; `PostgreSQL`, `pg_catalog`, `template1` and every user login and email: in 0 files |
+| Guest boot on the import | `/ready` 200, all checks true; V16..V20 applied; stored bootstrap fingerprint unchanged (no reconcile); `identity_runtime_secret` holds only the two fingerprint rows; every table count unchanged |
+| Issuer and key | discovery `issuer` equals `ISSUER_URL`; JWKS serves the old `kid`; both ID tokens the old guest issued verify (RS256) against the new JWKS, same `kid` and `iss`; a new code exchange signs with the same `kid` |
+| Users | owner, viewer and all five users sign in with the passwords the old guest hashed (signed-in session confirmed); a wrong password does not sign in |
+| Clients | the bootstrap access, directory and provisioner clients and both admin-registered clients authenticate with their old secrets (introspection 200); wrong secrets 401; provisioner client credentials then the admin API lists 7 users |
+| Tokens | the old guest's opaque access token introspects as active within its 600 s lifetime (first run) and inactive after it (second run, 30 minutes later); refresh: an unused token of either family rotates (200, new token); the already rotated token is reuse (400 `invalid_grant`) and revokes its family (the token just issued: 400) |
+| Sessions and consent | the viewer's session cookie from the old guest is still signed in; the owner's stored consent is reused (authorize redirects straight to the callback with a code) |
+| Refusals | rehearsal with another `DI_PGLITE_KEY`: `pglite-encfs: ... key check value mismatch; refusing`, open failed; install with a key whose KCV differs from the marker: refused before any cluster call; import into a non-empty directory: refused |
+| Logs | the tools' combined output scanned for 32 secret and PII strings (every value, the JWK's private parts, user passwords, client secrets, emails, password hashes): 0 found |
+
+`deploy/cutover/roundtrip.test.ts` runs the export and import on real engines in CI (Postgres
+16 at V13, V14 and V15, PGlite 17.5 behind the guest's adapter), boots the current guest on the
+V15 import and signs in and authenticates with the old credentials; `units.test.ts` covers the
+mapping, refusals, the runner protocol, the ciphertext check and the install plan.
+
+**Not proven:** anything on a cluster. Creating a tenant with `kubectl apply`, the install helper
+pod and its image on the node, deploying into a tenant whose storage was pre-filled, the guest
+under wash (QuickJS and the composed Argon2 component) on imported data, the freeze in step 2
+(`replicas: 0` on a WorkloadDeployment), and the route move. The rehearsal runs the guest's code
+on Bun, not the component, and wasmtime, not wash.
+
+**Open questions for the coordinator:**
+
+- **The issuer's host** (step 4). If authproto's `ISSUER_URL` names tenant `identity` in its
+  host, keeping the issuer (and so every token) means serving that URL from the new tenant,
+  which the gateway does not do by tenant name; options are an alias in front of the gateway, or
+  deploying into tenant `identity` once its `directory` is retired, which the guard refuses by
+  design and would need its own change.
+- **The tenant host image** (step 8). The pglite guest needs the exclusive-instance wash build;
+  if authproto's platform runs another image, switching it is a platform config change that
+  rolls every tenant host, the old guest's included.

@@ -532,8 +532,42 @@ export async function applyRuntimeSecrets(
   return { names: Object.keys(options.values).sort(), revision: options.revision, pgliteKey };
 }
 
-/** The di-framework-kube instance that runs the Postgres-era guest; never a target here. */
+/** The di-framework-kube instance that runs the Postgres-era guest. */
 export const LEGACY_INSTANCE = 'authproto';
+/** The tenant the Postgres-era guest runs in on authproto; never a target. */
+export const LEGACY_TENANT = 'identity';
+/**
+ * Confirms the authproto cutover (docs/guest-http-api.md#authproto-cutover): the environment
+ * variable of deploy.sh and `runtime-secrets.ts guard`, and the Pulumi stack config
+ * `cutoverConfirm`. Its value must be `authproto/<tenant>`, naming the new tenant.
+ */
+export const CUTOVER_CONFIRM_ENV = 'IDENTITY_AUTHPROTO_CUTOVER';
+
+/**
+ * Whether a deploy may target `instance` and `tenant`. Any instance but authproto passes. The
+ * signed-off cutover lifts the authproto refusal for one case only: a tenant other than
+ * `identity` (where the Postgres-era guest runs), confirmed with `authproto/<tenant>`. The
+ * caller still checks the tenant (no `directory` BackingService) against the cluster.
+ */
+export function assertInstanceAllowed(
+  instance: string,
+  tenant: string,
+  confirmation: string | undefined,
+): 'other-instance' | 'authproto-cutover' {
+  if (instance !== LEGACY_INSTANCE) return 'other-instance';
+  if (tenant === LEGACY_TENANT) {
+    throw new Error(
+      `tenant ${LEGACY_TENANT} on ${LEGACY_INSTANCE} runs the Postgres-era identity guest; the cutover deploys into a new tenant (docs/guest-http-api.md#authproto-cutover). Refusing`,
+    );
+  }
+  const expected = `${LEGACY_INSTANCE}/${tenant}`;
+  if (confirmation?.trim() !== expected) {
+    throw new Error(
+      `${LEGACY_INSTANCE} runs the Postgres-era identity guest; deploying there is the cutover in docs/guest-http-api.md#authproto-cutover. To confirm it for the new tenant, set ${CUTOVER_CONFIRM_ENV}=${expected}. Refusing`,
+    );
+  }
+  return 'authproto-cutover';
+}
 
 /** kubectl run synchronously, for checks at Pulumi program evaluation, before any resource. */
 export type SyncKubectl = (
@@ -545,6 +579,10 @@ export type SyncKubectl = (
 export interface PreflightTarget {
   /** di-framework-kube instance name (`kubeInstance`). */
   instance: string;
+  /** The stack's tenant. */
+  tenant?: string;
+  /** Stack config `cutoverConfirm`: `authproto/<tenant>` for the signed-off cutover. */
+  cutoverConfirm?: string;
   /** kube `--state-dir`; kube's default (`os.UserConfigDir()/di-framework-kube`) when unset. */
   stateDir: string;
   /** `kubeconfig` and `context` of an existing cluster, instead of the managed instance's. */
@@ -572,7 +610,10 @@ export function defaultKubeStateDir(
  * upgrades a managed instance in place and replaces its tenant declarations and host image),
  * the tenant host patches and Mailpit.
  *
- * - The instance name `authproto` is refused outright.
+ * - The instance name `authproto` is refused unless the cutover is confirmed for a new tenant
+ *   (`assertInstanceAllowed`). Even then the next check refuses it while authproto still has the
+ *   `directory` BackingService: `kube up` would rewrite that install, tenant `identity`
+ *   included. The cutover deploys with deploy/guest/deploy.sh instead.
  * - The target cluster is the stack's `kubeconfig`, or else the managed instance's kubeconfig in
  *   kube's state directory. A managed instance whose directory does not exist yet is new and has
  *   nothing to protect. One that exists without a kubeconfig is refused (fail closed).
@@ -585,11 +626,7 @@ export function preflightCluster(
   target: PreflightTarget,
   io: { exists(path: string): boolean; kubectl: SyncKubectl },
 ): 'new-instance' | 'checked' {
-  if (target.instance === LEGACY_INSTANCE) {
-    throw new Error(
-      `kubeInstance ${LEGACY_INSTANCE} runs the Postgres-era identity guest; deploying there is the cutover in docs/guest-http-api.md#authproto-cutover. Refusing`,
-    );
-  }
+  assertInstanceAllowed(target.instance, target.tenant ?? '', target.cutoverConfirm);
   let kubeconfig = target.kubeconfig;
   if (kubeconfig === undefined) {
     const instanceDir = `${target.stateDir}/${target.instance}`;

@@ -1,6 +1,15 @@
 import { createWasmPgliteDatabase, type WasmPgliteModule } from '@di-framework/pglite-component';
 import type { SqlDatabase } from '@di-framework/repo';
 
+// For the cutover importer (deploy/cutover), which resolves packages through this workspace.
+export type {
+  WasmPgliteConnection,
+  WasmPgliteModule,
+  WasmPgRow,
+  WasmPgValue,
+} from '@di-framework/pglite-component';
+export type { SqlDatabase };
+
 /** Environment variable cli-plugin-platform sets from `pglite.dataDir` in di-framework.config.json. */
 export const DATABASE_ROOT_ENV = 'DI_PGLITE_DATA_DIR';
 /** The provider's default root, inside the workload's persistent `/data` mount. */

@@ -32,8 +32,11 @@
  *     `--enable` also sets IDENTITY_COLUMN_ENCRYPTION=enabled. Run `apply` afterwards.
  *
  *   bun deploy/guest/runtime-secrets.ts guard --kubeconfig <path> --tenant <name> [--context <name>]
+ *       [--instance <name>]
  *     Fails when di-tenant-<tenant> still has the Postgres `directory` BackingService (the
- *     Postgres-era guest, i.e. authproto). `apply` runs the same check first.
+ *     Postgres-era guest, i.e. authproto). `apply` runs the same check first. With --instance
+ *     authproto it also fails unless the tenant is not `identity` and IDENTITY_AUTHPROTO_CUTOVER
+ *     is `authproto/<tenant>` (the signed-off cutover, docs/guest-http-api.md#authproto-cutover).
  *
  *   bun deploy/guest/runtime-secrets.ts apply --values <file> --kubeconfig <path> --tenant <name>
  *       [--context <name>] [--config <file>]
@@ -55,8 +58,10 @@ import { parseArgs } from 'node:util';
 import {
   applyRuntimeSecrets,
   assertDeployable,
+  assertInstanceAllowed,
   assertPrivateMode,
   COLUMN_KEY_NAMES,
+  CUTOVER_CONFIRM_ENV,
   ensurePgliteKey,
   type Kubectl,
   newPgliteKey,
@@ -80,6 +85,7 @@ const { positionals, values: args } = parseArgs({
     kubeconfig: { type: 'string' },
     context: { type: 'string' },
     tenant: { type: 'string' },
+    instance: { type: 'string' },
     config: {
       type: 'string',
       default: join(import.meta.dir, '..', '..', 'apps', 'guest', 'di-framework.config.json'),
@@ -252,10 +258,18 @@ try {
     case 'generate':
       generate();
       break;
-    case 'guard':
-      await refuseLegacyTenant(kubectl, `di-tenant-${required('tenant')}`);
-      console.log(`di-tenant-${args.tenant} has no Postgres directory BackingService`);
+    case 'guard': {
+      const tenant = required('tenant');
+      const allowed = args.instance
+        ? assertInstanceAllowed(args.instance, tenant, process.env[CUTOVER_CONFIRM_ENV])
+        : 'other-instance';
+      await refuseLegacyTenant(kubectl, `di-tenant-${tenant}`);
+      if (allowed === 'authproto-cutover') {
+        console.log(`authproto cutover confirmed for the new tenant ${tenant}`);
+      }
+      console.log(`di-tenant-${tenant} has no Postgres directory BackingService`);
       break;
+    }
     case 'apply':
       await apply();
       break;

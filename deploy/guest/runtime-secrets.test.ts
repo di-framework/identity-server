@@ -296,6 +296,51 @@ describe('deploy.sh', () => {
     expect(argvOf(broken.calls).some((line) => line.includes('workloaddeployment'))).toBe(false);
   });
 
+  test('authproto only as the confirmed cutover into a new tenant, refused before the build', () => {
+    const { path } = generate();
+    const run = (tenant: string, extra: Record<string, string> = {}) => {
+      const { bin, calls } = stubs();
+      const result = Bun.spawnSync(['sh', deployScript, 'authproto', tenant, path], {
+        cwd: root,
+        env: {
+          PATH: `${bin}:${process.env.PATH ?? ''}`,
+          HOME: process.env.HOME ?? '',
+          IDENTITY_KUBECONFIG: join(work, 'kubeconfig'),
+          IDENTITY_KUBE_CONTEXT: 'test',
+          ...extra,
+        },
+      });
+      return {
+        code: result.exitCode,
+        out: result.stdout.toString(),
+        stderr: result.stderr.toString(),
+        argv: argvOf(calls),
+      };
+    };
+    const unconfirmed = run('identity-pg');
+    expect(unconfirmed.code).not.toBe(0);
+    expect(unconfirmed.stderr).toContain(
+      'set IDENTITY_AUTHPROTO_CUTOVER=authproto/identity-pg. Refusing',
+    );
+    expect(unconfirmed.argv.some((line) => line.startsWith('di-framework'))).toBe(false);
+    const legacy = run('identity', { IDENTITY_AUTHPROTO_CUTOVER: 'authproto/identity' });
+    expect(legacy.code).not.toBe(0);
+    expect(legacy.stderr).toContain('tenant identity on authproto runs the Postgres-era');
+    expect(legacy.argv.some((line) => line.startsWith('di-framework'))).toBe(false);
+    const confirmed = run('identity-pg', { IDENTITY_AUTHPROTO_CUTOVER: 'authproto/identity-pg' });
+    expect(confirmed.code).toBe(0);
+    expect(confirmed.out).toContain('authproto cutover confirmed for the new tenant identity-pg');
+    expect(confirmed.argv).toContain('di-framework platform build');
+    // The tenant is still checked against the cluster for the `directory` BackingService.
+    expect(
+      confirmed.argv.some((line) =>
+        line.includes(
+          '--namespace di-tenant-identity-pg get backingservices.platform.di-framework.dev directory',
+        ),
+      ),
+    ).toBe(true);
+  });
+
   test('refuses a values file without the data directory key before touching the cluster', () => {
     const { path } = generate('--plaintext-pglite');
     const { bin, calls } = stubs();

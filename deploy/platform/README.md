@@ -249,7 +249,10 @@ three protected keys: the data directory key and the column keys (see [Key custo
 
 Before it registers any resource (so before `di-framework-kube up`, the tenant host patch and
 Mailpit), the program refuses `kubeInstance` `authproto` and refuses a target cluster with a
-Postgres `directory` BackingService in any namespace. The target is the stack's `kubeconfig`, or
+Postgres `directory` BackingService in any namespace. The signed-off cutover lifts only the name
+refusal, for a new tenant confirmed with `cutoverConfirm: authproto/<tenant>`; the `directory`
+refusal stays, so this program cannot run on authproto until `directory` is retired, and the
+cutover deploys with `deploy/guest/deploy.sh` (`docs/guest-http-api.md#authproto-cutover`). The target is the stack's `kubeconfig`, or
 the managed instance's kubeconfig in kube's state directory (`kubeStateDir`, else kube's default
 `os.UserConfigDir()/di-framework-kube`); an instance directory without a kubeconfig is refused, and
 one that does not exist yet is a new instance. Before each CLI deploy and before it writes

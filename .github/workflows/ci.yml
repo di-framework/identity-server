@@ -47,3 +47,23 @@ jobs:
         env:
           IDENTITY_TEST_DATABASE: pglite
         run: bun --config=bunfig.pglite.toml test apps/server/tests/authorization-code.test.ts
+
+  pglite-runner:
+    name: Cutover pglite runner
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        # rust-toolchain.toml here pins the toolchain, the wasm32-wasip2 target and the components.
+        working-directory: deploy/cutover/pglite-runner
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+
+      - name: Format
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy --locked --release --target wasm32-wasip2 -- -D warnings
+
+      - name: Build
+        run: cargo build --locked --release --target wasm32-wasip2

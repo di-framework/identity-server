@@ -5,9 +5,11 @@ import {
   applyRuntimeSecrets,
   assertColumnEncryption,
   assertDeployable,
+  assertInstanceAllowed,
   assertPgliteKeys,
   assertPrivateMode,
   COLUMN_KEY_NAMES,
+  CUTOVER_CONFIRM_ENV,
   checkStoredPgliteKey,
   controlSecretDocument,
   decodePgliteKey,
@@ -305,9 +307,46 @@ describe('the Pulumi preflight before any resource', () => {
   test('refuses the authproto instance by name, without touching the cluster', () => {
     const probe = io([`${state}/authproto`, `${state}/authproto/kubeconfig`]);
     expect(() => preflightCluster({ instance: 'authproto', stateDir: state }, probe.io)).toThrow(
-      'kubeInstance authproto runs the Postgres-era identity guest',
+      'authproto runs the Postgres-era identity guest; deploying there is the cutover',
     );
     expect(probe.calls).toEqual([]);
+  });
+
+  test('the signed-off cutover lifts the authproto refusal only for a confirmed new tenant', () => {
+    expect(CUTOVER_CONFIRM_ENV).toBe('IDENTITY_AUTHPROTO_CUTOVER');
+    expect(assertInstanceAllowed('pgprove', 'identity', undefined)).toBe('other-instance');
+    expect(assertInstanceAllowed('authproto', 'identity-pg', ' authproto/identity-pg ')).toBe(
+      'authproto-cutover',
+    );
+    expect(() => assertInstanceAllowed('authproto', 'identity-pg', undefined)).toThrow(
+      'set IDENTITY_AUTHPROTO_CUTOVER=authproto/identity-pg. Refusing',
+    );
+    expect(() => assertInstanceAllowed('authproto', 'identity-pg', 'authproto/other')).toThrow(
+      'deploying there is the cutover',
+    );
+    expect(() => assertInstanceAllowed('authproto', 'identity', 'authproto/identity')).toThrow(
+      'tenant identity on authproto runs the Postgres-era identity guest',
+    );
+  });
+
+  test('a confirmed authproto stack is still refused while the cluster has `directory`', () => {
+    const files = [`${state}/authproto`, `${state}/authproto/kubeconfig`];
+    const target = {
+      instance: 'authproto',
+      tenant: 'identity-pg',
+      cutoverConfirm: 'authproto/identity-pg',
+      stateDir: state,
+    };
+    const legacy = io(files, { stdout: 'di-tenant-identity/directory\n' });
+    expect(() => preflightCluster(target, legacy.io)).toThrow(
+      'authproto has the Postgres BackingService di-tenant-identity/directory',
+    );
+    expect(legacy.calls).toHaveLength(1);
+    // Once `directory` is retired, the confirmed stack may run.
+    expect(preflightCluster(target, io(files, { stdout: '' }).io)).toBe('checked');
+    expect(() => preflightCluster({ ...target, cutoverConfirm: undefined }, io(files).io)).toThrow(
+      'set IDENTITY_AUTHPROTO_CUTOVER=authproto/identity-pg',
+    );
   });
 
   test('a managed instance that does not exist yet is new', () => {
@@ -451,7 +490,7 @@ describe('one resolved kube target for the preflight and for kube', () => {
           return { code: 0, stdout: '', stderr: '' };
         },
       }),
-    ).toThrow('kubeInstance authproto runs the Postgres-era identity guest');
+    ).toThrow('authproto runs the Postgres-era identity guest; deploying there is the cutover');
     expect(calls).toEqual([]);
   });
 });

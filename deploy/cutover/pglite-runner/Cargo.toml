@@ -1,0 +1,18 @@
+[package]
+name = "identity-pglite-runner"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "wasip2 command that serves di-framework:pglite/database over a JSON-lines protocol on stdin/stdout. The authproto cutover importer (deploy/cutover/import.ts) plugs the guest's encrypted pglite provider into it and runs it under wasmtime."
+
+[[bin]]
+name = "identity-pglite-runner"
+path = "src/main.rs"
+
+[dependencies]
+wit-bindgen = { version = "=0.61.1", default-features = false, features = ["macros"] }
+serde_json = "=1.0.145"
+
+[profile.release]
+opt-level = "s"
+lto = true

@@ -28,14 +28,22 @@ export function resetSchema(): void {
   schema = undefined;
 }
 
-export async function applySchema(database: SqlDatabase): Promise<string[]> {
+/**
+ * `migrations` defaults to every shipped file; the cutover importer passes the files up to the
+ * source database's version (deploy/cutover/import-core.ts), so the history reads as if the
+ * guest had applied them.
+ */
+export async function applySchema(
+  database: SqlDatabase,
+  migrations: readonly EmbeddedMigration[] = embeddedMigrations,
+): Promise<string[]> {
   await database.exec(HISTORY);
   const existing = await database.query<{ version: unknown }>(
     'SELECT version FROM identity_schema_migrations',
   );
   const applied = new Set(existing.map((row) => String(row.version)));
   const ran: string[] = [];
-  for (const migration of embeddedMigrations) {
+  for (const migration of migrations) {
     if (applied.has(migration.version)) continue;
     await database.transaction((tx) => tx.exec(migrationStatement(migration)));
     ran.push(migration.version);
