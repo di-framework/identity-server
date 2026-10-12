@@ -463,11 +463,20 @@ describe('opt-in column encryption', () => {
         systemRole: 'user',
         status: 'pending',
       });
-    for (const email of [legacy.email.toLowerCase(), fresh.email.toUpperCase()]) {
+    for (const email of [
+      legacy.email.toLowerCase(),
+      fresh.email.toUpperCase(),
+      ` ${fresh.email} `,
+      ` ${legacy.email} `,
+    ]) {
       await expect(account(email)).rejects.toMatchObject({ status: 409 });
     }
-    // Without an email nothing conflicts.
+    // Without an email nothing conflicts; a padded address is found by the trimmed lookup.
     await account(null);
+    await account(' Padded@Example.com ');
+    expect((await directory().findUserByEmail('padded@example.com'))?.email).toBe(
+      ' Padded@Example.com ',
+    );
     const link = (subject: string) =>
       links().insert({
         id: crypto.randomUUID(),

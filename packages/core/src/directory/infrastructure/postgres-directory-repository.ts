@@ -193,7 +193,8 @@ export class PostgresDirectoryRepository implements DirectoryRepository {
    */
   private async insertPerson(person: NewAccount): Promise<void> {
     const cipher = await this.encryption.cipher();
-    const normalizedEmail = person.email?.toLowerCase() ?? null;
+    // The same normalization as every email lookup, so the blind index always matches.
+    const normalizedEmail = person.email?.trim().toLowerCase() ?? null;
     const inserted = await this.db.writeCount(
       sql`INSERT INTO users (id, login, normalized_login, email, email_enc, normalized_email,
          normalized_email_bidx, password_hash, display_name, display_name_enc, email_verified,
