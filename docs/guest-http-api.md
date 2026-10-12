@@ -307,6 +307,37 @@ As a tenant developer, replacing `identity-control` with a copy that drops keys 
 `tenant-secret-update`. The no-keys restart therefore deleted the Secret first, as `deploy.sh`
 does.
 
+### Data directory encryption on `pgprove`
+
+2026-10-12, the same instance and tenant, as a **fresh** guest named `pgenc` (its own workload,
+`pgenc-control` Secret and empty data directory; the plaintext `identity` guest was left as it
+was). Built with cli-plugin-platform from cli-extensions `f15f84b` (main with #70 and #72,
+unreleased), packed with `bun pm pack` and installed into an isolated extensions directory;
+deployed with `deploy/guest/deploy.sh` as the tenant developer `pgdev` and freshly generated
+values with `--column-encryption`. Only statuses, counts, booleans and KCVs were recorded:
+
+| Check | Result |
+| --- | --- |
+| Build | `Composing the PGlite encryption layer into the provider`; deploy reports `encrypted at rest by ghcr.io/di-framework/pglite-encfs@sha256:46863e8b…a5d414` |
+| Deployed component (fetched back from the tenant registry) | layer `sha256:041784d1…` (the pin's wasm layer) and the composed provider embedded verbatim; `custom "di-framework:pglite-encfs"` section present |
+| First start, before `apply` (no `DI_PGLITE_KEY`) | every path 503 `boot-failed`; host log `pglite-encfs: DI_PGLITE_KEY is not set or invalid; refusing all file access`; data directory still empty (0 files) |
+| After `apply` | `/health` 200 in 21 s; `/ready` all true (column encryption opted in at first boot) |
+| Organization create, duplicate, read; owner sign-in, consent, token, UserInfo | 201, 409, 200; 303, 303, 200, 200 |
+| Code exchange, ID token, refresh checks | as in the table above |
+| Admin user create, read, list, duplicate email | 201, 200 decrypted, list decrypted, 409 |
+| Tenant host pod deleted | `/health` 200 after 96 s; organization, user and owner sign-in read back with the same subject |
+| Data directory on the node | 1767 files: 1581 with an encfs header under the key's KCV, 186 empty, 0 without a header; `.di-encfs` KCV equals `runtime-secrets.ts kcv`; the probe slug, the probe user's login and address, `pg_catalog`, `PostgreSQL`, `template1`: in 0 files (the plaintext `identity` directory: 26, 44, 5 files for the last three) |
+| Secret recreated without `DI_PGLITE_KEY`, workload rolled | every path 503 `boot-failed`; same refusal in the host log; tree digest of the directory identical before and after, and again after five more requests |
+| Secret with a different key | 503; `pglite-encfs: the data directory was encrypted with a different key (key check value mismatch); refusing`; tree digest unchanged |
+| Key restored with `runtime-secrets.ts apply` | `/health` 200 in 5 s; data and sign-in as before, same subject |
+| Second `deploy.sh` | CLI: `Kept control Secret pgenc-control: it holds declared app keys this deploy cannot read`; same KCV; `/health` 200; data intact |
+
+The first `deploy.sh` stopped at the CLI's readiness wait (exit 3) while the tenant host rolled
+to mount the new directory; the workload was Ready after 110 s and `apply` was run on its own,
+as documented then. `deploy.sh` now waits for Ready itself and continues to `apply`. After the pod deletion the host container restarted once on a NATS connection
+refusal at startup, unrelated to the layer. Key rotation was not exercised live (the platform's
+`make smoke` covers it).
+
 ### The acceptance suites from #50
 
 #50 asks for `examples/app/src/journey.test.ts` and `apps/server/tests/authorization-code.test.ts`
@@ -368,11 +399,18 @@ therefore deploys the pglite guest into a **new tenant** and never into `identit
 2. Create a new tenant on the instance (for example `identity-pg`) with the exclusive tenant host
    image, and deploy the pglite guest there with `deploy/guest/deploy.sh <instance> <new tenant>
    <values>`, the values taken from the export (keeping the issuer, origin and signing key keeps
-   issued tokens valid). The `authproto` name refusal in `deploy.sh` and the Pulumi preflight is
-   what the sign-off lifts, by a deliberate change, not a flag.
+   issued tokens valid). The export has no data directory key, and `deploy.sh` refuses a values
+   file without one, so first run `bun deploy/guest/runtime-secrets.ts pglite-key --values
+   <values>` (correct here: the new tenant's data directory is new and empty), back the key up
+   apart from any volume backup, and record the KCV it prints
+   (docs/configuration.md#data-directory-encryption). The `authproto` name refusal in `deploy.sh`
+   and the Pulumi preflight is what the sign-off lifts, by a deliberate change, not a flag.
 3. Load the data into the new database. There is no network path into pglite; this needs a
-   one-off import (for example a guest admin endpoint or a one-shot component on the same data
-   directory) that does not exist yet.
+   one-off import (for example a guest admin endpoint, or a one-shot component on the same data
+   directory) that does not exist yet. A one-shot component must be composed like the guest,
+   with the pinned pglite-encfs layer between pglite and the host, and get the same
+   `DI_PGLITE_KEY` in its environment: the directory is encrypted from the guest's first start,
+   and a plaintext provider is refused there.
 4. Move the public route to the new tenant once the new guest is verified, then retire the old
    workload and, after a final backup, the `directory` BackingService and tenant `identity`.
 

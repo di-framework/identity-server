@@ -17,7 +17,7 @@ pulumi destroy
 | `InClusterRegistry` (`components/registry.ts`) | Plain-HTTP OCI registry in the platform namespace: PVC, Deployment, and a ClusterIP Service for component pulls, plus a NodePort Service when a local tenant host image is published. It is skipped when the stack sets an external `registry`. |
 | `PublishedImage` (`components/image.ts`) | Only with `tenantHostLocalImage`: publishes that local tenant host build to the registry. The engine saves it as an OCI layout and `oras` copies it through a port-forward. |
 | `DeploymentPatch` `tenant-host-rollout` | Switches the tenant host to stop-then-start updates, because the tenant quota has no room for a second host pod, and so two hosts never open the database at once. With a published local image, it also rolls the host whenever that image's digest changes. |
-| `CliWorkload` (`components/workload.ts`) | The identity component, with the pglite provider composed in. It runs `di-framework platform deploy identity` when its sources change, and `di-framework platform destroy identity` on delete. |
+| `CliWorkload` (`components/workload.ts`) | The identity component, with the pglite provider and its encryption layer composed in. It checks the tenant, then runs `di-framework platform deploy <name>` (the config's `name`, `identity`) when its sources change, and `di-framework platform destroy <name>` on delete, which keeps the workload's storage. |
 | `Mailpit` (`components/mailpit.ts`) | SMTP relay in `di-tenant-<tenant>` on a fixed ClusterIP, plus the platform egress grant that lets the guest dial it. Skipped when `smtpHost` is set. |
 | `RandomPassword`, `tls.PrivateKey` | Bootstrap passwords, client secrets, the SMTP password, and the RS256 signing key, generated once and kept in state. |
 | `RuntimeSecrets` (`components/secrets.ts`) | Writes those values to the workload's `identity-control` Secret after every deploy, rolls the workload onto them, and waits until `/health` answers 200. |
@@ -67,9 +67,51 @@ the `di-framework.dev/exclusive-instance` component config, so the host serves e
 one component instance that holds the database's single connection.
 
 The data directory is a host path the platform manages for the workload, not a PVC. Back it up
-at the file level; the backup agent's `pg_dump` over the network does not apply. Encryption at
-rest is planned as a separately composed `wasi:filesystem` layer between the guest and the
-provider, which is why the provider stays a separate component.
+at the file level; the backup agent's `pg_dump` over the network does not apply. It is encrypted
+at rest: the build composes the platform's `pglite-encfs` `wasi:filesystem` layer between the
+provider and the host (`pglite.encryption` in the same config), so the directory holds only
+ciphertext under the key `DI_PGLITE_KEY`. The program generates that key once
+(`random.RandomBytes` `identity-pglite-key`, 32 bytes), keeps it in stack state and writes it to
+`<name>-control` (`identity-control`) with the other runtime values. See
+`docs/configuration.md#data-directory-encryption`.
+
+### Key custody
+
+**Losing the key loses the database.** The stack state and the Secret are the only copies, so
+take your own copy right after the first `pulumi up`, store it apart from the volume backups
+(a password manager or vault), and record its KCV (`pulumi stack output pgliteKeyCheckValue`,
+one-way and safe to store) with each backup. Either command writes the key to a file only you
+can read, and prints nothing:
+
+```sh
+umask 077
+# From the stack state (the resource whose URN ends in ::identity-pglite-key):
+pulumi stack export --show-secrets \
+  | jq -r '.deployment.resources[] | select(.urn | endswith("::identity-pglite-key"))
+           | .outputs.base64 | if type == "object" then .plaintext | fromjson else . end' \
+  > pglite-key
+# Or from the cluster, with the admin kubeconfig:
+kubectl --kubeconfig "$(pulumi stack output kubeconfig)" -n "di-tenant-$(pulumi config get tenant)" \
+  get secret identity-control -o 'jsonpath={.data.DI_PGLITE_KEY}' | base64 -d > pglite-key
+```
+
+Check the copy with `bun deploy/guest/runtime-secrets.ts kcv` on a values file that holds it, or
+compare it with the `.di-encfs` marker (docs/configuration.md#key-custody-losing-the-key-loses-the-data).
+
+- **The key resource is protected** (`protect: true`, like the two column keys). Replacing it
+  (`pulumi up --replace`, a rename without an alias, a changed `length`) or destroying it is a
+  key change: the new key cannot open the existing volume. Pulumi refuses either until you run
+  `pulumi state unprotect` on it, which you should only do for a stack whose data you are
+  discarding.
+- **No rotation on this path.** The program writes only `DI_PGLITE_KEY`, never
+  `DI_PGLITE_KEY_PREVIOUS`, so replacing the key here would lock the guest out instead of
+  rotating. Rotation is a values-file procedure (`deploy/guest/runtime-secrets.ts` and
+  `docs/configuration.md#rotation`); `runtime-secrets.ts apply` refuses a different key unless
+  the one in the cluster is supplied as `DI_PGLITE_KEY_PREVIOUS`.
+- **`pulumi destroy` leaves the data behind.** `CliWorkload` runs `di-framework platform
+  destroy`, which deletes the workload and its control Secret but not the workload's storage, and
+  `purgeClusterOnDestroy` is `false` by default. The encrypted directory survives on the node,
+  readable only with the key you kept.
 
 ## Tenant host image
 
@@ -168,6 +210,7 @@ pulumi up
 | `tenantHostImage` | Image reference the tenant host runs |
 | `url` | Tenant route through the gateway, such as `http://identity.<tenant>.localhost:28180` |
 | `signingKeyId` | `kid` of the active signing key |
+| `pgliteKeyCheckValue` | KCV of the data directory key `DI_PGLITE_KEY` (one-way, safe to record; matches bytes 8..24 of the volume's `.di-encfs` marker) |
 | `bootstrapOwnerPassword`, `bootstrapViewerPassword` | Secret. Passwords of the bootstrap `owner` and `viewer` |
 | `accessClientSecret`, `directoryClientSecret`, `provisionerClientSecret` | Secret. Bootstrap client secrets |
 
@@ -186,9 +229,13 @@ environment label reference only its `<workload>-control` Secret. Nothing secret
 the database; migration `V16` removes what the earlier Postgres guest kept there.
 
 The program generates the values with `@pulumi/random` and `@pulumi/tls` and keeps them,
-encrypted, in stack state. `di-framework platform deploy` rewrites `identity-control` on every
-deploy with only its control token, so `RuntimeSecrets` writes the whole Secret again after each
-deploy (a fresh control token, the identity, and the values, sent to kubectl on stdin), sets
+encrypted, in stack state. Every name is declared in `controlSecretKeys` of
+`apps/guest/di-framework.config.json`, so `di-framework platform deploy` (cli-plugin-platform
+with cli-extensions#70, after 6.1.2) keeps `<name>-control`: with the admin kubeconfig it reads
+the Secret and carries the declared keys over with a fresh token. The workload name is the
+config's `name`, read by the program as `deploy/guest/deploy.sh` does. `RuntimeSecrets` still
+writes the whole Secret after each deploy (a fresh control token, the identity, and the values,
+sent to kubectl on stdin; a different `DI_PGLITE_KEY` than the cluster's is refused), sets
 `IDENTITY_RUNTIME_REVISION` in the workload's environment config to roll it, and waits up to 10
 minutes for `/health`. Until then the guest answers 503 and names the missing settings; it never
 starts with the default issuer or without a signing key.
@@ -197,20 +244,22 @@ starts with the default issuer or without a signing key.
 pulumi stack output --show-secrets bootstrapOwnerPassword
 ```
 
-To rotate a value, replace its resource: `pulumi up --replace <urn>`.
+To rotate a value, replace its resource: `pulumi up --replace <urn>`. That does not apply to the
+three protected keys: the data directory key and the column keys (see [Key custody](#key-custody)).
 
 Before it registers any resource (so before `di-framework-kube up`, the tenant host patch and
 Mailpit), the program refuses `kubeInstance` `authproto` and refuses a target cluster with a
 Postgres `directory` BackingService in any namespace. The target is the stack's `kubeconfig`, or
 the managed instance's kubeconfig in kube's state directory (`kubeStateDir`, else kube's default
 `os.UserConfigDir()/di-framework-kube`); an instance directory without a kubeconfig is refused, and
-one that does not exist yet is a new instance. Before it deletes or writes `identity-control`, the
-program also checks that `di-tenant-<tenant>` has
+one that does not exist yet is a new instance. Before each CLI deploy and before it writes
+`<name>-control`, the program also checks that `di-tenant-<tenant>` has
 no Postgres `directory` BackingService and refuses the tenant otherwise (on an existing cluster
 named by `kubeconfig`, it checks before anything else runs, `kube up` included).
 
-> **Status:** this Pulumi path (`tenant`, the tenant check, `resetControlSecret`, `deployedAt`
-> and the always-rolling `RuntimeSecrets`) has been type-checked only. It has not run against a
+> **Status:** this Pulumi path (`tenant`, the tenant check, the CLI keep path with the admin
+> kubeconfig, `deployedAt`, the protected keys and the always-rolling `RuntimeSecrets`) has been
+> type-checked only. It has not run against a
 > live cluster yet; the live proof used `deploy/guest/deploy.sh`. Treat the first fresh-stack
 > `pulumi up` as its test.
 
@@ -243,9 +292,9 @@ literal `ip:port`. So Mailpit's Service has a fixed ClusterIP, kube puts
   `di-user-<user>-<tenant>-token ... does not exist`; that can take a few minutes. Wait for
   the Secret in the platform namespace, then run `pulumi up` again. The platform README
   documents this.
-- A `di-framework platform deploy` run outside this program resets `identity-control` to the CLI's
-  control token only. The guest then answers 503 until the next `pulumi up` (or
-  `deploy/guest/runtime-secrets.ts apply`) writes the values again.
+- A `di-framework platform deploy` run outside this program keeps `<name>-control` with the
+  current CLI (the keys are declared). cli-plugin-platform 6.1.2 and older cannot build this
+  guest at all: it refuses `pglite.encryption`.
 - Stacks created before the switch to pglite still have the `directory` BackingService in state.
   The next `pulumi up` deletes it; with `databaseDeletionPolicy` `Retain` (the old default) the
   platform keeps its data. Export anything you need first: the pglite guest starts from an empty

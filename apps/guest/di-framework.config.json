@@ -2,9 +2,34 @@
   "name": "identity",
   "entry": "src/app.ts",
   "output": "dist/identity.wasm",
+  "controlSecretKeys": [
+    "ISSUER_URL",
+    "AUTH_PUBLIC_ORIGIN",
+    "AUTH_ACTIVE_PRIVATE_JWK",
+    "AUTH_PREVIOUS_PUBLIC_JWK_SET",
+    "SMTP_HOST",
+    "SMTP_USERNAME",
+    "SMTP_PASSWORD",
+    "AUTH_ACCESS_REDIRECT_URIS",
+    "AUTH_BOOTSTRAP_OWNER_PASSWORD",
+    "AUTH_BOOTSTRAP_VIEWER_PASSWORD",
+    "AUTH_ACCESS_CLIENT_SECRET",
+    "AUTH_DIRECTORY_CLIENT_SECRET",
+    "AUTH_PROVISIONER_CLIENT_SECRET",
+    "AUTH_CLI_CLIENT_ID",
+    "AUTH_CLI_REDIRECT_URIS",
+    "IDENTITY_COLUMN_ENCRYPTION",
+    "IDENTITY_COLUMN_KEY",
+    "IDENTITY_BIDX_KEY",
+    "DI_PGLITE_KEY",
+    "DI_PGLITE_KEY_PREVIOUS"
+  ],
   "pglite": {
     "image": "ghcr.io/di-framework/pglite-component@sha256:9a00ac39f202ede852d0ce0e43dbb27c5626c3e3e613d63d5916c990394a7d5e",
     "storageMount": "/data",
-    "dataDir": "/data/pglite"
+    "dataDir": "/data/pglite",
+    "encryption": {
+      "image": "ghcr.io/di-framework/pglite-encfs@sha256:46863e8bc92be13104f4be1b489f5500ba008f51f4662f382a211f7a78a5d414"
+    }
   }
 }

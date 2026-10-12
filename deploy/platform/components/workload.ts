@@ -1,5 +1,5 @@
 import * as pulumi from '@pulumi/pulumi';
-import { resetControlSecret } from './control-secret';
+import { refuseLegacyTenant } from './control-secret';
 import { kubectlRunner, portForward, runProcess } from './process';
 
 /**
@@ -33,12 +33,11 @@ export interface CliWorkloadInputs {
   };
   sourceDigest: string;
   /**
-   * A control Secret to delete before each deploy. The CLI rewrites `<workload>-control` with only
-   * its control token, and a tenant developer's replace is refused while the Secret holds more
-   * keys (the runtime secrets written after the previous deploy). The tenant is checked for the
-   * Postgres `directory` BackingService first, and a tenant that has it is refused.
+   * A tenant namespace to check before each deploy: one that still has the Postgres `directory`
+   * BackingService (the Postgres-era guest) is refused. The control Secret is no longer deleted
+   * first: the CLI keeps the keys the project declares in `controlSecretKeys`.
    */
-  resetControlSecret?: { kubeconfig: string; context?: string; namespace: string; name: string };
+  guardTenant?: { kubeconfig: string; context?: string; namespace: string };
 }
 
 interface CliWorkloadState extends CliWorkloadInputs {
@@ -55,7 +54,7 @@ type DeepInput<T> = pulumi.Input<
 type CliWorkloadArgs = { [K in keyof CliWorkloadInputs]: DeepInput<CliWorkloadInputs[K]> };
 
 /** Paths and tools can differ between machines without changing what is deployed. */
-const LOCAL_ONLY = ['workspaceRoot', 'cli', 'registryForward', 'resetControlSecret'];
+const LOCAL_ONLY = ['workspaceRoot', 'cli', 'registryForward', 'guardTenant'];
 const REPLACE_ON_CHANGE = ['application', 'target'];
 
 export class CliWorkload extends pulumi.dynamic.Resource {
@@ -107,15 +106,15 @@ const workloadProvider: pulumi.dynamic.ResourceProvider = {
 };
 
 async function deploy(inputs: CliWorkloadInputs): Promise<CliWorkloadState> {
-  const reset = inputs.resetControlSecret;
-  if (reset) {
+  const guard = inputs.guardTenant;
+  if (guard) {
     const kubectl = kubectlRunner(
-      reset.kubeconfig,
-      reset.context,
-      `di-framework-reset-${reset.name}.log`,
+      guard.kubeconfig,
+      guard.context,
+      `di-framework-guard-${guard.namespace}.log`,
     );
-    // Refuses a tenant that still has `directory` (the Postgres-era guest) before deleting.
-    await resetControlSecret(kubectl, { namespace: reset.namespace, name: reset.name });
+    // Refuses a tenant that still has `directory` (the Postgres-era guest) before the deploy.
+    await refuseLegacyTenant(kubectl, guard.namespace);
   }
   const forward = inputs.registryForward ? await portForward(inputs.registryForward) : undefined;
   try {

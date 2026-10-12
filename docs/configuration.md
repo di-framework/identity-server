@@ -206,9 +206,9 @@ The keys are bound values, so they reach any log that records bound values:
   missing key and with `--enable` sets the switch, then `apply`. `apply` refuses a values file
   that enables encryption without both keys, with malformed keys, or with two equal keys. With
   Pulumi, set `columnEncryption: true` in the stack config. The keys are generated either way.
-- The new control-Secret keys are `IDENTITY_COLUMN_ENCRYPTION`, `IDENTITY_COLUMN_KEY` and
-  `IDENTITY_BIDX_KEY`. The cli-extensions control-secret key declaration must list them too
-  (coordinated with that change).
+- The control-Secret keys are `IDENTITY_COLUMN_ENCRYPTION`, `IDENTITY_COLUMN_KEY` and
+  `IDENTITY_BIDX_KEY`, declared in `controlSecretKeys` of `apps/guest/di-framework.config.json`
+  alongside the data directory keys (see [Data directory encryption](#data-directory-encryption)).
 
 ## Database role separation
 
@@ -322,7 +322,9 @@ places and never from its database:
   `AUTH_CLI_CLIENT_ID`, `AUTH_CLI_REDIRECT_URIS`, and for [column encryption](#column-encryption)
   `IDENTITY_COLUMN_ENCRYPTION`, `IDENTITY_COLUMN_KEY`, `IDENTITY_BIDX_KEY`
   (`RUNTIME_SECRET_SETTINGS` in `apps/guest/src/settings.ts`). An environment value wins over
-  wasi:config.
+  wasi:config. The same Secret carries `DI_PGLITE_KEY` (and, during a rotation,
+  `DI_PGLITE_KEY_PREVIOUS`) for the [data directory encryption](#data-directory-encryption) layer;
+  the guest code never reads them.
 
 wasi:config cannot carry secrets or URLs (the platform rejects them), and tenant admission lets a
 workload without an environment label reference only its `<workload>-control` Secret, which
@@ -341,38 +343,55 @@ Every boot failure answers the same generic body with a coarse `reason`:
 
 The details are only in the log, because a driver message can echo a value.
 
-`di-framework platform deploy` (cli-plugin-platform 6.1.2) rewrites `identity-control` on each
-deploy with only `DI_CONTROL_TOKEN` and `DI_CONTROL_IDENTITY`. As a tenant developer it cannot
-replace a copy that holds more keys (the platform's `tenant-secret-update` policy refuses a replace
-that drops a key), and as an administrator it silently drops them.
+Every name the Secret may hold is declared in `controlSecretKeys` of
+`apps/guest/di-framework.config.json`, so `di-framework platform deploy` keeps `<name>-control` (`identity-control` for the default `name`)
+instead of rewriting it with only `DI_CONTROL_TOKEN` and `DI_CONTROL_IDENTITY`. As a tenant
+developer it keeps the Secret as it is; as an administrator it carries the declared keys over and
+rotates the token. This needs cli-plugin-platform with di-framework/cli-extensions#70 and #72 (the
+release after 6.1.2); 6.1.2 does not know `controlSecretKeys` or `pglite.encryption`.
 `deploy/guest/deploy.sh <instance> <tenant> <values-file>` (both instance and tenant are
-required) therefore runs:
+required) runs:
 
-1. checks: the values file is mode 0600 with known and required names, and
-   `di-tenant-<tenant>` has no Postgres `directory` BackingService (that tenant still runs the
-   Postgres-era guest, as authproto's `identity` does; the check reads the cluster, so it holds
-   whichever kubeconfig or tenant was passed);
+1. checks: `runtime-secrets.ts preflight` reads the values file (mode 0600, known and required
+   names) against the guest config: every name declared in `controlSecretKeys`, `DI_PGLITE_KEY`
+   present (its KCV is logged), and a plaintext guest only with the explicit development opt-out.
+   It prints the workload name, which is the config's `name`. Then `di-tenant-<tenant>` must have
+   no Postgres `directory` BackingService (that tenant still runs the Postgres-era guest, as
+   authproto's `identity` does; the check reads the cluster, so it holds whichever kubeconfig or
+   tenant was passed);
 2. `di-framework platform build`, before anything on the cluster changes;
-3. delete `identity-control`;
-4. `di-framework platform deploy identity --target identity`;
-5. `bun deploy/guest/runtime-secrets.ts apply`, which repeats the tenant check, writes the whole
+3. `di-framework platform deploy <name> --target identity`;
+4. `bun deploy/guest/runtime-secrets.ts apply`, which repeats both checks, writes the whole
    Secret (a fresh control token, the identity, and the values; the guest has no cron or queue
    invokers that use the token) on kubectl's stdin through raw create/replace, which tenant
    developers may use without reading Secrets, and rolls the workload by setting only
    `IDENTITY_RUNTIME_REVISION` in its environment config (the other entries, such as
    `DI_PGLITE_DATA_DIR`, stay).
 
-From step 3 until step 5 finishes the guest answers 503. **Recovery:** if step 4 or 5 fails, fix
-the cause and run `bun deploy/guest/runtime-secrets.ts apply --values <file> --kubeconfig <kc>
---tenant <tenant>` on its own; it recreates the Secret and rolls the workload.
+The values file is only read, so the data directory key in it is the same on every deploy. On a
+first deploy the Secret does not exist yet: the CLI creates it with only its control keys, and the
+guest answers 503 until step 4 (the encryption layer refuses to start without its key and
+changes nothing). On the first deploy of a new workload the CLI's fixed readiness wait (30 x 2 s)
+usually ends before the tenant host has rolled to mount the new directory, and step 3 exits 3
+with `did not become ready`. `deploy.sh` expects that: it polls the WorkloadDeployment's Ready
+condition for up to `IDENTITY_READY_TIMEOUT` seconds (default 300) and goes on to step 4. If the
+workload is still not Ready, or step 3 or 4 fails otherwise, it prints the exact recovery command:
+fix the cause and run
+`bun deploy/guest/runtime-secrets.ts apply --values <file> --kubeconfig <kc> --tenant <tenant>`
+on its own; it rewrites the Secret and rolls the workload.
 
-Two changes would remove this sequence: the CLI carrying extra keys in the control Secret
-(di-framework/cli-extensions#69), or an environment label on the workload, which lets it reference
-`<name>.<env>` Secrets that the CLI never rewrites.
+**The key in the cluster is checked before it is replaced.** When the caller may read
+`<name>-control` (an administrator's kubeconfig, or the Pulumi program), `apply` compares the KCV
+of the `DI_PGLITE_KEY` already there with the values file's. A different key, or a values file
+without one, is refused before anything is written, unless the cluster's key is supplied as
+`DI_PGLITE_KEY_PREVIOUS` ([rotation](#rotation)); the message shows KCVs only. A tenant
+developer may not read Secrets, so for them nothing is compared: `apply` says so, and the KCV it
+prints must match your custody record before you run it.
 
 `bun deploy/guest/runtime-secrets.ts generate --out <file> --origin <url> --smtp-host <host>`
-creates a values file (mode 0600) for a new instance. The `deploy/platform` Pulumi program does
-the same with values it keeps in stack state.
+creates a values file (mode 0600) for a new instance, including `DI_PGLITE_KEY`, and prints that
+key's KCV. The `deploy/platform` Pulumi program does the same with values it keeps in stack
+state.
 
 The database is embedded PostgreSQL 17, the `di-framework:pglite` provider composed into the
 component at build time (`pglite` in `apps/guest/di-framework.config.json`, pinned by GHCR
@@ -380,6 +399,141 @@ digest). Its root is `DI_PGLITE_DATA_DIR` (default `/data/pglite`), inside the w
 persistent `/data` directory. The tenant host must run the exclusive-instance wash build
 (`ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive`), which serves the workload from one
 component instance so the database has one opener.
+
+## Data directory encryption
+
+The guest's PGlite data directory is **encrypted at rest by default** (identity-server#62,
+di-framework/platform#138). `pglite.encryption` in `apps/guest/di-framework.config.json` pins the
+platform's `pglite-encfs` layer by digest
+(`ghcr.io/di-framework/pglite-encfs@sha256:46863e8b…a5d414`), and `di-framework platform build`
+composes it between the pglite provider and the host:
+
+```
+guest ──di-framework:pglite──▶ pglite provider ──wasi:filesystem──▶ pglite-encfs ──▶ host
+```
+
+The build checks the wiring with an explicit `wac compose` and a fail-closed import allowlist,
+and refuses a layer without the `di-framework:pglite-encfs` custom section. Every regular file of
+the data directory (tables, catalogs, WAL, configuration) is stored as AES-256-XTS ciphertext
+behind a 4 KiB header; directory and file names, sizes and timestamps stay visible. The layer's
+design, format and threat model are in di-framework/platform `platform/pglite-encfs/README.md`.
+
+**Two layers.** This is the filesystem half. [Column encryption](#column-encryption) is the other:
+
+| | Data directory (`pglite-encfs`) | Columns (pgcrypto) |
+| --- | --- | --- |
+| Default | on | off; opt in with `IDENTITY_COLUMN_ENCRYPTION=enabled` |
+| Covers | every file of the data directory, including WAL and catalogs | the PII and secret columns listed above, for new writes |
+| Protects against | a stolen disk or volume, a leaked snapshot or file-level backup, a storage administrator, another workload mounting the directory | the same, plus `pg_dump` output and anything else that reads rows without the column keys |
+| Does not protect against | the host, the wash process, anyone who can read the tenant's Secrets, or the guest itself (it sees plaintext through SQL); tampering is not detected | the live database server or the service process (see [Threat model and logging](#threat-model-and-logging)) |
+| Key | `DI_PGLITE_KEY` | `IDENTITY_COLUMN_KEY`, `IDENTITY_BIDX_KEY` |
+
+Use both: the keys are independent, so a leak of one does not expose the others.
+
+**The key.** `DI_PGLITE_KEY` is 32 random bytes, base64, in `<name>-control` with the other
+runtime values; the layer reads it from the WASI environment and hides it from the engine. It is
+declared in `controlSecretKeys` together with `DI_PGLITE_KEY_PREVIOUS` and every runtime value
+(the build refuses an encrypted provider without the declaration).
+
+- `runtime-secrets.ts generate` writes it into a new values file and prints its KCV, never the
+  key. For an existing values file of a **new** deployment, `runtime-secrets.ts pglite-key
+  --values <file>` adds one when it is missing. Neither ever replaces a key that exists.
+- `deploy.sh` and `apply` only read the values file, and refuse one without `DI_PGLITE_KEY`
+  before anything on the cluster changes. The Pulumi program generates the key once and keeps it
+  in stack state.
+- On the first start over an empty directory, the layer writes the `.di-encfs` marker with the
+  key's check value and initdb runs on ciphertext. From then on the directory opens only with that
+  key.
+
+### Key custody: losing the key loses the data
+
+There is no recovery path. Without `DI_PGLITE_KEY` nobody can read the database, you included.
+
+- **Back up the key separately from the volume backups.** A backup holding both defeats the
+  encryption, and a volume backup without the key is useless. Keep it in a password manager or
+  vault; a local values file stays at mode `0600`.
+- **Record the KCV** (key-check value) with each backup, so you can tell which key opens which
+  backup: `bun deploy/guest/runtime-secrets.ts kcv --values <file>` (Pulumi: the
+  `pgliteKeyCheckValue` output). It is HKDF-SHA256 of the key, one-way and safe to store, and
+  equals bytes 8..24 of the data directory's `.di-encfs` marker. `deploy.sh` and `apply` log it.
+- **Never regenerate the key for an existing volume.** A new key does not decrypt the old data.
+- Deleting the Secret, or a Secret without the key, is an outage, not data loss, as long as the
+  key still exists somewhere: the guest fails closed (below) until the key is back.
+
+### Fail closed
+
+The layer checks the marker before the provider touches the directory:
+
+| State | Result |
+| --- | --- |
+| marker matches `DI_PGLITE_KEY` | starts |
+| empty directory | writes the marker, starts (initdb on ciphertext) |
+| marker matches `DI_PGLITE_KEY_PREVIOUS` | rotates (below), starts |
+| marker matches neither key, or `DI_PGLITE_KEY` missing or invalid | refused |
+| data but no marker (a plaintext directory) | refused |
+
+A refusal locks the directory before anything is written, so the directory is unchanged. The
+provider's open fails, and the guest answers every request, `/health` included, with 503
+`{"ok":false,"error":"service unavailable","reason":"boot-failed"}`. The tenant host log carries
+the layer's reason (for example `pglite-encfs: the data directory was encrypted with a different
+key ...`). Restoring the right key and rolling the workload (`runtime-secrets.ts apply`) recovers
+it with its data.
+
+### Rotation
+
+A rotation re-wraps each file's data key under the new key; the data is not re-encrypted.
+
+1. In the values file, move the current key to `DI_PGLITE_KEY_PREVIOUS` and put a new key (32
+   random bytes, base64, for example `openssl rand -base64 32`) in `DI_PGLITE_KEY`. Back up the
+   new key and record its KCV (`runtime-secrets.ts kcv` prints both). `apply`, which rolls the
+   workload.
+2. At start the layer re-wraps every file header and then flips the marker. The tenant host log
+   says `pglite-encfs: key rotation complete: re-wrapped N file keys`. Keep both keys until that
+   line: a start with only the old key after a partial sweep fails closed.
+3. Remove `DI_PGLITE_KEY_PREVIOUS` from the values file. A tenant developer cannot replace the
+   Secret with fewer keys (`tenant-secret-update` refuses a replace that drops a key), so delete
+   it first: `kubectl delete secret <name>-control -n di-tenant-<tenant>` (`<name>` is the
+   config's `name`, `identity` by default), then `apply`. The
+   running instance keeps its environment until `apply` rolls it.
+
+A rotation does not lock out a compromised old key: someone holding it and an old volume image
+can still read data written later, because the data keys stay. After a suspected compromise,
+move the data to a fresh deployment under a new key (below).
+
+### Existing plaintext deployments
+
+The layer refuses a directory that holds data but no marker, and it never encrypts a plaintext
+directory in place. **There is no automatic conversion.** A guest deployed before this change
+has a plaintext data directory, so redeploying it with this config fails closed (503) and leaves
+the directory as it was. For such a deployment, either:
+
+- **Deploy fresh and move the data:** deploy under a new workload name (a new, empty data
+  directory) with a key, then export the data from the old guest and import it into the new one
+  through the admin API (organizations, users, clients) or a SQL dump and restore, and retire the
+  old workload and its directory. Data in the old directory, its WAL and its backups stays
+  plaintext until they are destroyed. An offline converter is tracked in
+  di-framework/platform#199 and has not been built.
+- **Stay opted out** for now, with the risks of a plaintext directory. Main always builds the
+  encrypted guest, so this means deploying that workload from a local or branch copy of the
+  config without `pglite.encryption`, with `IDENTITY_PGLITE_PLAINTEXT=1`, as described below,
+  on every deploy until you move the data. It is a stopgap for that one deployment, not a
+  supported configuration.
+
+### Opting out (development only)
+
+A plaintext data directory takes two explicit steps, and is meant for local development and
+tests only:
+
+1. remove `pglite.encryption` from `apps/guest/di-framework.config.json` in a local or branch
+   copy (main keeps the encrypted default, and the tests pin it there);
+2. deploy with `IDENTITY_PGLITE_PLAINTEXT=1` in the environment of `deploy.sh` or
+   `runtime-secrets.ts apply`, and a values file without `DI_PGLITE_KEY` (`generate
+   --plaintext-pglite`).
+
+Without the variable, `preflight` and `apply` refuse a config without `pglite.encryption`; with
+it, they warn. They also refuse a values file that holds `DI_PGLITE_KEY` for a plaintext build,
+because that file belongs to an encrypted directory, which a plaintext provider cannot read. The
+tests pin the committed config to the encrypted default.
 
 ## Provisioning with Pulumi
 

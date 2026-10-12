@@ -3,11 +3,28 @@
  * Runtime secrets for the identity guest, kept in its `identity-control` Secret.
  *
  *   bun deploy/guest/runtime-secrets.ts generate --out <file> --origin <url> --smtp-host <host>
- *       [--issuer <url>] [--redirect-uris <list>] [--column-encryption]
+ *       [--issuer <url>] [--redirect-uris <list>] [--column-encryption] [--plaintext-pglite]
  *     Writes a new values file (mode 0600): issuer and origin, an RS256 signing key, bootstrap
- *     passwords, client secrets, SMTP settings, and the two column encryption keys
- *     (IDENTITY_COLUMN_KEY, IDENTITY_BIDX_KEY). `--column-encryption` also opts in
- *     (IDENTITY_COLUMN_ENCRYPTION=enabled). Refuses to overwrite an existing file.
+ *     passwords, client secrets, SMTP settings, the two column encryption keys
+ *     (IDENTITY_COLUMN_KEY, IDENTITY_BIDX_KEY) and the data directory key DI_PGLITE_KEY.
+ *     `--column-encryption` also opts in (IDENTITY_COLUMN_ENCRYPTION=enabled).
+ *     `--plaintext-pglite` leaves out DI_PGLITE_KEY, for a development guest built without
+ *     pglite.encryption. Prints the key's KCV, never the key. Refuses to overwrite a file.
+ *
+ *   bun deploy/guest/runtime-secrets.ts pglite-key --values <file>
+ *     Adds DI_PGLITE_KEY to an existing values file when it has none, for a new data directory
+ *     (an existing key is never replaced: the volume encrypted under it would become
+ *     unreadable). Prints the KCV. Run `apply` afterwards.
+ *
+ *   bun deploy/guest/runtime-secrets.ts kcv --values <file>
+ *     Prints the key-check value of DI_PGLITE_KEY (and DI_PGLITE_KEY_PREVIOUS): record it with
+ *     each backup. It matches bytes 8..24 of the data directory's `.di-encfs` marker.
+ *
+ *   bun deploy/guest/runtime-secrets.ts preflight --values <file> [--config <file>]
+ *     Checks a values file against the guest config (apps/guest/di-framework.config.json):
+ *     every name declared in controlSecretKeys, DI_PGLITE_KEY present when the data directory
+ *     is encrypted, and a plaintext guest only with IDENTITY_PGLITE_PLAINTEXT=1. `apply` runs it
+ *     too. Prints the workload name, then the KCVs on stderr.
  *
  *   bun deploy/guest/runtime-secrets.ts column-keys --values <file> [--enable]
  *     Adds the column encryption keys to an existing values file when they are missing (an
@@ -19,8 +36,9 @@
  *     Postgres-era guest, i.e. authproto). `apply` runs the same check first.
  *
  *   bun deploy/guest/runtime-secrets.ts apply --values <file> --kubeconfig <path> --tenant <name>
- *       [--context <name>] [--workload identity]
- *     Writes the workload's control Secret with those values and rolls the workload onto them.
+ *       [--context <name>] [--config <file>]
+ *     Runs `preflight`, writes the control Secret of the workload the config names with those
+ *     values, and rolls the workload onto them.
  *     Run it on its own to recover when a deploy stopped after deleting or resetting the Secret.
  *
  *   bun deploy/guest/runtime-secrets.ts names --values <file>
@@ -32,13 +50,21 @@
  */
 import { createHash, generateKeyPairSync, randomBytes } from 'node:crypto';
 import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { parseArgs } from 'node:util';
 import {
   applyRuntimeSecrets,
+  assertDeployable,
   assertPrivateMode,
   COLUMN_KEY_NAMES,
+  ensurePgliteKey,
   type Kubectl,
+  newPgliteKey,
+  type PgliteKeyCheck,
+  PLAINTEXT_OPT_OUT,
+  parseGuestConfig,
   parseRuntimeValues,
+  pgliteKeyCheckValues,
   refuseLegacyTenant,
 } from '../platform/components/control-secret.ts';
 
@@ -54,8 +80,12 @@ const { positionals, values: args } = parseArgs({
     kubeconfig: { type: 'string' },
     context: { type: 'string' },
     tenant: { type: 'string' },
-    workload: { type: 'string', default: 'identity' },
+    config: {
+      type: 'string',
+      default: join(import.meta.dir, '..', '..', 'apps', 'guest', 'di-framework.config.json'),
+    },
     'column-encryption': { type: 'boolean', default: false },
+    'plaintext-pglite': { type: 'boolean', default: false },
     enable: { type: 'boolean', default: false },
   },
 });
@@ -104,9 +134,43 @@ const kubectl: Kubectl = async (argv, input) => {
   return { code: await child.exited, stdout, stderr };
 };
 
+const PGLITE_KEY_CHECK_MESSAGES: Record<PgliteKeyCheck, (secret: string) => string> = {
+  new: (secret) => `${secret} had no DI_PGLITE_KEY yet`,
+  matched: (secret) => `${secret} already holds this DI_PGLITE_KEY (same KCV)`,
+  rotation: (secret) =>
+    `rotation: ${secret} holds the values' DI_PGLITE_KEY_PREVIOUS; the guest re-wraps its files on the next start`,
+  unverified: (secret) =>
+    `cannot read ${secret} as this user, so its DI_PGLITE_KEY was not compared. Replacing it is irreversible: the KCV above must match your custody record`,
+};
+
+/** Prints `name KCV <hex>` lines: one-way values that identify a key, safe to record. */
+function printKcvs(values: Record<string, string>, stream: typeof console.log = console.log): void {
+  for (const [name, kcv] of Object.entries(pgliteKeyCheckValues(values))) {
+    stream(`${name} KCV ${kcv}`);
+  }
+}
+
+/** The values file checked against the guest config; returns the values and the workload. */
+function preflight(): { values: Record<string, string>; workload: string } {
+  const source = required('values');
+  const values = readValues(source);
+  const configPath = args.config as string;
+  const config = parseGuestConfig(readFileSync(configPath, 'utf8'), configPath);
+  assertDeployable(config, values, {
+    allowPlaintext: process.env[PLAINTEXT_OPT_OUT] === '1',
+    source,
+  });
+  if (config.encryption === undefined) {
+    console.error(
+      `warning: ${config.name} is built without pglite.encryption (${PLAINTEXT_OPT_OUT}=1): its data directory is plaintext`,
+    );
+  }
+  return { values, workload: config.name };
+}
+
 async function apply(): Promise<void> {
-  const values = readValues(required('values'));
-  const workload = args.workload as string;
+  const { values, workload } = preflight();
+  printKcvs(values);
   const result = await applyRuntimeSecrets(kubectl, {
     tenant: required('tenant'),
     workload,
@@ -114,6 +178,7 @@ async function apply(): Promise<void> {
     token: secret(32),
     revision: createHash('sha256').update(randomBytes(16)).digest('hex').slice(0, 16),
   });
+  console.log(PGLITE_KEY_CHECK_MESSAGES[result.pgliteKey](`${workload}-control`));
   console.log(`wrote di-tenant-${args.tenant}/${workload}-control: ${result.names.join(', ')}`);
   console.log(
     `rolled workloaddeployment/${workload} (IDENTITY_RUNTIME_REVISION=${result.revision})`,
@@ -139,9 +204,25 @@ function generate(): void {
     IDENTITY_COLUMN_KEY: columnKey(),
     IDENTITY_BIDX_KEY: columnKey(),
     ...(args['column-encryption'] ? { IDENTITY_COLUMN_ENCRYPTION: 'enabled' } : {}),
+    ...(args['plaintext-pglite'] ? {} : { DI_PGLITE_KEY: newPgliteKey(randomBytes) }),
   };
   writeFileSync(out, `${JSON.stringify(values, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
   console.log(`wrote ${out} (mode 0600): ${Object.keys(values).sort().join(', ')}`);
+  printKcvs(values);
+}
+
+/** Adds DI_PGLITE_KEY when missing (never replacing one) and prints its KCV. */
+function pgliteKey(): void {
+  const path = required('values');
+  const values = readValues(path);
+  const added = ensurePgliteKey(values, () => newPgliteKey(randomBytes));
+  if (added) writeFileSync(path, `${JSON.stringify(values, null, 2)}\n`, { mode: 0o600 });
+  console.log(
+    added
+      ? `updated ${path}: added DI_PGLITE_KEY (for a new data directory only)`
+      : `${path} already has DI_PGLITE_KEY; kept it`,
+  );
+  printKcvs(values);
 }
 
 /** Adds missing column keys (never replacing one) and, with --enable, opts in. */
@@ -181,6 +262,18 @@ try {
     case 'column-keys':
       columnKeys();
       break;
+    case 'pglite-key':
+      pgliteKey();
+      break;
+    case 'kcv':
+      printKcvs(readValues(required('values')));
+      break;
+    case 'preflight': {
+      const { values, workload } = preflight();
+      console.log(workload);
+      printKcvs(values, console.error);
+      break;
+    }
     case 'names':
       console.log(
         Object.keys(readValues(required('values')))
@@ -189,7 +282,9 @@ try {
       );
       break;
     default:
-      throw new Error('usage: runtime-secrets.ts generate|column-keys|guard|apply|names [options]');
+      throw new Error(
+        'usage: runtime-secrets.ts generate|column-keys|pglite-key|kcv|preflight|guard|apply|names [options]',
+      );
   }
 } catch (error) {
   console.error(`runtime-secrets: ${error instanceof Error ? error.message : String(error)}`);

@@ -10,9 +10,10 @@ import { kubectlRunner, portForward } from './process';
  * database. Tenant admission lets a workload without an environment label reference only that
  * Secret, and wasi:config refuses secrets and URLs.
  *
- * `di-framework platform deploy` rewrites the control Secret on every deploy with only
- * DI_CONTROL_TOKEN and DI_CONTROL_IDENTITY, so this resource writes the whole Secret after each
- * deploy of `CliWorkload` (its `deployment` input changes with every deploy): a fresh control
+ * `di-framework platform deploy` keeps the control Secret's declared keys (`controlSecretKeys`)
+ * and rotates its token. This resource still writes the whole Secret after each deploy of
+ * `CliWorkload` (its `deployment` input changes with every deploy), after checking that the
+ * cluster's `DI_PGLITE_KEY` is the stack's (`checkStoredPgliteKey`): a fresh control
  * token (the identity workload has no cron or queue invokers that use it), the identity, and the
  * values. The document goes to kubectl on stdin; no value is in an argument list or a log.
  * It then rolls the workload with a revision entry in its environment config, since a running
