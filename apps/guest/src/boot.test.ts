@@ -231,13 +231,20 @@ test('the guest boots on one pglite connection and serves the Bun routes and flo
         [held],
       );
       freshRealm();
+      const busyLines: string[] = [];
+      const busyLog = spyOn(console, 'error').mockImplementation((line: unknown) => {
+        busyLines.push(String(line));
+      });
       const busy = await handle(new Request('https://identity.test/health'), withCli());
+      busyLog.mockRestore();
       expect(busy.status).toBe(503);
       expect(busy.headers.get('retry-after')).toBe('5');
       expect(await busy.json()).toEqual({
         ok: false,
-        error: `bootstrap in progress until ${held}`,
+        error: 'service unavailable',
+        reason: 'bootstrap-in-progress',
       });
+      expect(busyLines).toEqual([`identity boot failed: bootstrap in progress until ${held}`]);
       expect(await secretOf('tenant-cli')).toBeUndefined();
 
       // An expired lease is taken over and released after the store. Stored client
@@ -501,7 +508,11 @@ test('column encryption on pglite with pgcrypto: opt in, flows on ciphertext, fa
       log.mockRestore();
       expect(locked.status).toBe(503);
       // The unauthenticated body is generic; the detail goes to the log only.
-      expect(await locked.json()).toEqual({ ok: false, error: 'column encryption unavailable' });
+      expect(await locked.json()).toEqual({
+        ok: false,
+        error: 'service unavailable',
+        reason: 'column-encryption-unavailable',
+      });
       expect(logged.join('\n')).toContain(
         'column encryption is enabled but IDENTITY_COLUMN_KEY and IDENTITY_BIDX_KEY are not set',
       );

@@ -22,8 +22,11 @@ export function redactStatement(error: unknown): unknown {
 }
 
 function replacement(error: unknown): Error {
-  const code = (error as { code?: unknown }).code;
-  return Object.assign(new Error((error as { message?: unknown }).message as string), { code });
+  const { code, errno } = error as { code?: unknown; errno?: unknown };
+  return Object.assign(new Error((error as { message?: unknown }).message as string), {
+    code,
+    errno,
+  });
 }
 
 /** What may be logged about a failure: its message and code, never statement values. */

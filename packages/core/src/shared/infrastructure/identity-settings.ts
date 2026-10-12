@@ -30,7 +30,11 @@ export interface IdentitySettings {
   issuer: string;
   publicOrigin: string;
   cookieSecure: boolean;
-  database: { url: string; poolMax: number };
+  /**
+   * `migrationUrl` (`MIGRATION_DATABASE_URL`): when set, migrations run as that (owner) role and
+   * the service, on `url`, gets only DML and EXECUTE grants (role separation).
+   */
+  database: { url: string; poolMax: number; migrationUrl: string };
   smtp: {
     host: string;
     port: number;
@@ -74,7 +78,11 @@ export function loadIdentitySettings(env: Env = process.env): IdentitySettings {
     issuer,
     publicOrigin: text('AUTH_PUBLIC_ORIGIN', issuer),
     cookieSecure: text('SERVER_SERVLET_SESSION_COOKIE_SECURE', 'true'),
-    database: { url: text('DATABASE_URL', localPostgresUrl), poolMax: '8' },
+    database: {
+      url: text('DATABASE_URL', localPostgresUrl),
+      poolMax: '8',
+      migrationUrl: text('MIGRATION_DATABASE_URL'),
+    },
     smtp: {
       host: text('SMTP_HOST'),
       port: text('SMTP_PORT', '587'),
@@ -173,7 +181,7 @@ function normalize(raw: unknown): Omit<IdentitySettings, 'encryption'> {
     issuer: unknown;
     publicOrigin: unknown;
     cookieSecure: unknown;
-    database: { url: unknown; poolMax: unknown };
+    database: { url: unknown; poolMax: unknown; migrationUrl: unknown };
     smtp: Record<string, unknown>;
     jwk: Record<string, unknown>;
     bootstrap: IdentitySettings['bootstrap'];
@@ -194,6 +202,7 @@ function normalize(raw: unknown): Omit<IdentitySettings, 'encryption'> {
     database: {
       url: str(value.database.url),
       poolMax: int(value.database.poolMax, 'database pool size'),
+      migrationUrl: str(value.database.migrationUrl),
     },
     smtp: {
       host: str(value.smtp.host),

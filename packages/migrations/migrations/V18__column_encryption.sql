@@ -101,17 +101,8 @@ ALTER TABLE auth_audit_records
   ADD CONSTRAINT auth_audit_records_after_present
     CHECK (after_metadata IS NOT NULL OR after_metadata_enc IS NOT NULL) NOT VALID;
 
--- The CHECKs above were added NOT VALID (no scan under the ALTER's lock); validate them now. They
--- hold for every existing row, whose plaintext columns were NOT NULL.
-ALTER TABLE users VALIDATE CONSTRAINT users_display_name_present;
-ALTER TABLE email_challenges VALIDATE CONSTRAINT email_challenges_email_present;
-ALTER TABLE identity_links VALIDATE CONSTRAINT identity_links_subject_present;
-ALTER TABLE identity_link_flows VALIDATE CONSTRAINT identity_link_flows_nonce_present;
-ALTER TABLE identity_link_flows VALIDATE CONSTRAINT identity_link_flows_code_verifier_present;
-ALTER TABLE identity_unlink_confirmations VALIDATE CONSTRAINT identity_unlink_confirmations_subject_present;
-ALTER TABLE browser_sessions VALIDATE CONSTRAINT browser_sessions_attributes_present;
-ALTER TABLE auth_audit_records VALIDATE CONSTRAINT auth_audit_records_before_present;
-ALTER TABLE auth_audit_records VALIDATE CONSTRAINT auth_audit_records_after_present;
+-- The CHECKs above are added NOT VALID: no scan of the existing rows here. V19 validates them in
+-- its own migration (its own transaction on the guest), after this one commits.
 
 -- The latch is one-way in the database, not only in the service: once enabled, the state row
 -- cannot be turned off, have its key checks changed or cleared, be deleted, or be truncated

@@ -126,10 +126,10 @@ test('redaction follows the cause chain and tolerates odd error shapes', () => {
     configurable: false,
     enumerable: true,
   });
-  Object.assign(frozen, { code: 'XX000' });
-  const replaced = redactStatement(frozen) as Error & { code?: string };
+  Object.assign(frozen, { code: 'XX000', errno: 'IDC01' });
+  const replaced = redactStatement(frozen) as Error & { code?: string; errno?: string };
   expect(replaced).not.toBe(frozen);
-  expect([replaced.message, replaced.code]).toEqual(['frozen', 'XX000']);
+  expect([replaced.message, replaced.code, replaced.errno]).toEqual(['frozen', 'XX000', 'IDC01']);
   expect(JSON.stringify(replaced)).not.toContain(KEY);
   expect(redactStatement(null)).toBeNull();
   expect(describeError('text')).toBe('unknown error');

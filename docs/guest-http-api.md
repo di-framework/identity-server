@@ -271,7 +271,7 @@ as the developer: `di-tenant-pgprove has no Postgres directory BackingService`).
 
 | Check | Result |
 | --- | --- |
-| `/health` before the Secret had values | 503, `runtime settings missing from the identity-control Secret: ISSUER_URL, AUTH_PUBLIC_ORIGIN, AUTH_ACTIVE_PRIVATE_JWK` (database opened and migrated first) |
+| `/health` before the Secret had values | 503, `runtime settings missing from the identity-control Secret: ISSUER_URL, AUTH_PUBLIC_ORIGIN, AUTH_ACTIVE_PRIVATE_JWK` (database opened and migrated first). Since #57 the body is generic (`reason: runtime-settings-missing`) and the names are in the log. |
 | After `runtime-secrets.ts apply` | `/health` 200 within 12 s; `/ready` all true |
 | Provisioner client credentials, `POST /api/admin/organizations` | 201, then 409 for the same slug; `GET` 200 |
 | Owner sign-in, consent, PKCE code exchange, UserInfo | 303, 303, 200, 200 |

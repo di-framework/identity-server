@@ -57,6 +57,7 @@ test('discovers the reused Flyway migrations in version order', async () => {
     ['16', 'runtime secrets to secret'],
     ['17', 'clear session secrets'],
     ['18', 'column encryption'],
+    ['19', 'validate column encryption checks'],
   ]);
 });
 
@@ -83,6 +84,7 @@ test('applies the reused migrations and reads a row through PostgresAdapter', as
       '16',
       '17',
       '18',
+      '19',
     ]);
 
     const again = await applyMigrations(db);
@@ -134,6 +136,7 @@ test('V12 unwraps metadata and session attributes stored as JSON string scalars'
         '16',
         '17',
         '18',
+        '19',
       ]);
       expect(
         await db.first<Record<string, unknown>>(
@@ -186,6 +189,7 @@ test('V16 removes runtime secrets from identity_runtime_secret and keeps bootstr
         '16',
         '17',
         '18',
+        '19',
       ]);
       expect(await db.query('SELECT name FROM identity_runtime_secret ORDER BY name')).toEqual([
         { name: 'bootstrap_client_fingerprints' },
@@ -232,6 +236,7 @@ test('V17 removes raw secrets from existing browser session attributes', async (
       expect((await applyMigrations(db)).applied.map((record) => record.version)).toEqual([
         '17',
         '18',
+        '19',
       ]);
       expect(await db.query('SELECT id, attributes FROM browser_sessions ORDER BY id')).toEqual([
         { id: 'a'.repeat(64), attributes: { SPRING_SECURITY_SAVED_REQUEST: '/admin' } },
@@ -295,7 +300,10 @@ test('V18 prepares column encryption on a populated database without changing a 
         audit: await db.query('SELECT before_metadata, after_metadata FROM auth_audit_records'),
       });
       const before = await snapshot();
-      expect((await applyMigrations(db)).applied.map((record) => record.version)).toEqual(['18']);
+      expect((await applyMigrations(db)).applied.map((record) => record.version)).toEqual([
+        '18',
+        '19',
+      ]);
       expect(await snapshot()).toEqual(before);
       expect(
         await db.first<Record<string, unknown>>(

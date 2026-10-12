@@ -22,7 +22,7 @@ import { routeRequest } from '../../server/src/serve.ts';
 import type { GuestEnv } from './database.ts';
 import { ensureSchema, resetSchema } from './migrations.ts';
 import type { ConfigStore } from './settings.ts';
-import { loadGuestSettings } from './settings.ts';
+import { loadGuestSettings, MissingRuntimeSecretsError } from './settings.ts';
 
 const BOOTSTRAP_FINGERPRINT = 'bootstrap_fingerprint';
 const CLIENT_FINGERPRINTS = 'bootstrap_client_fingerprints';
@@ -70,21 +70,26 @@ export async function handle(request: Request, runtime: GuestRuntime): Promise<R
     });
     await ready;
   } catch (error) {
+    // Unauthenticated: a generic body and a coarse reason. The details (missing setting names,
+    // key mismatches, driver messages that might echo a value) go to the log only.
+    console.error(`identity boot failed: ${describeError(redactStatement(error))}`);
     const headers = error instanceof BootstrapBusyError ? { 'retry-after': '5' } : {};
-    // Column encryption details (which key is missing or differs) stay in the log.
-    if (error instanceof ColumnEncryptionUnavailable) {
-      console.error(`identity boot failed: ${describeError(redactStatement(error))}`);
-      return Response.json(
-        { ok: false, error: 'column encryption unavailable' },
-        { status: 503, headers },
-      );
-    }
-    const message = error instanceof Error ? error.message : 'failed';
-    return Response.json({ ok: false, error: message }, { status: 503, headers });
+    return Response.json(
+      { ok: false, error: 'service unavailable', reason: bootFailure(error) },
+      { status: 503, headers: { ...headers, 'cache-control': 'no-store' } },
+    );
   }
   const response = await routeRequest(request, runtime.assets, runtime.shell);
   await drain();
   return response;
+}
+
+/** A stable, value-free label for why boot failed. */
+export function bootFailure(error: unknown): string {
+  if (error instanceof BootstrapBusyError) return 'bootstrap-in-progress';
+  if (error instanceof MissingRuntimeSecretsError) return 'runtime-settings-missing';
+  if (error instanceof ColumnEncryptionUnavailable) return 'column-encryption-unavailable';
+  return 'boot-failed';
 }
 
 async function boot(runtime: GuestRuntime): Promise<void> {

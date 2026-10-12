@@ -1,4 +1,4 @@
-import { afterAll, beforeEach, expect, test } from 'bun:test';
+import { afterAll, beforeEach, expect, spyOn, test } from 'bun:test';
 import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -245,13 +245,20 @@ test('a failed database or schema surfaces as not ready', async () => {
     assets: new Map(),
     shell: '<div id="root"></div>',
   });
+  const logged: string[] = [];
+  const log = spyOn(console, 'error').mockImplementation((line: unknown) => {
+    logged.push(String(line));
+  });
+  const unavailable = (reason: string) => ({ ok: false, error: 'service unavailable', reason });
   resetGuest();
   const closed = await handle(
     new Request('https://identity.test/ready'),
     runtime(async () => failing(new Error('PostgreSQL closed'))),
   );
   expect(closed.status).toBe(503);
-  expect(await closed.json()).toEqual({ ok: false, error: 'PostgreSQL closed' });
+  // The driver's message stays out of the unauthenticated body.
+  expect(await closed.json()).toEqual(unavailable('boot-failed'));
+  expect(closed.headers.get('cache-control')).toBe('no-store');
   const opaque = await handle(
     new Request('https://identity.test/ready'),
     runtime(async () => {
@@ -259,7 +266,7 @@ test('a failed database or schema surfaces as not ready', async () => {
     }),
   );
   expect(opaque.status).toBe(503);
-  expect(await opaque.json()).toEqual({ ok: false, error: 'failed' });
+  expect(await opaque.json()).toEqual(unavailable('boot-failed'));
 
   const database = await freshDatabase();
   const unconfigured = await handle(
@@ -267,11 +274,13 @@ test('a failed database or schema surfaces as not ready', async () => {
     runtime(async () => database, { DI_CONTROL_TOKEN: 'only-the-cli-keys' }),
   );
   expect(unconfigured.status).toBe(503);
-  expect(await unconfigured.json()).toEqual({
-    ok: false,
-    error:
-      'runtime settings missing from the identity-control Secret: ISSUER_URL, AUTH_PUBLIC_ORIGIN, AUTH_ACTIVE_PRIVATE_JWK',
-  });
+  expect(await unconfigured.json()).toEqual(unavailable('runtime-settings-missing'));
+  log.mockRestore();
+  expect(logged).toEqual([
+    'identity boot failed: PostgreSQL closed',
+    'identity boot failed: unknown error',
+    'identity boot failed: runtime settings missing from the identity-control Secret: ISSUER_URL, AUTH_PUBLIC_ORIGIN, AUTH_ACTIVE_PRIVATE_JWK',
+  ]);
   resetGuest();
 });
 
