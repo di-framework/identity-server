@@ -260,7 +260,9 @@ connection, and a restart on the same data directory.
 
 2026-10-12, kube instance `pgprove` (platform 6.0.11-equivalent main, published
 `wash:2.8.0-wasi-tls-exclusive`), tenant `pgprove`, deployed as the tenant developer with
-`deploy/guest/deploy.sh` and freshly generated values; pushed to the tenant registry.
+`deploy/guest/deploy.sh` and freshly generated values; pushed to the tenant registry. The
+authorization-code rows are from the redeploy after the security review (the tenant check passed
+as the developer: `di-tenant-pgprove has no Postgres directory BackingService`).
 `apps/guest/scripts/live-check.ts` drove the gateway with `Host: identity.pgprove.localhost`:
 
 | Check | Result |
@@ -272,16 +274,65 @@ connection, and a restart on the same data directory.
 | 32 parallel `/ready`, `/oauth2/jwks`, `/login` | all 200 in 0.7 s |
 | Tenant host pod deleted | workload Ready again without a re-push; the organization reads back, the owner signs in with the password hashed before the restart, the stored consent is reused, same subject |
 | Second `deploy.sh` (Secret deleted, CLI deploy, values re-applied) | 503 for one poll while the CLI's roll ran without values, then 200; data intact |
+| Authorize validation: unknown client, unregistered redirect URI | 400, 400 |
+| Code exchange: wrong PKCE verifier, wrong redirect URI, correct exchange, ID token verified against `/oauth2/jwks` (RS256, nonce, subject), code replay, wrong client secret | 400, 400, 200, verified, 400, 401 |
+| Refresh: rotation, narrowing to `profile`, widening to `admin:write`, reuse of a rotated token, the family after reuse | 200, 200, `invalid_scope`, `invalid_grant`, 400 |
+
+### The acceptance suites from #50
+
+#50 asks for `examples/app/src/journey.test.ts` and `apps/server/tests/authorization-code.test.ts`
+on the fresh instance. Neither can be pointed at a deployed guest as written:
+
+- `examples/app/src/journey.test.ts` tests `examples/app`, a separate `@di-framework/auth` demo
+  (`/auth/register`, `/me`, `__Host-sid`) with its own in-memory store. It imports no identity
+  code and the guest has none of its routes, so there is nothing of it to run against `pgprove`.
+  It passes in `bun test` as before.
+- `apps/server/tests/authorization-code.test.ts` sets up through the database: it registers
+  clients and inserts users with repositories, changes rows with SQL (avatar, archived and
+  inactive users, expired codes) and reads audit rows. The pglite database inside the workload
+  has no network path, so those steps cannot run remotely. Instead:
+  - the whole suite (9 tests) runs on PGlite 17.5 behind the guest's adapter, in CI:
+    `IDENTITY_TEST_DATABASE=pglite bun --config=bunfig.pglite.toml test apps/server/tests/authorization-code.test.ts`
+    (9 pass);
+  - its HTTP-only assertions run against `pgprove` through `authorizationCodeChecks` in
+    `apps/guest/tests/support/flows.ts` (rows above), also run in-process by `boot.test.ts`.
+
+| authorization-code.test.ts | On `pgprove` (live-check.ts) | On PGlite in CI |
+| --- | --- | --- |
+| login, consent, code, tokens, ID token, UserInfo, consent reuse, code replay | sign-in, consent, exchange, ID token verified, UserInfo, consent reused after restart, replay 400 | yes |
+| refresh rotation and reuse revoking the authorization | rotate, narrow, widen refused, reuse `invalid_grant`, family revoked (the audit row is not readable remotely) | yes |
+| authorize request validation | unknown client, unregistered redirect URI (the other cases need extra clients) | yes |
+| code exchange checks client, expiry, redirect URI, PKCE | wrong secret 401, wrong redirect 400, wrong verifier 400 (expiry needs SQL) | yes |
+| consent bound to the pending request and user | not remote (needs a second user) | yes |
+| UserInfo refuses inactive users | not remote (needs SQL) | yes |
+| prompt=login, max_age, prompt=none | not remote | yes |
+| archived users get nothing | not remote (needs SQL) | yes |
+| public loopback client | not remote (needs a public client) | yes |
 
 ### authproto cutover
 
 Not done; it needs explicit sign-off. `authproto` still runs the Postgres guest on tenant
 `identity` with the `directory` BackingService and the `identity_runtime_secret` rows, deployed
-from an earlier commit. `deploy/guest/deploy.sh` refuses `authproto`, and the Pulumi program
-refuses any stack without `database: pglite`. A cutover would:
+from an earlier commit. `deploy/guest/deploy.sh` and the Pulumi program refuse any tenant whose
+namespace has the `directory` BackingService, the Pulumi program also refuses any stack without
+`database: pglite`, and neither has a default tenant.
+
+> **Gate: export the runtime-secret rows before any migration at V16 or later touches
+> `directory`.** V16 deletes every `identity_runtime_secret` row except the bootstrap state. On
+> authproto those rows may be the only copy of the signing key (`AUTH_ACTIVE_PRIVATE_JWK`) and the
+> client secrets. Any migrator from this repository at or after V16 does it: the pglite guest
+> never connects to Postgres, but the Bun server (`bun start`, `applyMigrations`) with
+> `DATABASE_URL` pointed at `directory` would. Export first (`SELECT name, value FROM
+> identity_runtime_secret`, to an encrypted store, never a log), and check the export before
+> running anything newer than V15 there. A `DELETE` does not erase the values: they stay in dead
+> tuples until `VACUUM`, in WAL until it is recycled, and in every existing `pg_dump` or volume
+> backup until rotation. Treat those as secret-bearing until then.
+
+A cutover would:
 
 1. Freeze writes, and export the directory data from Postgres (`pg_dump --data-only` of the
-   identity tables) and the runtime secret rows (names and values, kept out of logs).
+   identity tables) and the runtime secret rows (names and values, kept out of logs), per the
+   gate above.
 2. Upgrade the tenant host to the exclusive image and deploy the pglite guest with those values
    in `identity-control` (keeping the issuer, origin and signing key keeps issued tokens valid).
 3. Load the data into the new database. There is no network path into pglite; this needs a

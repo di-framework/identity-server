@@ -7,57 +7,32 @@
  *     Writes a new values file (mode 0600): issuer and origin, an RS256 signing key, bootstrap
  *     passwords, client secrets, SMTP settings. Refuses to overwrite an existing file.
  *
+ *   bun deploy/guest/runtime-secrets.ts guard --kubeconfig <path> --tenant <name> [--context <name>]
+ *     Fails when di-tenant-<tenant> still has the Postgres `directory` BackingService (the
+ *     Postgres-era guest, i.e. authproto). `apply` runs the same check first.
+ *
  *   bun deploy/guest/runtime-secrets.ts apply --values <file> --kubeconfig <path> --tenant <name>
  *       [--context <name>] [--workload identity]
  *     Writes the workload's control Secret with those values and rolls the workload onto them.
+ *     Run it on its own to recover when a deploy stopped after deleting or resetting the Secret.
  *
  *   bun deploy/guest/runtime-secrets.ts names --values <file>
- *     Lists the names in a values file (never the values).
+ *     Checks a values file (mode 0600, known names, required names) and lists its names.
  *
- * Why the control Secret: tenant admission lets a workload without an environment label read
- * only `<workload>-control` through `localResources.environment.secretFrom`, and the platform
- * refuses secrets and URLs in wasi:config. The guest reads these names from its WASI environment
- * (apps/guest/src/settings.ts); they never reach the database.
- *
- * `di-framework platform deploy` (cli-plugin-platform 6.1.2) rewrites that Secret on every deploy
- * with only DI_CONTROL_TOKEN and DI_CONTROL_IDENTITY, so `apply` must run after each deploy. As a
- * tenant developer the CLI cannot replace a control Secret that has extra keys (the platform's
- * `tenant-secret-update` policy refuses a replace that drops a key), so `deploy.sh` deletes the
- * Secret before deploying. The guest fails closed (HTTP 503, naming the missing keys) while the
- * Secret lacks the values.
- *
- * Tenant developers can create, replace and delete Secrets but never read them. `apply` therefore
- * writes the whole Secret blind, like the CLI does: a fresh DI_CONTROL_TOKEN (the identity
- * workload has no cron or queue invokers that use it), DI_CONTROL_IDENTITY, and the values. The
- * document goes to kubectl through a private temporary file; nothing here prints a value.
+ * The rules and the reasons for this Secret are in deploy/platform/components/control-secret.ts,
+ * which the Pulumi program uses too. The Secret document goes to kubectl on stdin; no value is
+ * written to disk (other than by `generate`), put in an argument list, or printed.
  */
 import { createHash, generateKeyPairSync, randomBytes } from 'node:crypto';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
-
-/** Every name the guest reads from its environment (apps/guest/src/settings.ts). */
-const KNOWN = new Set([
-  'ISSUER_URL',
-  'AUTH_PUBLIC_ORIGIN',
-  'AUTH_ACTIVE_PRIVATE_JWK',
-  'AUTH_PREVIOUS_PUBLIC_JWK_SET',
-  'SMTP_HOST',
-  'SMTP_USERNAME',
-  'SMTP_PASSWORD',
-  'AUTH_ACCESS_REDIRECT_URIS',
-  'AUTH_BOOTSTRAP_OWNER_PASSWORD',
-  'AUTH_BOOTSTRAP_VIEWER_PASSWORD',
-  'AUTH_ACCESS_CLIENT_SECRET',
-  'AUTH_DIRECTORY_CLIENT_SECRET',
-  'AUTH_PROVISIONER_CLIENT_SECRET',
-  'AUTH_CLI_CLIENT_ID',
-  'AUTH_CLI_REDIRECT_URIS',
-]);
-const REQUIRED = ['ISSUER_URL', 'AUTH_PUBLIC_ORIGIN', 'AUTH_ACTIVE_PRIVATE_JWK'];
-/** WorkloadDeployment config entry that rolls the workload when the values change. */
-const REVISION_KEY = 'IDENTITY_RUNTIME_REVISION';
+import {
+  applyRuntimeSecrets,
+  assertPrivateMode,
+  type Kubectl,
+  parseRuntimeValues,
+  refuseLegacyTenant,
+} from '../platform/components/control-secret.ts';
 
 const { positionals, values: args } = parseArgs({
   allowPositionals: true,
@@ -75,14 +50,9 @@ const { positionals, values: args } = parseArgs({
   },
 });
 
-function fail(message: string): never {
-  console.error(`runtime-secrets: ${message}`);
-  process.exit(2);
-}
-
 function required(name: keyof typeof args): string {
   const value = args[name];
-  if (typeof value !== 'string' || value.trim() === '') fail(`--${name} is required`);
+  if (typeof value !== 'string' || value.trim() === '') throw new Error(`--${name} is required`);
   return value;
 }
 
@@ -99,111 +69,48 @@ function signingJwk(): string {
 }
 
 function readValues(path: string): Record<string, string> {
-  const parsed = JSON.parse(readFileSync(path, 'utf8')) as unknown;
-  if (parsed == null || typeof parsed !== 'object' || Array.isArray(parsed)) {
-    fail(`${path} must hold a JSON object of names to strings`);
-  }
-  const entries = Object.entries(parsed as Record<string, unknown>);
-  const unknown = entries.filter(([name]) => !KNOWN.has(name)).map(([name]) => name);
-  if (unknown.length > 0) fail(`unknown names in ${path}: ${unknown.join(', ')}`);
-  const notStrings = entries.filter(([, value]) => typeof value !== 'string').map(([n]) => n);
-  if (notStrings.length > 0) fail(`values must be strings: ${notStrings.join(', ')}`);
-  const missing = REQUIRED.filter((name) => !(parsed as Record<string, string>)[name]?.trim());
-  if (missing.length > 0) fail(`missing required names: ${missing.join(', ')}`);
-  return parsed as Record<string, string>;
+  assertPrivateMode(statSync(path).mode, path);
+  return parseRuntimeValues(readFileSync(path, 'utf8'), path);
 }
 
-async function kubectl(argv: string[]): Promise<{ code: number; stderr: string }> {
+/** kubectl bound to --kubeconfig/--context; stdout is returned, never printed. */
+const kubectl: Kubectl = async (argv, input) => {
   const base = [
     '--kubeconfig',
     required('kubeconfig'),
     ...(args.context ? ['--context', args.context] : []),
   ];
-  const child = Bun.spawn(['kubectl', ...base, ...argv], { stdout: 'ignore', stderr: 'pipe' });
-  const stderr = await new Response(child.stderr).text();
-  return { code: await child.exited, stderr };
-}
+  const child = Bun.spawn(['kubectl', ...base, ...argv], {
+    stdin: input === undefined ? 'ignore' : new Blob([input]),
+    stdout: 'pipe',
+    stderr: 'pipe',
+  });
+  const [stdout, stderr] = await Promise.all([
+    new Response(child.stdout).text(),
+    new Response(child.stderr).text(),
+  ]);
+  return { code: await child.exited, stdout, stderr };
+};
 
 async function apply(): Promise<void> {
   const values = readValues(required('values'));
-  const tenant = required('tenant');
   const workload = args.workload as string;
-  const namespace = `di-tenant-${tenant}`;
-  const name = `${workload}-control`;
-  const encode = (value: string) => Buffer.from(value, 'utf8').toString('base64');
-  const data: Record<string, string> = {
-    DI_CONTROL_TOKEN: encode(secret(32)),
-    DI_CONTROL_IDENTITY: encode(workload),
-  };
-  for (const [key, value] of Object.entries(values)) data[key] = encode(value);
-  const document = {
-    apiVersion: 'v1',
-    kind: 'Secret',
-    metadata: {
-      name,
-      namespace,
-      labels: {
-        'app.kubernetes.io/managed-by': 'di-framework',
-        'app.kubernetes.io/name': workload,
-      },
-    },
-    type: 'Opaque',
-    data,
-  };
-  const directory = mkdtempSync(join(tmpdir(), 'identity-control-'));
-  const path = join(directory, 'secret.json');
-  const collection = `/api/v1/namespaces/${namespace}/secrets`;
-  try {
-    writeFileSync(path, JSON.stringify(document), { mode: 0o600 });
-    const created = await kubectl(['create', '--raw', collection, '-f', path]);
-    if (created.code !== 0) {
-      if (!/AlreadyExists/.test(created.stderr)) {
-        fail(`creating ${name} failed (exit ${created.code})`);
-      }
-      const replaced = await kubectl(['replace', '--raw', `${collection}/${name}`, '-f', path]);
-      if (replaced.code !== 0) fail(`replacing ${name} failed (exit ${replaced.code})`);
-    }
-  } finally {
-    rmSync(directory, { recursive: true, force: true });
-  }
-  console.log(`wrote ${namespace}/${name}: ${Object.keys(values).sort().join(', ')}`);
-
-  // The running instance keeps the environment it started with; a changed template rolls it.
-  const revision = createHash('sha256')
-    .update(JSON.stringify(Object.entries(values).sort()))
-    .update(String(Date.now()))
-    .digest('hex')
-    .slice(0, 16);
-  // The CLI renders environment config for every pglite workload; add the map itself if not.
-  const environment = '/spec/template/spec/components/0/localResources/environment';
-  const attempts = [
-    [{ op: 'add', path: `${environment}/config/${REVISION_KEY}`, value: revision }],
-    [{ op: 'add', path: `${environment}/config`, value: { [REVISION_KEY]: revision } }],
-  ];
-  let patched = { code: 1, stderr: '' };
-  for (const patch of attempts) {
-    patched = await kubectl([
-      '--namespace',
-      namespace,
-      'patch',
-      'workloaddeployment',
-      workload,
-      '--type',
-      'json',
-      '-p',
-      JSON.stringify(patch),
-    ]);
-    if (patched.code === 0) break;
-  }
-  if (patched.code !== 0) {
-    fail(`rolling workloaddeployment/${workload} failed: ${patched.stderr.trim().slice(0, 300)}`);
-  }
-  console.log(`rolled workloaddeployment/${workload} (${REVISION_KEY}=${revision})`);
+  const result = await applyRuntimeSecrets(kubectl, {
+    tenant: required('tenant'),
+    workload,
+    values,
+    token: secret(32),
+    revision: createHash('sha256').update(randomBytes(16)).digest('hex').slice(0, 16),
+  });
+  console.log(`wrote di-tenant-${args.tenant}/${workload}-control: ${result.names.join(', ')}`);
+  console.log(
+    `rolled workloaddeployment/${workload} (IDENTITY_RUNTIME_REVISION=${result.revision})`,
+  );
 }
 
 function generate(): void {
   const out = required('out');
-  if (existsSync(out)) fail(`${out} exists; refusing to overwrite runtime secrets`);
+  if (existsSync(out)) throw new Error(`${out} exists; refusing to overwrite runtime secrets`);
   const origin = required('origin').replace(/\/+$/, '');
   const values: Record<string, string> = {
     ISSUER_URL: (args.issuer ?? origin).replace(/\/+$/, ''),
@@ -222,20 +129,29 @@ function generate(): void {
   console.log(`wrote ${out} (mode 0600): ${Object.keys(values).sort().join(', ')}`);
 }
 
-switch (positionals[0]) {
-  case 'generate':
-    generate();
-    break;
-  case 'apply':
-    await apply();
-    break;
-  case 'names':
-    console.log(
-      Object.keys(readValues(required('values')))
-        .sort()
-        .join('\n'),
-    );
-    break;
-  default:
-    fail('usage: runtime-secrets.ts generate|apply|names [options]; see the header comment');
+try {
+  switch (positionals[0]) {
+    case 'generate':
+      generate();
+      break;
+    case 'guard':
+      await refuseLegacyTenant(kubectl, `di-tenant-${required('tenant')}`);
+      console.log(`di-tenant-${args.tenant} has no Postgres directory BackingService`);
+      break;
+    case 'apply':
+      await apply();
+      break;
+    case 'names':
+      console.log(
+        Object.keys(readValues(required('values')))
+          .sort()
+          .join('\n'),
+      );
+      break;
+    default:
+      throw new Error('usage: runtime-secrets.ts generate|guard|apply|names [options]');
+  }
+} catch (error) {
+  console.error(`runtime-secrets: ${error instanceof Error ? error.message : String(error)}`);
+  process.exitCode = 2;
 }

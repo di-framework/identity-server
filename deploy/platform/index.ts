@@ -3,7 +3,7 @@
  *
  *   KubeInstance      di-framework-kube release, verified and cached; `up` on create and
  *                     update, `down` on delete. kube creates Kubesolo (or uses an existing
- *                     cluster) and installs @di-framework/platform with platform.json.
+ *                     cluster) and installs @di-framework/platform with tenant `tenant`.
  *   InClusterRegistry component registry in the platform namespace, unless `registry`
  *                     names an external one.
  *   PublishedImage    only with `tenantHostLocalImage`: a local tenant host build, pushed
@@ -24,8 +24,10 @@
  *
  * `pulumi up` builds the environment; `pulumi destroy` removes it in reverse order.
  *
- * Stack config. `database` is required and must be `pglite`; everything else is optional:
+ * Stack config. `database` and `tenant` are required; everything else is optional:
  *   database               `pglite`, the explicit opt-in checked below (required)
+ *   tenant                 tenant to declare and deploy into, with a `developer` user (required;
+ *                          a tenant with the Postgres `directory` BackingService is refused)
  *   kubeVersion            kube release tag, or `latest` (default: latest)
  *   kubeBinary             local di-framework-kube build instead of a release
  *   kubeInstance           kube instance name (default: identity)
@@ -52,14 +54,17 @@
  *   mailpitClusterIP       Mailpit's fixed ClusterIP, granted as tenant egress (default: 10.43.250.25)
  *   workloadForwardPort    loopback port for reaching the workload through di-http (default: 25181)
  */
+
+import { spawnSync } from 'node:child_process';
 import { createHash, createPrivateKey } from 'node:crypto';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import * as k8s from '@pulumi/kubernetes';
 import * as pulumi from '@pulumi/pulumi';
 import * as random from '@pulumi/random';
 import * as tls from '@pulumi/tls';
 import { parse } from 'yaml';
+import { LEGACY_DATABASE } from './components/control-secret';
 import { containerEngine, localImageId, PublishedImage } from './components/image';
 import { KubeInstance, latestKubeRelease } from './components/kube';
 import { Mailpit, mailpitDestination } from './components/mailpit';
@@ -69,9 +74,8 @@ import { CliWorkload, sourceDigest } from './components/workload';
 
 /** Project name in apps/guest/di-framework.config.json. */
 const APPLICATION = 'identity';
-/** Target in di-framework.deploy.toml, and the tenant declared in platform.json. */
+/** Target in di-framework.deploy.toml. */
 const TARGET = 'identity';
-const TENANT = 'identity';
 
 interface ExternalRegistry {
   push: string;
@@ -80,6 +84,50 @@ interface ExternalRegistry {
 
 const config = new pulumi.Config();
 const workspaceRoot = resolve(__dirname, '../..');
+
+/**
+ * The tenant the platform declares and the guest deploys into. Required, with no default: the
+ * Postgres-era guest (authproto) runs in tenant `identity`, and a default would point a new stack
+ * at it. The deploy also refuses any tenant whose namespace still has the Postgres `directory`
+ * BackingService (components/control-secret.ts), whatever the stack config says.
+ */
+const TENANT = config.require('tenant');
+if (!/^[a-z]([-a-z0-9]{0,40}[a-z0-9])?$/.test(TENANT)) {
+  throw new Error('tenant must be a DNS label');
+}
+
+/**
+ * On an existing cluster, check before anything (kube's `up` included) touches it. A new
+ * Kubesolo instance has no BackingServices; CliWorkload and RuntimeSecrets check again before
+ * they write.
+ */
+const existingKubeconfig = config.get('kubeconfig');
+if (existingKubeconfig !== undefined && !pulumi.runtime.isDryRun()) {
+  const result = spawnSync(
+    'kubectl',
+    [
+      '--kubeconfig',
+      existingKubeconfig,
+      ...(config.get('context') ? ['--context', config.get('context') as string] : []),
+      '--namespace',
+      `di-tenant-${TENANT}`,
+      'get',
+      'backingservices.platform.di-framework.dev',
+      LEGACY_DATABASE,
+      '--ignore-not-found',
+      '-o',
+      'name',
+    ],
+    { encoding: 'utf8' },
+  );
+  if (result.status !== 0 || result.stdout.trim() !== '') {
+    throw new Error(
+      result.status !== 0
+        ? `cannot check di-tenant-${TENANT} for the Postgres \`${LEGACY_DATABASE}\` BackingService; refusing`
+        : `di-tenant-${TENANT} has the Postgres \`${LEGACY_DATABASE}\` BackingService (the Postgres-era guest); see docs/guest-http-api.md#authproto-cutover`,
+    );
+  }
+}
 
 /**
  * Earlier versions of this program ran the guest on a Postgres BackingService (`directory`). An
@@ -159,7 +207,8 @@ const kube = new KubeInstance('kube', {
   httpPort: config.getNumber('httpPort', { min: 1024, max: 65535 }) ?? 28180,
   platformPackage: config.get('platformPackage') ?? '@di-framework/platform@6.0.11',
   platformConfig: {
-    ...JSON.parse(readFileSync(join(__dirname, 'platform.json'), 'utf8')),
+    tenants: [{ name: TENANT }],
+    users: [{ name: 'developer', memberships: [{ tenant: TENANT, role: 'developer' }] }],
     tenantHostImage,
     // A published tag is mutable: pull on every host start so a rebuild takes effect.
     tenantHostImagePullPolicy: publishHostImage ? 'Always' : 'IfNotPresent',

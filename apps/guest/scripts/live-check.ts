@@ -8,12 +8,18 @@
  * `--values` is the runtime secrets file deploy/guest/deploy.sh applied (bootstrap owner password
  * and client secrets come from it). Requests go to `--url` with `Host: <--host>`, for example
  * `--url http://127.0.0.1:28380 --host identity.pgprove.localhost`. Without `--read-only` it
- * creates the organization `--slug`; with it, it checks that the organization exists, which is the
- * check after a restart. Prints status codes and names only, never a secret.
+ * creates the organization `--slug` and runs the authorization-code checks (tests/support/flows.ts:
+ * the HTTP-only assertions of apps/server/tests/authorization-code.test.ts); with it, it checks
+ * that the organization exists and the owner can sign in, which is the check after a restart. Prints status codes and names only, never a secret.
  */
 import { readFileSync } from 'node:fs';
 import { parseArgs } from 'node:util';
-import { identityFlows, loginFlow, readiness } from '../tests/support/flows.ts';
+import {
+  authorizationCodeChecks,
+  identityFlows,
+  loginFlow,
+  readiness,
+} from '../tests/support/flows.ts';
 
 const { values: args } = parseArgs({
   options: {
@@ -91,5 +97,12 @@ if (args['read-only']) {
   if (ready.status !== 200 || read.status !== 200) process.exit(1);
 } else {
   const report = await identityFlows(inputs);
-  console.log(JSON.stringify({ ...report, ms: Math.round(performance.now() - started) }, null, 2));
+  const authorizationCode = await authorizationCodeChecks(inputs);
+  console.log(
+    JSON.stringify(
+      { ...report, authorizationCode, ms: Math.round(performance.now() - started) },
+      null,
+      2,
+    ),
+  );
 }

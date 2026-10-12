@@ -42,3 +42,8 @@ jobs:
 
       - name: Test
         run: bun test
+
+      - name: Authorization code suite on PGlite (the guest's engine and adapter)
+        env:
+          IDENTITY_TEST_DATABASE: pglite
+        run: bun --config=bunfig.pglite.toml test apps/server/tests/authorization-code.test.ts

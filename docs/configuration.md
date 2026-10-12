@@ -101,16 +101,31 @@ cli-plugin-platform creates for the control token. The guest refuses to boot wit
 `di-framework platform deploy` (cli-plugin-platform 6.1.2) rewrites `identity-control` on each
 deploy with only `DI_CONTROL_TOKEN` and `DI_CONTROL_IDENTITY`. As a tenant developer it cannot
 replace a copy that holds more keys (the platform's `tenant-secret-update` policy refuses a replace
-that drops a key), and as an administrator it silently drops them. A deploy is therefore three
-steps, which `deploy/guest/deploy.sh <instance> <values-file>` runs:
+that drops a key), and as an administrator it silently drops them.
+`deploy/guest/deploy.sh <instance> <tenant> <values-file>` (both instance and tenant are
+required) therefore runs:
 
-1. delete `identity-control`;
-2. `di-framework platform deploy identity --target identity`;
-3. `bun deploy/guest/runtime-secrets.ts apply`, which writes the whole Secret (a fresh control
-   token, the identity, and the values; the guest has no cron or queue invokers that use the
-   token) through kubectl's raw create/replace, which tenant developers may use without reading
-   Secrets, and rolls the workload by setting `IDENTITY_RUNTIME_REVISION` in its environment
-   config.
+1. checks: the values file is mode 0600 with known and required names, and
+   `di-tenant-<tenant>` has no Postgres `directory` BackingService (that tenant still runs the
+   Postgres-era guest, as authproto's `identity` does; the check reads the cluster, so it holds
+   whichever kubeconfig or tenant was passed);
+2. `di-framework platform build`, before anything on the cluster changes;
+3. delete `identity-control`;
+4. `di-framework platform deploy identity --target identity`;
+5. `bun deploy/guest/runtime-secrets.ts apply`, which repeats the tenant check, writes the whole
+   Secret (a fresh control token, the identity, and the values; the guest has no cron or queue
+   invokers that use the token) on kubectl's stdin through raw create/replace, which tenant
+   developers may use without reading Secrets, and rolls the workload by setting only
+   `IDENTITY_RUNTIME_REVISION` in its environment config (the other entries, such as
+   `DI_PGLITE_DATA_DIR`, stay).
+
+From step 3 until step 5 finishes the guest answers 503. **Recovery:** if step 4 or 5 fails, fix
+the cause and run `bun deploy/guest/runtime-secrets.ts apply --values <file> --kubeconfig <kc>
+--tenant <tenant>` on its own; it recreates the Secret and rolls the workload.
+
+Two changes would remove this sequence: the CLI carrying extra keys in the control Secret
+(di-framework/cli-extensions#69), or an environment label on the workload, which lets it reference
+`<name>.<env>` Secrets that the CLI never rewrites.
 
 `bun deploy/guest/runtime-secrets.ts generate --out <file> --origin <url> --smtp-host <host>`
 creates a values file (mode 0600) for a new instance. The `deploy/platform` Pulumi program does

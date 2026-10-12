@@ -4,6 +4,8 @@ import type {
   WasmPgRow,
   WasmPgValue,
 } from '@di-framework/pglite-component';
+import { createWasmPgliteDatabase } from '@di-framework/pglite-component';
+import type { SqlDatabase } from '@di-framework/repo';
 import { PGlite } from '@electric-sql/pglite';
 
 /**
@@ -34,7 +36,20 @@ export interface PgliteFixture {
   shutdown(): Promise<void>;
 }
 
-export function pgliteFixture(dataDir?: (root: string) => string): PgliteFixture {
+/**
+ * `integers`: how the binding lifts WIT `s64` results. componentize-qjs 0.4.4-di.5 lifts them as
+ * `bigint` (the default); earlier toolchains lift them as JavaScript numbers, which the adapter
+ * also accepts. Tests run both.
+ */
+export interface PgliteFixtureOptions {
+  integers?: 'bigint' | 'number';
+}
+
+export function pgliteFixture(
+  dataDir?: (root: string) => string,
+  options: PgliteFixtureOptions = {},
+): PgliteFixture {
+  const integers = options.integers ?? 'bigint';
   const engines = new Map<string, PGlite>();
   const open = new Set<string>();
   const opened: string[] = [];
@@ -43,7 +58,8 @@ export function pgliteFixture(dataDir?: (root: string) => string): PgliteFixture
       const root = path || '/data/pglite';
       opened.push(root);
       if (open.has(root)) {
-        return { tag: 'err', val: { tag: 'already-open', val: `${root} is already open` } };
+        // The provider's `open-failed`: another connection already owns this instance.
+        return { tag: 'err', val: { tag: 'open-failed', val: `${root} is already open` } };
       }
       let engine = engines.get(root);
       if (!engine) {
@@ -56,7 +72,7 @@ export function pgliteFixture(dataDir?: (root: string) => string): PgliteFixture
       }
       await engine.exec("SET TimeZone = 'UTC'; SET DateStyle = 'ISO'");
       open.add(root);
-      return connection(engine, () => open.delete(root));
+      return connection(engine, integers, () => open.delete(root));
     },
   };
   return {
@@ -70,13 +86,40 @@ export function pgliteFixture(dataDir?: (root: string) => string): PgliteFixture
   };
 }
 
-function connection(engine: PGlite, release: () => void): WasmPgliteConnection {
+/** A provider error raised inside `guard`, passed through as its WIT variant. */
+class ProviderError {
+  constructor(
+    readonly tag: string,
+    readonly val: string,
+  ) {}
+}
+
+function connection(
+  engine: PGlite,
+  integers: 'bigint' | 'number',
+  release: () => void,
+): WasmPgliteConnection {
   let closed = false;
+  // The provider tracks the transaction itself and refuses calls the state does not permit
+  // (`invalid-transaction-state`) instead of passing them to PostgreSQL, which would only warn.
+  let inTransaction = false;
+  const requireTransaction = (open: boolean, call: string) => {
+    if (inTransaction !== open) {
+      throw new ProviderError(
+        'invalid-transaction-state',
+        `${call} ${open ? 'needs an open transaction' : 'inside an open transaction'}`,
+      );
+    }
+  };
+  const integer = (value: bigint) => (integers === 'number' ? Number(value) : value);
   const guard = async <T>(fn: () => Promise<T>) => {
     if (closed) return { tag: 'err' as const, val: { tag: 'closed', val: 'connection closed' } };
     try {
       return { tag: 'ok' as const, val: await fn() };
     } catch (error) {
+      if (error instanceof ProviderError) {
+        return { tag: 'err' as const, val: { tag: error.tag, val: error.val } };
+      }
       const record = error as { code?: string; message?: string };
       return {
         tag: 'err' as const,
@@ -88,6 +131,11 @@ function connection(engine: PGlite, release: () => void): WasmPgliteConnection {
     }
   };
   const statement = async (sql: string, params: WasmPgValue[]) => {
+    for (const param of params) {
+      if (param.tag === 'real' && !Number.isFinite(param.val)) {
+        throw new ProviderError('invalid-params', 'non-finite floats cannot be sent as parameters');
+      }
+    }
     const bound = params.map(toParam);
     return engine.query<Record<string, unknown>>(
       sql,
@@ -99,27 +147,56 @@ function connection(engine: PGlite, release: () => void): WasmPgliteConnection {
     result.rows.map((row) =>
       result.fields.map(
         (field) =>
-          [field.name, toValue(row[field.name], field.dataTypeID)] as [string, WasmPgValue],
+          [field.name, toValue(row[field.name], field.dataTypeID, integer)] as [
+            string,
+            WasmPgValue,
+          ],
       ),
     );
   return {
     exec: (sql) => guard(async () => void (await engine.exec(sql))),
     run: (sql, params) =>
-      guard(async () => BigInt((await statement(sql, params)).affectedRows ?? 0)),
+      guard(async () => integer(BigInt((await statement(sql, params)).affectedRows ?? 0))),
     query: (sql, params) => guard(async () => rows(await statement(sql, params))),
     first: (sql, params) => guard(async () => rows(await statement(sql, params))[0]),
-    begin: () => guard(async () => void (await engine.exec('BEGIN'))),
-    commit: () => guard(async () => void (await engine.exec('COMMIT'))),
-    rollback: () => guard(async () => void (await engine.exec('ROLLBACK'))),
-    savepoint: (name) => guard(async () => void (await engine.exec(`SAVEPOINT ${name}`))),
+    begin: () =>
+      guard(async () => {
+        requireTransaction(false, 'begin');
+        await engine.exec('BEGIN');
+        inTransaction = true;
+      }),
+    commit: () =>
+      guard(async () => {
+        requireTransaction(true, 'commit');
+        inTransaction = false;
+        await engine.exec('COMMIT');
+      }),
+    rollback: () =>
+      guard(async () => {
+        requireTransaction(true, 'rollback');
+        inTransaction = false;
+        await engine.exec('ROLLBACK');
+      }),
+    savepoint: (name) =>
+      guard(async () => {
+        requireTransaction(true, 'savepoint');
+        await engine.exec(`SAVEPOINT ${name}`);
+      }),
     releaseSavepoint: (name) =>
-      guard(async () => void (await engine.exec(`RELEASE SAVEPOINT ${name}`))),
+      guard(async () => {
+        requireTransaction(true, 'release savepoint');
+        await engine.exec(`RELEASE SAVEPOINT ${name}`);
+      }),
     rollbackToSavepoint: (name) =>
-      guard(async () => void (await engine.exec(`ROLLBACK TO SAVEPOINT ${name}`))),
+      guard(async () => {
+        requireTransaction(true, 'rollback to savepoint');
+        await engine.exec(`ROLLBACK TO SAVEPOINT ${name}`);
+      }),
     close: () =>
       guard(async () => {
         // The provider rolls back uncommitted work and resets the session on close.
-        await engine.exec('ROLLBACK');
+        if (inTransaction) await engine.exec('ROLLBACK');
+        inTransaction = false;
         closed = true;
         release();
       }),
@@ -143,12 +220,16 @@ function toParam(value: WasmPgValue): { value: string | null; oid: number } {
   }
 }
 
-function toValue(raw: unknown, oid: number): WasmPgValue {
+function toValue(
+  raw: unknown,
+  oid: number,
+  integer: (value: bigint) => bigint | number,
+): WasmPgValue {
   if (raw === null || raw === undefined) return { tag: 'null' };
   if (Array.isArray(raw)) return { tag: 'text', val: arrayLiteral(raw) };
   const text = String(raw);
   if (oid === 16) return { tag: 'boolean', val: text === 't' };
-  if (INTEGER.has(oid)) return { tag: 'integer', val: BigInt(text) };
+  if (INTEGER.has(oid)) return { tag: 'integer', val: integer(BigInt(text)) };
   if (REAL.has(oid)) return { tag: 'real', val: Number(text) };
   if (oid === 17) return { tag: 'blob', val: Uint8Array.from(Buffer.from(text.slice(2), 'hex')) };
   if (JSON_TYPES.has(oid)) return { tag: 'json', val: text };
@@ -171,4 +252,14 @@ function arrayLiteral(values: unknown[]): string {
       : `"${text.replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`;
   });
   return `{${items.join(',')}}`;
+}
+
+export const OPEN_TEST_PGLITE = Symbol.for('identity.test.pglite');
+
+/** One in-memory PGlite database behind the real adapter, for suites written against `SqlDatabase`. */
+export async function openTestPglite(): Promise<SqlDatabase> {
+  const fixture = pgliteFixture();
+  // An engine left open at exit ends the process with status 99; pglite-preload.ts closes it.
+  (globalThis as Record<symbol, unknown>)[OPEN_TEST_PGLITE] = () => fixture.shutdown();
+  return createWasmPgliteDatabase('/data/test', { module: fixture.module });
 }

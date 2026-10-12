@@ -1,4 +1,5 @@
 import { Hashing } from '../../../../packages/core/src/shared/infrastructure/crypto/hashing.ts';
+import { verifyJws } from '../../../../packages/core/src/shared/infrastructure/crypto/signing-keys.ts';
 import { Browser } from '../../../server/tests/support/browser.ts';
 
 /**
@@ -156,6 +157,181 @@ export async function loginFlow(inputs: FlowInputs): Promise<FlowReport['login']
     userinfo: userinfo.status,
     subject: String(claims.sub),
   };
+}
+
+/**
+ * The checks of apps/server/tests/authorization-code.test.ts that need nothing but HTTP, against
+ * the bootstrap access client and owner: authorize validation, consent reuse, the ID token
+ * verified against the JWKS, PKCE and redirect URI enforcement, code replay, refresh rotation,
+ * scope narrowing and widening, and refresh reuse revoking the authorization.
+ */
+export async function authorizationCodeChecks(
+  inputs: FlowInputs,
+): Promise<Record<string, unknown>> {
+  const browser = new Browser(inputs.fetch);
+  const signIn = await browser.signIn(inputs.ownerLogin, inputs.ownerPassword);
+  check(signIn.status === 303, `sign-in: HTTP ${signIn.status}`);
+  const client = inputs.accessClient;
+  const token = async (form: Record<string, string>, secret = client.secret) => {
+    const response = await inputs.fetch(
+      new Request('https://identity.test/oauth2/token', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/x-www-form-urlencoded',
+          authorization: basic(client.id, secret),
+        },
+        body: new URLSearchParams(form),
+      }),
+    );
+    return { status: response.status, body: (await response.json()) as Record<string, string> };
+  };
+  const authorize = (extra: Record<string, string> = {}) => {
+    const verifier = Hashing.token();
+    const query = new URLSearchParams({
+      response_type: 'code',
+      client_id: client.id,
+      redirect_uri: client.redirectUri,
+      scope: 'openid profile offline_access',
+      state: 'ac-state',
+      nonce: 'n-live',
+      code_challenge: Hashing.pkceChallenge(verifier),
+      code_challenge_method: 'S256',
+      ...extra,
+    });
+    return { path: `/oauth2/authorize?${query}`, verifier };
+  };
+  /** A code, approving consent when the server asks for it. */
+  const codeFor = async (path: string, scope: string[]) => {
+    let location = (await browser.send('GET', path)).headers.get('location') ?? '';
+    const consentUrl = new URL(location, 'https://identity.test');
+    if (consentUrl.pathname === '/oauth2/consent') {
+      const consent = await browser.page<{ state: string }>(
+        `${consentUrl.pathname}${consentUrl.search}`,
+      );
+      location =
+        (
+          await browser.send('POST', '/oauth2/authorize', {
+            form: { client_id: client.id, state: consent.state, scope },
+          })
+        ).headers.get('location') ?? '';
+    }
+    const callback = new URL(location, 'https://identity.test');
+    check(
+      callback.searchParams.get('state') === 'ac-state',
+      `no code redirect: ${callback.pathname}`,
+    );
+    return callback.searchParams.get('code') ?? '';
+  };
+  const results: Record<string, unknown> = {};
+
+  // Authorize request validation: unknown client and unregistered redirect URI are error pages.
+  const unknownClient = await browser.send('GET', '/oauth2/authorize?client_id=missing', {
+    json: true,
+  });
+  check(unknownClient.status === 400, `unknown client: HTTP ${unknownClient.status}`);
+  const badRedirect = await browser.send(
+    'GET',
+    authorize({ redirect_uri: 'https://evil.example/cb' }).path,
+    { json: true },
+  );
+  check(badRedirect.status === 400, `unregistered redirect URI: HTTP ${badRedirect.status}`);
+  results.authorizeValidation = { unknownClient: 400, unregisteredRedirect: 400 };
+
+  // Code, ID token against the JWKS, wrong verifier, wrong redirect, replay.
+  const first = authorize();
+  const code = await codeFor(first.path, ['openid', 'profile', 'offline_access']);
+  const wrongVerifier = await token({
+    grant_type: 'authorization_code',
+    code,
+    redirect_uri: client.redirectUri,
+    code_verifier: Hashing.token(),
+  });
+  check(wrongVerifier.status === 400, `wrong PKCE verifier: HTTP ${wrongVerifier.status}`);
+  // A failed exchange consumes nothing a correct one could reuse; get a fresh code.
+  const second = authorize();
+  const code2 = await codeFor(second.path, ['openid', 'profile', 'offline_access']);
+  const wrongRedirect = await token({
+    grant_type: 'authorization_code',
+    code: code2,
+    redirect_uri: 'http://localhost:3000/other',
+    code_verifier: second.verifier,
+  });
+  check(wrongRedirect.status === 400, `wrong redirect URI: HTTP ${wrongRedirect.status}`);
+  const third = authorize();
+  const code3 = await codeFor(third.path, ['openid', 'profile', 'offline_access']);
+  const exchanged = await token({
+    grant_type: 'authorization_code',
+    code: code3,
+    redirect_uri: client.redirectUri,
+    code_verifier: third.verifier,
+  });
+  check(exchanged.status === 200, `code exchange: HTTP ${exchanged.status}`);
+  check(exchanged.body.refresh_token, 'no refresh token for offline_access');
+  const jwks = (await (
+    await inputs.fetch(new Request('https://identity.test/oauth2/jwks'))
+  ).json()) as { keys: Record<string, unknown>[] };
+  const claims = verifyJws(exchanged.body.id_token ?? '', jwks.keys, ['RS256']);
+  check(claims.nonce === 'n-live', 'ID token nonce');
+  check(claims.preferred_username === inputs.ownerLogin, 'ID token subject');
+
+  // Refresh: rotation, narrowing, widening refused, reuse revokes the authorization.
+  const rotated = await token({
+    grant_type: 'refresh_token',
+    refresh_token: exchanged.body.refresh_token ?? '',
+  });
+  check(rotated.status === 200, `refresh: HTTP ${rotated.status}`);
+  check(rotated.body.refresh_token !== exchanged.body.refresh_token, 'refresh token not rotated');
+  const narrowed = await token({
+    grant_type: 'refresh_token',
+    refresh_token: rotated.body.refresh_token ?? '',
+    scope: 'profile',
+  });
+  check(narrowed.status === 200 && narrowed.body.scope === 'profile', 'narrowed refresh');
+  const widened = await token({
+    grant_type: 'refresh_token',
+    refresh_token: narrowed.body.refresh_token ?? '',
+    scope: 'admin:write',
+  });
+  check(widened.status === 400 && widened.body.error === 'invalid_scope', 'widened refresh');
+  const reused = await token({
+    grant_type: 'refresh_token',
+    refresh_token: exchanged.body.refresh_token ?? '',
+  });
+  check(reused.status === 400 && reused.body.error === 'invalid_grant', 'reused refresh');
+  const afterReuse = await token({
+    grant_type: 'refresh_token',
+    refresh_token: narrowed.body.refresh_token ?? '',
+  });
+  check(afterReuse.status === 400, `family revoked after reuse: HTTP ${afterReuse.status}`);
+  results.refresh = {
+    rotate: rotated.status,
+    narrow: narrowed.status,
+    widen: widened.body.error,
+    reuse: reused.body.error,
+    familyRevoked: afterReuse.status,
+  };
+  // Replaying the code (after the refresh checks: a replay revokes what the code issued).
+  const replay = await token({
+    grant_type: 'authorization_code',
+    code: code3,
+    redirect_uri: client.redirectUri,
+    code_verifier: third.verifier,
+  });
+  check(replay.status === 400, `code replay: HTTP ${replay.status}`);
+  const badSecret = await token(
+    { grant_type: 'authorization_code', code: code3, redirect_uri: client.redirectUri },
+    'not-the-secret',
+  );
+  check(badSecret.status === 401, `wrong client secret: HTTP ${badSecret.status}`);
+  results.codeExchange = {
+    wrongVerifier: wrongVerifier.status,
+    wrongRedirect: wrongRedirect.status,
+    exchange: exchanged.status,
+    idTokenVerified: true,
+    replay: replay.status,
+    wrongClientSecret: badSecret.status,
+  };
+  return results;
 }
 
 export async function identityFlows(inputs: FlowInputs): Promise<FlowReport> {

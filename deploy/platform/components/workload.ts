@@ -1,5 +1,6 @@
 import * as pulumi from '@pulumi/pulumi';
-import { portForward, runProcess } from './process';
+import { refuseLegacyTenant } from './control-secret';
+import { kubectlRunner, portForward, runProcess } from './process';
 
 /**
  * A di-framework application deployed with the di-framework CLI, as a Pulumi resource.
@@ -34,7 +35,8 @@ export interface CliWorkloadInputs {
   /**
    * A control Secret to delete before each deploy. The CLI rewrites `<workload>-control` with only
    * its control token, and a tenant developer's replace is refused while the Secret holds more
-   * keys (the runtime secrets written after the previous deploy).
+   * keys (the runtime secrets written after the previous deploy). The tenant is checked for the
+   * Postgres `directory` BackingService first, and a tenant that has it is refused.
    */
   resetControlSecret?: { kubeconfig: string; context?: string; namespace: string; name: string };
 }
@@ -107,25 +109,25 @@ const workloadProvider: pulumi.dynamic.ResourceProvider = {
 async function deploy(inputs: CliWorkloadInputs): Promise<CliWorkloadState> {
   const reset = inputs.resetControlSecret;
   if (reset) {
-    // A plain delete: tenant developers may delete Secrets but not read them.
-    const deleted = await runProcess(
-      'kubectl',
-      [
-        '--kubeconfig',
-        reset.kubeconfig,
-        ...(reset.context ? ['--context', reset.context] : []),
-        '--namespace',
-        reset.namespace,
-        'delete',
-        'secret',
-        reset.name,
-        '--ignore-not-found',
-        '--wait=false',
-      ],
-      { log: `di-framework-reset-${reset.name}.log` },
+    const kubectl = kubectlRunner(
+      reset.kubeconfig,
+      reset.context,
+      `di-framework-reset-${reset.name}.log`,
     );
+    // Never replace the Postgres-era guest (authproto): its tenant still has `directory`.
+    await refuseLegacyTenant(kubectl, reset.namespace);
+    // A plain delete: tenant developers may delete Secrets but not read them.
+    const deleted = await kubectl([
+      '--namespace',
+      reset.namespace,
+      'delete',
+      'secret',
+      reset.name,
+      '--ignore-not-found',
+      '--wait=false',
+    ]);
     if (deleted.code !== 0) {
-      throw new Error(`deleting ${reset.name} failed; log: ${deleted.log}\n${deleted.tail}`);
+      throw new Error(`deleting ${reset.name} failed: ${deleted.stderr.slice(-300)}`);
     }
   }
   const forward = inputs.registryForward ? await portForward(inputs.registryForward) : undefined;

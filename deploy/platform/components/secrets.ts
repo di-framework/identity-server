@@ -1,5 +1,6 @@
 import * as pulumi from '@pulumi/pulumi';
-import { portForward, runProcess } from './process';
+import { applyRuntimeSecrets } from './control-secret';
+import { kubectlRunner, portForward } from './process';
 
 /**
  * The identity guest's runtime secrets (issuer, origin, signing key, passwords, client secrets,
@@ -42,9 +43,6 @@ type DeepInput<T> = pulumi.Input<
 >;
 type RuntimeSecretsArgs = { [K in keyof RuntimeSecretsInputs]: DeepInput<RuntimeSecretsInputs[K]> };
 
-/** WorkloadDeployment config entry that rolls the workload onto new values. */
-const REVISION_KEY = 'IDENTITY_RUNTIME_REVISION';
-
 export class RuntimeSecrets extends pulumi.dynamic.Resource {
   constructor(name: string, args: RuntimeSecretsArgs, opts?: pulumi.CustomResourceOptions) {
     super(secretsProvider, name, args, { ...opts, additionalSecretOutputs: ['values'] });
@@ -73,84 +71,26 @@ const secretsProvider: pulumi.dynamic.ResourceProvider = {
 
 async function write(inputs: RuntimeSecretsInputs): Promise<void> {
   const crypto = require('node:crypto') as typeof import('node:crypto');
-  const name = `${inputs.workload}-control`;
-  const encode = (value: string) => Buffer.from(value, 'utf8').toString('base64');
-  const data: Record<string, string> = {
-    DI_CONTROL_TOKEN: encode(crypto.randomBytes(32).toString('base64url')),
-    DI_CONTROL_IDENTITY: encode(inputs.workload),
-  };
-  for (const [key, value] of Object.entries(inputs.values)) data[key] = encode(value);
-  const document = JSON.stringify({
-    apiVersion: 'v1',
-    kind: 'Secret',
-    metadata: {
-      name,
-      namespace: inputs.tenantNamespace,
-      labels: {
-        'app.kubernetes.io/managed-by': 'di-framework',
-        'app.kubernetes.io/name': inputs.workload,
-      },
-    },
-    type: 'Opaque',
-    data,
-  });
-  const collection = `/api/v1/namespaces/${inputs.tenantNamespace}/secrets`;
-  const log = `runtime-secrets-${inputs.workload}.log`;
-  const created = await runProcess(
-    'kubectl',
-    [...kubectlBase(inputs), 'create', '--raw', collection, '-f', '-'],
-    { log, input: document, capture: true },
+  const kubectl = kubectlRunner(
+    inputs.kubeconfig,
+    inputs.context,
+    `runtime-secrets-${inputs.workload}.log`,
   );
-  if (created.code !== 0) {
-    if (!created.tail.includes('AlreadyExists')) {
-      throw new Error(`creating ${name} failed; log: ${created.log}`);
-    }
-    const replaced = await runProcess(
-      'kubectl',
-      [...kubectlBase(inputs), 'replace', '--raw', `${collection}/${name}`, '-f', '-'],
-      { log, input: document, capture: true },
-    );
-    if (replaced.code !== 0) throw new Error(`replacing ${name} failed; log: ${replaced.log}`);
-  }
-
-  // A new revision on every write, like `deploy/guest/runtime-secrets.ts apply`: the Secret
-  // always gets a fresh control token, so the workload always rolls.
-  const revision = crypto
-    .createHash('sha256')
-    .update(JSON.stringify(Object.entries(inputs.values).sort()))
-    .update(inputs.deployment)
-    .update(String(Date.now()))
-    .digest('hex')
-    .slice(0, 16);
-  // The CLI renders environment config for every pglite workload; add the map itself if not.
-  const environment = '/spec/template/spec/components/0/localResources/environment';
-  const attempts = [
-    [{ op: 'add', path: `${environment}/config/${REVISION_KEY}`, value: revision }],
-    [{ op: 'add', path: `${environment}/config`, value: { [REVISION_KEY]: revision } }],
-  ];
-  let patched: Awaited<ReturnType<typeof runProcess>> | undefined;
-  for (const patch of attempts) {
-    patched = await runProcess(
-      'kubectl',
-      [
-        ...kubectlBase(inputs),
-        '--namespace',
-        inputs.tenantNamespace,
-        'patch',
-        'workloaddeployment',
-        inputs.workload,
-        '--type',
-        'json',
-        '-p',
-        JSON.stringify(patch),
-      ],
-      { log: `runtime-secrets-${inputs.workload}-roll.log` },
-    );
-    if (patched.code === 0) break;
-  }
-  if (patched?.code !== 0) {
-    throw new Error(`rolling ${inputs.workload} failed; log: ${patched?.log}\n${patched?.tail}`);
-  }
+  // Refuses a tenant that still has the Postgres `directory` BackingService (authproto), writes
+  // the whole Secret on stdin, and rolls the workload by setting only the revision key. A new
+  // revision on every write: the Secret always gets a fresh control token.
+  await applyRuntimeSecrets(kubectl, {
+    tenant: inputs.tenantNamespace.replace(/^di-tenant-/, ''),
+    workload: inputs.workload,
+    values: inputs.values,
+    token: crypto.randomBytes(32).toString('base64url'),
+    revision: crypto
+      .createHash('sha256')
+      .update(inputs.deployment)
+      .update(crypto.randomBytes(16))
+      .digest('hex')
+      .slice(0, 16),
+  });
 
   const forward = await portForward({
     kubeconfig: inputs.kubeconfig,
@@ -213,12 +153,4 @@ function request(
     req.on('error', reject);
     req.end();
   });
-}
-
-function kubectlBase(inputs: RuntimeSecretsInputs): string[] {
-  return [
-    '--kubeconfig',
-    inputs.kubeconfig,
-    ...(inputs.context ? ['--context', inputs.context] : []),
-  ];
 }

@@ -11,7 +11,7 @@ import { NotificationWorker } from '../../../packages/core/src/notifications/app
 import { withContainer } from '../../../packages/core/tests/support/container-lock.ts';
 import { useTestDatabase } from '../../../packages/core/tests/support/database.ts';
 import { rsaPrivateJwk } from '../../../packages/core/tests/support/keys.ts';
-import { identityFlows } from '../tests/support/flows.ts';
+import { authorizationCodeChecks, identityFlows } from '../tests/support/flows.ts';
 import { type PgliteFixture, pgliteFixture } from '../tests/support/pglite.ts';
 import { DATABASE_ROOT_ENV, pgliteDatabase } from './database.ts';
 import { type GuestRuntime, handle, resetGuest } from './runtime.ts';
@@ -117,7 +117,8 @@ const flowInputs = (fetch: (request: Request) => Promise<Response>, slug: string
 
 test('the guest boots on one pglite connection and serves the Bun routes and flows', async () => {
   await withContainer(async () => {
-    const fixture = pgliteFixture();
+    // `s64` lifted as JavaScript numbers here; the other tests use bigint (componentize-qjs di.5).
+    const fixture = pgliteFixture(undefined, { integers: 'number' });
     const database = pgliteDatabase(fixture.module, () => ({ [DATABASE_ROOT_ENV]: '/data/boot' }));
     const db = await database();
     const assets = new Map<string, Uint8Array>([['main.js', new Uint8Array([1, 2, 3])]]);
@@ -164,6 +165,24 @@ test('the guest boots on one pglite connection and serves the Bun routes and flo
         name: 'Org acme',
       });
       expect(report.login).toMatchObject({ signIn: 303, consent: 303, token: 200, userinfo: 200 });
+      expect(await authorizationCodeChecks(flowInputs(serve, 'unused'))).toEqual({
+        authorizeValidation: { unknownClient: 400, unregisteredRedirect: 400 },
+        codeExchange: {
+          wrongVerifier: 400,
+          wrongRedirect: 400,
+          exchange: 200,
+          idTokenVerified: true,
+          replay: 400,
+          wrongClientSecret: 401,
+        },
+        refresh: {
+          rotate: 200,
+          narrow: 200,
+          widen: 'invalid_scope',
+          reuse: 'invalid_grant',
+          familyRevoked: 400,
+        },
+      });
       expect(fixture.opened).toEqual(['/data/boot']);
       // Secrets stay out of the database: only bootstrap state is stored there.
       const stored = await db.query<{ name: string }>(

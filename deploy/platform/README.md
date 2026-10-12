@@ -6,13 +6,14 @@ One Pulumi program builds identity on wasmCloud end to end:
 cd deploy/platform
 pulumi install      # once, after cloning
 pulumi config set database pglite   # once per stack; see below
+pulumi config set tenant <tenant>   # required; never a tenant that runs the Postgres guest
 pulumi up
 pulumi destroy
 ```
 
 | Resource | What it does |
 | --- | --- |
-| `KubeInstance` (`components/kube.ts`) | Downloads the [di-framework-kube](https://github.com/di-framework/kube) release for this machine, verifies it against `checksums.txt`, and caches it. It runs `di-framework-kube up` on create and update, and `down` on delete. kube creates a Kubesolo container, or uses an existing cluster, and installs `@di-framework/platform` with the tenants in `platform.json` and the tenant host image below. |
+| `KubeInstance` (`components/kube.ts`) | Downloads the [di-framework-kube](https://github.com/di-framework/kube) release for this machine, verifies it against `checksums.txt`, and caches it. It runs `di-framework-kube up` on create and update, and `down` on delete. kube creates a Kubesolo container, or uses an existing cluster, and installs `@di-framework/platform` with the stack's `tenant` (and a `developer` user in it) and the tenant host image below. |
 | `InClusterRegistry` (`components/registry.ts`) | Plain-HTTP OCI registry in the platform namespace: PVC, Deployment, and a ClusterIP Service for component pulls, plus a NodePort Service when a local tenant host image is published. It is skipped when the stack sets an external `registry`. |
 | `PublishedImage` (`components/image.ts`) | Only with `tenantHostLocalImage`: publishes that local tenant host build to the registry. The engine saves it as an OCI layout and `oras` copies it through a port-forward. |
 | `DeploymentPatch` `tenant-host-rollout` | Switches the tenant host to stop-then-start updates, because the tenant quota has no room for a second host pod, and so two hosts never open the database at once. With a published local image, it also rolls the host whenever that image's digest changes. |
@@ -110,7 +111,8 @@ is a loopback address. Each rebuild rolls the host.
 a Postgres BackingService; updating such a stack deletes that BackingService and starts the guest
 on an empty pglite database. That is the authproto cutover, which needs its own sign-off
 (`docs/guest-http-api.md#authproto-cutover`), so every stack opts in explicitly. Do not set it on
-a stack that still runs the Postgres guest. All other keys are optional.
+a stack that still runs the Postgres guest. `tenant` is required too and has no default
+(authproto's tenant is `identity`). All other keys are optional.
 
 | Key | Default | Purpose |
 | --- | --- | --- |
@@ -196,7 +198,16 @@ pulumi stack output --show-secrets bootstrapOwnerPassword
 
 To rotate a value, replace its resource: `pulumi up --replace <urn>`.
 
-Without Pulumi, `deploy/guest/deploy.sh <instance> <values-file>` does the same steps;
+Before it deletes or writes `identity-control`, the program checks that `di-tenant-<tenant>` has
+no Postgres `directory` BackingService and refuses the tenant otherwise (on an existing cluster
+named by `kubeconfig`, it checks before anything else runs, `kube up` included).
+
+> **Status:** this Pulumi path (`tenant`, the tenant check, `resetControlSecret`, `deployedAt`
+> and the always-rolling `RuntimeSecrets`) has been type-checked only. It has not run against a
+> live cluster yet; the live proof used `deploy/guest/deploy.sh`. Treat the first fresh-stack
+> `pulumi up` as its test.
+
+Without Pulumi, `deploy/guest/deploy.sh <instance> <tenant> <values-file>` does the same steps;
 `bun deploy/guest/runtime-secrets.ts generate` creates a values file. See
 `docs/configuration.md#wasmcloud-guest`.
 

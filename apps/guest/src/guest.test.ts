@@ -3,6 +3,7 @@ import { mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'nod
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { getBindingMetadata } from '@di-framework/bindings';
+import type { WasmPgliteConnection } from '@di-framework/pglite-component';
 import type { SqlDatabase } from '@di-framework/repo';
 import { routeRequest } from '../../server/src/serve.ts';
 import { pgliteFixture } from '../tests/support/pglite.ts';
@@ -272,4 +273,44 @@ test('a failed database or schema surfaces as not ready', async () => {
       'runtime settings missing from the identity-control Secret: ISSUER_URL, AUTH_PUBLIC_ORIGIN, AUTH_ACTIVE_PRIVATE_JWK',
   });
   resetGuest();
+});
+
+test('the test provider refuses what the real provider refuses', async () => {
+  const local = pgliteFixture(undefined, { integers: 'number' });
+  try {
+    // A successful open returns the connection resource itself, as the binding does.
+    const connection = (await local.module.open('/data/strict', undefined)) as WasmPgliteConnection;
+    expect(await local.module.open('/data/strict', undefined)).toMatchObject({
+      tag: 'err',
+      val: { tag: 'open-failed' },
+    });
+    expect(await connection.commit()).toMatchObject({
+      tag: 'err',
+      val: { tag: 'invalid-transaction-state' },
+    });
+    expect(await connection.savepoint('s1')).toMatchObject({
+      tag: 'err',
+      val: { tag: 'invalid-transaction-state' },
+    });
+    expect(await connection.begin()).toEqual({ tag: 'ok', val: undefined });
+    expect(await connection.begin()).toMatchObject({
+      tag: 'err',
+      val: { tag: 'invalid-transaction-state' },
+    });
+    expect(await connection.rollback()).toEqual({ tag: 'ok', val: undefined });
+    expect(
+      await connection.query('SELECT $1::float8 AS f', [{ tag: 'real', val: Number.NaN }]),
+    ).toMatchObject({
+      tag: 'err',
+      val: { tag: 'invalid-params' },
+    });
+    expect(await connection.first('SELECT 7::int8 AS n', [])).toEqual({
+      tag: 'ok',
+      val: [['n', { tag: 'integer', val: 7 }]],
+    });
+    expect(await connection.close()).toEqual({ tag: 'ok', val: undefined });
+    expect(await connection.exec('SELECT 1')).toMatchObject({ tag: 'err', val: { tag: 'closed' } });
+  } finally {
+    await local.shutdown();
+  }
 });

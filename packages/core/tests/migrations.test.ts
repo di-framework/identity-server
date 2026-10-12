@@ -160,7 +160,16 @@ test('V16 removes runtime secrets from identity_runtime_secret and keeps bootstr
   try {
     await withThrowawayDatabase('identity_v16_test', async (db) => {
       await applyMigrations(db, root);
-      for (const name of ['AUTH_ACTIVE_PRIVATE_JWK', 'SMTP_PASSWORD', 'bootstrap_fingerprint']) {
+      const names = [
+        'AUTH_ACTIVE_PRIVATE_JWK',
+        'SMTP_PASSWORD',
+        // Written by hand under a name no writer in this repository ever used.
+        'LEGACY_HAND_SEEDED_KEY',
+        'bootstrap_fingerprint',
+        'bootstrap_client_fingerprints',
+        'bootstrap_lease',
+      ];
+      for (const name of names) {
         await db.run('INSERT INTO identity_runtime_secret (name, value) VALUES (?, ?)', [
           name,
           'stored',
@@ -168,7 +177,9 @@ test('V16 removes runtime secrets from identity_runtime_secret and keeps bootstr
       }
       expect((await applyMigrations(db)).applied.map((record) => record.version)).toEqual(['16']);
       expect(await db.query('SELECT name FROM identity_runtime_secret ORDER BY name')).toEqual([
+        { name: 'bootstrap_client_fingerprints' },
         { name: 'bootstrap_fingerprint' },
+        { name: 'bootstrap_lease' },
       ]);
     });
   } finally {
