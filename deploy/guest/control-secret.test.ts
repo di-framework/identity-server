@@ -4,13 +4,23 @@ import { tmpdir } from 'node:os';
 import {
   applyRuntimeSecrets,
   assertColumnEncryption,
+  assertDeployable,
+  assertPgliteKeys,
   assertPrivateMode,
   COLUMN_KEY_NAMES,
   controlSecretDocument,
+  decodePgliteKey,
   defaultKubeStateDir,
+  ensurePgliteKey,
+  type GuestConfig,
   type Kubectl,
   type KubectlResult,
+  newPgliteKey,
+  PGLITE_KEY_NAMES,
+  parseGuestConfig,
   parseRuntimeValues,
+  pgliteKeyCheckValue,
+  pgliteKeyCheckValues,
   preflightCluster,
   REQUIRED_RUNTIME_SECRETS,
   REVISION_KEY,
@@ -473,5 +483,164 @@ describe('one resolved kube target for the preflight and for kube', () => {
       }),
     ).toThrow('kubeInstance authproto runs the Postgres-era identity guest');
     expect(calls).toEqual([]);
+  });
+});
+
+/** 0x00..0x1f: its KCV below was computed independently (Python hmac, RFC 5869 HKDF). */
+const PGLITE_KEY = Buffer.from(Array.from({ length: 32 }, (_, index) => index)).toString('base64');
+const PGLITE_KCV = 'f9e35e24255015d6477a445dec381e8c';
+const OTHER_PGLITE_KEY = Buffer.alloc(32, 7).toString('base64');
+
+describe('pglite-encfs keys', () => {
+  test('decode as the layer does: 32 bytes, standard or URL-safe, padding optional', () => {
+    const urlSafe = Buffer.alloc(32, 0xfb).toString('base64url');
+    expect(urlSafe).toMatch(/[-_]/);
+    expect(decodePgliteKey(PGLITE_KEY)?.length).toBe(32);
+    expect(decodePgliteKey(` ${PGLITE_KEY.replace(/=$/, '')}\n`)?.length).toBe(32);
+    expect(decodePgliteKey(urlSafe)).toEqual(Buffer.alloc(32, 0xfb));
+    expect(decodePgliteKey(Buffer.alloc(31).toString('base64'))).toBeUndefined();
+    expect(decodePgliteKey(Buffer.alloc(33).toString('base64'))).toBeUndefined();
+    expect(decodePgliteKey(`${'A'.repeat(42)}B=`)).toBeUndefined(); // non-canonical tail bits
+    expect(decodePgliteKey(`${'+'.repeat(21)}${'_'.repeat(22)}`)).toBeUndefined(); // mixed
+    expect(decodePgliteKey('')).toBeUndefined();
+  });
+
+  test('the KCV is HKDF-SHA256(salt di-framework/encfs/v1, info key-check-value), 16 bytes', () => {
+    expect(pgliteKeyCheckValue(PGLITE_KEY)).toBe(PGLITE_KCV);
+    expect(pgliteKeyCheckValue(PGLITE_KEY.replace(/=$/, ''))).toBe(PGLITE_KCV);
+    expect(pgliteKeyCheckValue(OTHER_PGLITE_KEY)).not.toBe(PGLITE_KCV);
+    expect(() => pgliteKeyCheckValue('not-a-key')).toThrow('DI_PGLITE_KEY must be 32 random');
+    expect(
+      pgliteKeyCheckValues({
+        ...VALUES,
+        DI_PGLITE_KEY: OTHER_PGLITE_KEY,
+        DI_PGLITE_KEY_PREVIOUS: PGLITE_KEY,
+      }),
+    ).toEqual({
+      DI_PGLITE_KEY: pgliteKeyCheckValue(OTHER_PGLITE_KEY),
+      DI_PGLITE_KEY_PREVIOUS: PGLITE_KCV,
+    });
+    expect(pgliteKeyCheckValues(VALUES)).toEqual({});
+  });
+
+  test('a new key is 32 random bytes, base64, and an existing key is never replaced', () => {
+    const fixed = (size: number) => Buffer.alloc(size, 9);
+    expect(newPgliteKey(fixed)).toBe(Buffer.alloc(32, 9).toString('base64'));
+    const values: Record<string, string> = { ...VALUES };
+    expect(ensurePgliteKey(values, () => PGLITE_KEY)).toBe(true);
+    expect(values.DI_PGLITE_KEY).toBe(PGLITE_KEY);
+    // A later deploy, or a second run, keeps the key the data directory was encrypted with.
+    expect(ensurePgliteKey(values, () => OTHER_PGLITE_KEY)).toBe(false);
+    expect(values.DI_PGLITE_KEY).toBe(PGLITE_KEY);
+  });
+
+  test('values files accept the keys, validate them and never echo them', () => {
+    expect(PGLITE_KEY_NAMES).toEqual(['DI_PGLITE_KEY', 'DI_PGLITE_KEY_PREVIOUS']);
+    const keyed = { ...VALUES, DI_PGLITE_KEY: PGLITE_KEY };
+    expect(parseRuntimeValues(JSON.stringify(keyed), 'v')).toEqual(keyed);
+    const rotating = {
+      ...keyed,
+      DI_PGLITE_KEY: OTHER_PGLITE_KEY,
+      DI_PGLITE_KEY_PREVIOUS: PGLITE_KEY,
+    };
+    expect(parseRuntimeValues(JSON.stringify(rotating), 'v')).toEqual(rotating);
+    const refused = (values: Record<string, string>) => {
+      try {
+        assertPgliteKeys(values, 'v');
+      } catch (error) {
+        return String(error);
+      }
+      throw new Error('accepted');
+    };
+    const short = Buffer.alloc(16, 3).toString('base64');
+    expect(refused({ DI_PGLITE_KEY: short })).toContain(
+      'DI_PGLITE_KEY in v must be 32 random bytes, base64 encoded',
+    );
+    expect(refused({ DI_PGLITE_KEY: PGLITE_KEY, DI_PGLITE_KEY_PREVIOUS: short })).toContain(
+      'DI_PGLITE_KEY_PREVIOUS in v must be 32 random bytes',
+    );
+    expect(refused({ DI_PGLITE_KEY_PREVIOUS: PGLITE_KEY })).toContain(
+      'DI_PGLITE_KEY_PREVIOUS in v needs DI_PGLITE_KEY',
+    );
+    const same = refused({
+      DI_PGLITE_KEY: PGLITE_KEY,
+      DI_PGLITE_KEY_PREVIOUS: PGLITE_KEY.replace(/=$/, ''),
+    });
+    expect(same).toContain('must differ');
+    for (const message of [same, refused({ DI_PGLITE_KEY: short })]) {
+      expect(message).not.toContain(PGLITE_KEY.slice(0, 20));
+      expect(message).not.toContain(short.slice(0, 20));
+    }
+  });
+});
+
+describe('guest config and deploy preflight', () => {
+  const ENCFS = `ghcr.io/di-framework/pglite-encfs@sha256:${'a'.repeat(64)}`;
+  const config = (extra: Record<string, unknown> = {}) =>
+    JSON.stringify({ name: 'identity', pglite: { image: 'x' }, ...extra });
+
+  test('parses the name, the pinned layer and controlSecretKeys', () => {
+    expect(
+      parseGuestConfig(
+        config({ controlSecretKeys: ['ISSUER_URL'], pglite: { encryption: { image: ENCFS } } }),
+        'c',
+      ),
+    ).toEqual({ name: 'identity', encryption: ENCFS, controlSecretKeys: ['ISSUER_URL'] });
+    expect(parseGuestConfig(config(), 'c')).toEqual({ name: 'identity', controlSecretKeys: [] });
+    expect(() => parseGuestConfig(config({ name: 'Identity' }), 'c')).toThrow('c needs a "name"');
+    expect(() => parseGuestConfig(config({ controlSecretKeys: 'ISSUER_URL' }), 'c')).toThrow(
+      '"controlSecretKeys" must be an array of names',
+    );
+    expect(() => parseGuestConfig(config({ controlSecretKeys: [1] }), 'c')).toThrow(
+      'must be an array of names',
+    );
+    expect(() =>
+      parseGuestConfig(config({ pglite: { encryption: { wasm: 'encfs.wasm' } } }), 'c'),
+    ).toThrow('pglite.encryption.wasm is a local build');
+    expect(() =>
+      parseGuestConfig(
+        config({ pglite: { encryption: { image: 'ghcr.io/di-framework/pglite-encfs:0.1.0' } } }),
+        'c',
+      ),
+    ).toThrow('must pin ghcr.io/di-framework/pglite-encfs by digest');
+  });
+
+  const encrypted: GuestConfig = {
+    name: 'identity',
+    encryption: ENCFS,
+    controlSecretKeys: [...Object.keys(VALUES), ...PGLITE_KEY_NAMES],
+  };
+  const plaintext: GuestConfig = { ...encrypted, encryption: undefined };
+
+  test('an encrypted guest needs its key, and every value name declared', () => {
+    const keyed = { ...VALUES, DI_PGLITE_KEY: PGLITE_KEY };
+    expect(assertDeployable(encrypted, keyed, { allowPlaintext: false, source: 'v' })).toEqual({
+      DI_PGLITE_KEY: PGLITE_KCV,
+    });
+    expect(() =>
+      assertDeployable(encrypted, VALUES, { allowPlaintext: true, source: 'v' }),
+    ).toThrow('v has no DI_PGLITE_KEY, which the encrypted data directory needs');
+    expect(() =>
+      assertDeployable({ ...encrypted, controlSecretKeys: ['ISSUER_URL'] }, keyed, {
+        allowPlaintext: false,
+        source: 'v',
+      }),
+    ).toThrow(
+      'controlSecretKeys in di-framework.config.json does not declare AUTH_PUBLIC_ORIGIN, AUTH_ACTIVE_PRIVATE_JWK, AUTH_ACCESS_CLIENT_SECRET, DI_PGLITE_KEY from v',
+    );
+  });
+
+  test('a plaintext guest needs the explicit opt-out and a values file without a key', () => {
+    expect(() =>
+      assertDeployable(plaintext, VALUES, { allowPlaintext: false, source: 'v' }),
+    ).toThrow('has no pglite.encryption, so the data directory would be plaintext');
+    expect(assertDeployable(plaintext, VALUES, { allowPlaintext: true, source: 'v' })).toEqual({});
+    expect(() =>
+      assertDeployable(
+        plaintext,
+        { ...VALUES, DI_PGLITE_KEY: PGLITE_KEY },
+        { allowPlaintext: true, source: 'v' },
+      ),
+    ).toThrow('v holds DI_PGLITE_KEY, so its data directory is encrypted');
   });
 });

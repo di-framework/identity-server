@@ -12,19 +12,28 @@
 # The variables di-framework.deploy.toml interpolates for target `identity` default to the
 # instance's admin kubeconfig and the in-cluster `examples-registry` behind a port-forward on
 # REGISTRY_FORWARD_PORT; override any of them through the environment. A tenant developer
-# kubeconfig works too: the Secret steps only create, replace and delete.
+# kubeconfig works too: the Secret steps only create and replace.
 #
 # The script refuses a tenant whose di-tenant-<tenant> namespace still has the Postgres
 # `directory` BackingService, i.e. the Postgres-era guest on authproto, however the kubeconfig and
 # tenant were chosen. Replacing that guest is the signed-off cutover in
 # docs/guest-http-api.md#authproto-cutover.
 #
-# Order: build, then delete `identity-control`, deploy, and write the values. The CLI rewrites
-# that Secret with only its control token and, as a tenant developer, cannot replace a copy that
-# holds more keys. Between the delete and the last step the guest answers 503 naming the missing
-# settings. If a step after the delete fails, fix the cause and run
+# The workload, and its `<workload>-control` Secret, are named by `name` in
+# apps/guest/di-framework.config.json. That config encrypts the data directory at rest
+# (pglite.encryption) and declares every runtime value, DI_PGLITE_KEY included, in
+# controlSecretKeys, so `di-framework platform deploy` keeps the Secret instead of rewriting it.
+# This needs cli-plugin-platform with cli-extensions#70 and #72 (the release after 6.1.2).
+#
+# Order: check the values against the config (every name declared, DI_PGLITE_KEY present; a
+# plaintext guest only with IDENTITY_PGLITE_PLAINTEXT=1), build, deploy, then write the values and
+# roll the workload onto them. The values file is only read: the data directory key it holds is
+# never regenerated, so every deploy reuses it. On a first deploy the Secret does not exist yet;
+# the CLI creates it with only its control keys, and until the last step the guest answers 503
+# (the encryption layer refuses to start without its key, and changes nothing). If a step after
+# the build fails, fix the cause and run
 #   bun deploy/guest/runtime-secrets.ts apply --values <file> --kubeconfig <kc> --tenant <tenant>
-# on its own: it recreates the Secret and rolls the workload.
+# on its own: it rewrites the Secret and rolls the workload.
 set -eu
 
 instance="${1:-}"
@@ -49,19 +58,16 @@ export IDENTITY_KUBE_CONTEXT="${IDENTITY_KUBE_CONTEXT:-$(kubectl --kubeconfig "$
 export IDENTITY_REGISTRY_PUSH="${IDENTITY_REGISTRY_PUSH:-http://127.0.0.1:${REGISTRY_FORWARD_PORT:-25001}}"
 export IDENTITY_REGISTRY_PULL="${IDENTITY_REGISTRY_PULL:-examples-registry.wasmcloud.svc.cluster.local:5000}"
 
-# Values file: mode 0600, known and required names.
-bun "$secrets" names --values "$values" >/dev/null
+# Values file (mode 0600, known names) against the guest config; prints the workload name.
+workload="$(bun "$secrets" preflight --values "$values")"
 # The target tenant must not run the Postgres-era guest.
 bun "$secrets" guard --kubeconfig "$IDENTITY_KUBECONFIG" --context "$IDENTITY_KUBE_CONTEXT" --tenant "$tenant"
 
 # Build before touching the cluster, so a build failure leaves the running guest and its Secret.
 (cd "$root/apps/guest" && di-framework platform build)
 
-kubectl --kubeconfig "$IDENTITY_KUBECONFIG" --context "$IDENTITY_KUBE_CONTEXT" \
-  --namespace "di-tenant-$tenant" delete secret identity-control --ignore-not-found --wait=false
-
-(cd "$root/apps/guest" && di-framework platform deploy identity --target identity --yes) || {
-  echo "deploy failed after identity-control was deleted; once fixed, run: bun $secrets apply --values $values --kubeconfig <kubeconfig> --tenant $tenant" >&2
+(cd "$root/apps/guest" && di-framework platform deploy "$workload" --target identity --yes) || {
+  echo "deploy of $workload failed; once fixed, run: bun $secrets apply --values $values --kubeconfig <kubeconfig> --tenant $tenant" >&2
   exit 3
 }
 

@@ -67,9 +67,15 @@ the `di-framework.dev/exclusive-instance` component config, so the host serves e
 one component instance that holds the database's single connection.
 
 The data directory is a host path the platform manages for the workload, not a PVC. Back it up
-at the file level; the backup agent's `pg_dump` over the network does not apply. Encryption at
-rest is planned as a separately composed `wasi:filesystem` layer between the guest and the
-provider, which is why the provider stays a separate component.
+at the file level; the backup agent's `pg_dump` over the network does not apply. It is encrypted
+at rest: the build composes the platform's `pglite-encfs` `wasi:filesystem` layer between the
+provider and the host (`pglite.encryption` in the same config), so the directory holds only
+ciphertext under the key `DI_PGLITE_KEY`. The program generates that key once
+(`random.RandomBytes`, 32 bytes), keeps it in stack state and writes it to `identity-control`
+with the other runtime values. **Losing the stack state loses the key, and with it the
+database**: back the key up separately from the volume, and record its KCV (the
+`pgliteKeyCheckValue` output) with each backup. See
+`docs/configuration.md#data-directory-encryption`.
 
 ## Tenant host image
 
@@ -168,6 +174,7 @@ pulumi up
 | `tenantHostImage` | Image reference the tenant host runs |
 | `url` | Tenant route through the gateway, such as `http://identity.<tenant>.localhost:28180` |
 | `signingKeyId` | `kid` of the active signing key |
+| `pgliteKeyCheckValue` | KCV of the data directory key `DI_PGLITE_KEY` (one-way, safe to record; matches bytes 8..24 of the volume's `.di-encfs` marker) |
 | `bootstrapOwnerPassword`, `bootstrapViewerPassword` | Secret. Passwords of the bootstrap `owner` and `viewer` |
 | `accessClientSecret`, `directoryClientSecret`, `provisionerClientSecret` | Secret. Bootstrap client secrets |
 

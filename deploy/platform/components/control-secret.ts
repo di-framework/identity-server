@@ -10,10 +10,14 @@
  * secrets and URLs in wasi:config. A workload labelled with an environment may instead reference
  * `<name>.<env>` Secrets, which the CLI never rewrites; moving the values there would remove the
  * delete, deploy, rewrite and roll sequence below, and so would the CLI carrying extra keys in
- * the control Secret (di-framework/cli-extensions#69). Until one of those lands,
- * `di-framework platform deploy` (cli-plugin-platform 6.1.2) rewrites the control Secret with
- * only its control token on every deploy, so these values are written again after each deploy.
+ * the control Secret (di-framework/cli-extensions#69). cli-plugin-platform with #70 and #72 (after
+ * 6.1.2) does the latter: every name here is declared in `controlSecretKeys` of
+ * apps/guest/di-framework.config.json, and deploy keeps the Secret instead of rewriting it with
+ * only its control token. The values are still written again after each deploy, which also rolls
+ * the workload onto them.
  */
+
+import { hkdfSync } from 'node:crypto';
 
 export interface KubectlResult {
   code: number | null;
@@ -45,6 +49,16 @@ export const RUNTIME_SECRET_NAMES: readonly string[] = [
   'IDENTITY_COLUMN_KEY',
   'IDENTITY_BIDX_KEY',
 ];
+/**
+ * The pglite-encfs master key and, during a rotation, the key it replaces (di-framework/platform
+ * `platform/pglite-encfs`). The layer reads them from the guest's environment, which the platform
+ * fills from the same control Secret; the guest itself never reads them.
+ */
+export const PGLITE_KEY = 'DI_PGLITE_KEY';
+export const PGLITE_PREVIOUS_KEY = 'DI_PGLITE_KEY_PREVIOUS';
+export const PGLITE_KEY_NAMES: readonly string[] = [PGLITE_KEY, PGLITE_PREVIOUS_KEY];
+/** Every name a values file and the control Secret may hold besides the CLI's `DI_CONTROL_*`. */
+export const VALUE_NAMES: readonly string[] = [...RUNTIME_SECRET_NAMES, ...PGLITE_KEY_NAMES];
 /** Column encryption keys: 32 random bytes each, base64; separate from each other. */
 export const COLUMN_KEY_NAMES: readonly string[] = ['IDENTITY_COLUMN_KEY', 'IDENTITY_BIDX_KEY'];
 export const REQUIRED_RUNTIME_SECRETS: readonly string[] = [
@@ -69,7 +83,7 @@ export function parseRuntimeValues(text: string, source: string): Record<string,
     throw new Error(`${source} must hold a JSON object of names to strings`);
   }
   const entries = Object.entries(parsed as Record<string, unknown>);
-  const unknown = entries.filter(([name]) => !RUNTIME_SECRET_NAMES.includes(name));
+  const unknown = entries.filter(([name]) => !VALUE_NAMES.includes(name));
   if (unknown.length > 0) {
     throw new Error(`unknown names in ${source}: ${unknown.map(([name]) => name).join(', ')}`);
   }
@@ -81,6 +95,7 @@ export function parseRuntimeValues(text: string, source: string): Record<string,
   const missing = REQUIRED_RUNTIME_SECRETS.filter((name) => !values[name]?.trim());
   if (missing.length > 0) throw new Error(`missing required names: ${missing.join(', ')}`);
   assertColumnEncryption(values, source);
+  assertPgliteKeys(values, source);
   return values;
 }
 
@@ -109,6 +124,167 @@ export function assertColumnEncryption(values: Record<string, string>, source: s
       `IDENTITY_COLUMN_ENCRYPTION=enabled in ${source} needs IDENTITY_COLUMN_KEY and IDENTITY_BIDX_KEY`,
     );
   }
+}
+
+/**
+ * Decodes a pglite-encfs master key as the layer does: exactly 32 bytes, standard or URL-safe
+ * base64 (not mixed), padding optional, surrounding whitespace ignored. Undefined when invalid.
+ */
+export function decodePgliteKey(text: string): Buffer | undefined {
+  const trimmed = text.trim();
+  if (!/^(?:[A-Za-z0-9+/]{43}|[A-Za-z0-9_-]{43})=?$/.test(trimmed)) return undefined;
+  const bare = trimmed.replace(/=$/, '');
+  const bytes = Buffer.from(bare.replaceAll('-', '+').replaceAll('_', '/'), 'base64');
+  // Non-canonical trailing bits decode to the same bytes; the layer refuses them, so do we.
+  const canonical = bytes.toString('base64').replace(/=$/, '');
+  return canonical === bare.replaceAll('-', '+').replaceAll('_', '/') ? bytes : undefined;
+}
+
+/** A new pglite-encfs master key: 32 random bytes, base64. */
+export function newPgliteKey(random: (size: number) => Buffer): string {
+  return random(32).toString('base64');
+}
+
+/**
+ * The key-check value (KCV) of a pglite-encfs master key, hex: HKDF-SHA256 with salt
+ * `di-framework/encfs/v1` and info `key-check-value`, 16 bytes. It is what the layer writes to
+ * bytes 8..24 of the data directory's `.di-encfs` marker and to bytes 32..48 of every file header,
+ * so it says which key opens which volume or backup. It is one-way and safe to record.
+ */
+export function pgliteKeyCheckValue(key: string): string {
+  const master = decodePgliteKey(key);
+  if (master === undefined) throw new Error(`${PGLITE_KEY} must be 32 random bytes, base64`);
+  const kcv = Buffer.from(
+    hkdfSync('sha256', master, 'di-framework/encfs/v1', 'key-check-value', 16),
+  ).toString('hex');
+  master.fill(0);
+  return kcv;
+}
+
+/**
+ * pglite-encfs keys in a values file: each set key is 32 bytes of base64, the previous key comes
+ * only with a current key and differs from it. Errors name the setting, never its value.
+ */
+export function assertPgliteKeys(values: Record<string, string>, source: string): void {
+  for (const name of PGLITE_KEY_NAMES) {
+    const key = values[name];
+    if (key !== undefined && decodePgliteKey(key) === undefined) {
+      throw new Error(`${name} in ${source} must be 32 random bytes, base64 encoded`);
+    }
+  }
+  const previous = values[PGLITE_PREVIOUS_KEY];
+  if (previous === undefined) return;
+  const current = values[PGLITE_KEY];
+  if (current === undefined) {
+    throw new Error(`${PGLITE_PREVIOUS_KEY} in ${source} needs ${PGLITE_KEY} (the new key)`);
+  }
+  if (pgliteKeyCheckValue(current) === pgliteKeyCheckValue(previous)) {
+    throw new Error(`${PGLITE_KEY} and ${PGLITE_PREVIOUS_KEY} in ${source} must differ`);
+  }
+}
+
+/**
+ * Adds a pglite-encfs key to `values` when it has none and returns whether it did. An existing key
+ * is never replaced: a new key cannot read a data directory written under the old one.
+ */
+export function ensurePgliteKey(values: Record<string, string>, newKey: () => string): boolean {
+  if (values[PGLITE_KEY] !== undefined) return false;
+  values[PGLITE_KEY] = newKey();
+  return true;
+}
+
+/** The KCVs of the keys a values file holds, by name, for custody records. */
+export function pgliteKeyCheckValues(values: Record<string, string>): Record<string, string> {
+  return Object.fromEntries(
+    PGLITE_KEY_NAMES.filter((name) => values[name] !== undefined).map((name) => [
+      name,
+      pgliteKeyCheckValue(values[name] as string),
+    ]),
+  );
+}
+
+/** The guest's `di-framework.config.json` as far as a deploy depends on it. */
+export interface GuestConfig {
+  /** Project name: the WorkloadDeployment and the `<name>-control` Secret. */
+  name: string;
+  /** The pinned pglite-encfs layer, or undefined when the data directory is plaintext. */
+  encryption?: string;
+  controlSecretKeys: string[];
+}
+
+/** Environment switch for a plaintext (development) guest; see docs/configuration.md. */
+export const PLAINTEXT_OPT_OUT = 'IDENTITY_PGLITE_PLAINTEXT';
+const ENCFS_IMAGE = /^ghcr\.io\/di-framework\/pglite-encfs@sha256:[0-9a-f]{64}$/;
+
+export function parseGuestConfig(text: string, source: string): GuestConfig {
+  const config = JSON.parse(text) as {
+    name?: unknown;
+    controlSecretKeys?: unknown;
+    pglite?: { encryption?: { image?: unknown; wasm?: unknown } };
+  };
+  if (typeof config.name !== 'string' || !/^[a-z][a-z0-9-]*$/.test(config.name)) {
+    throw new Error(`${source} needs a "name" (lower-case letters, digits and dashes)`);
+  }
+  const keys = config.controlSecretKeys ?? [];
+  if (!Array.isArray(keys) || keys.some((key) => typeof key !== 'string')) {
+    throw new Error(`${source} "controlSecretKeys" must be an array of names`);
+  }
+  const encryption = config.pglite?.encryption;
+  if (encryption !== undefined && encryption.wasm !== undefined) {
+    throw new Error(`${source} pglite.encryption.wasm is a local build; deploy a pinned image`);
+  }
+  if (encryption !== undefined && !ENCFS_IMAGE.test(String(encryption.image))) {
+    throw new Error(
+      `${source} pglite.encryption.image must pin ghcr.io/di-framework/pglite-encfs by digest`,
+    );
+  }
+  return {
+    name: config.name,
+    ...(encryption === undefined ? {} : { encryption: String(encryption.image) }),
+    controlSecretKeys: keys as string[],
+  };
+}
+
+/**
+ * Whether `values` can be deployed with `config`, before anything on the cluster changes:
+ * - every value name is declared in `controlSecretKeys`, so `di-framework platform deploy` keeps
+ *   the control Secret instead of refusing it for holding keys it did not write;
+ * - an encrypted guest has its `DI_PGLITE_KEY` (without it the layer refuses to start);
+ * - a plaintext guest is deployed only with the explicit development opt-out, and never with a
+ *   values file that holds a pglite key, since its data directory would be encrypted.
+ * Returns the KCVs of the keys, for the log.
+ */
+export function assertDeployable(
+  config: GuestConfig,
+  values: Record<string, string>,
+  options: { allowPlaintext: boolean; source: string },
+): Record<string, string> {
+  const undeclared = Object.keys(values).filter((name) => !config.controlSecretKeys.includes(name));
+  if (undeclared.length > 0) {
+    throw new Error(
+      `controlSecretKeys in di-framework.config.json does not declare ${undeclared.join(', ')} from ${options.source}`,
+    );
+  }
+  if (config.encryption !== undefined) {
+    if (values[PGLITE_KEY] === undefined) {
+      throw new Error(
+        `${options.source} has no ${PGLITE_KEY}, which the encrypted data directory needs; add one with \`runtime-secrets.ts pglite-key\` (a new volume only)`,
+      );
+    }
+    return pgliteKeyCheckValues(values);
+  }
+  if (!options.allowPlaintext) {
+    throw new Error(
+      `di-framework.config.json has no pglite.encryption, so the data directory would be plaintext. That is for development only: set ${PLAINTEXT_OPT_OUT}=1 to deploy it anyway`,
+    );
+  }
+  const keys = PGLITE_KEY_NAMES.filter((name) => values[name] !== undefined);
+  if (keys.length > 0) {
+    throw new Error(
+      `${options.source} holds ${keys.join(', ')}, so its data directory is encrypted; a plaintext build cannot read it`,
+    );
+  }
+  return {};
 }
 
 /** A values file must be readable by its owner only (mode 0600 or stricter). */

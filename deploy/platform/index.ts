@@ -19,7 +19,9 @@
  *                     grant that lets the guest dial it; skipped when `smtpHost` is set.
  *   RuntimeSecrets    the guest's runtime secrets in its `identity-control` Secret: issuer,
  *                     origin, RS256 signing key (@pulumi/tls), passwords and client secrets
- *                     (@pulumi/random), SMTP. Rewritten after every deploy (the CLI resets that
+ *                     (@pulumi/random), SMTP, and the data directory key DI_PGLITE_KEY
+ *                     (@pulumi/random; its KCV is the `pgliteKeyCheckValue` output). Rewritten
+ *                     after every deploy (`CliWorkload` resets that
  *                     Secret), then the workload rolls onto them.
  *
  * `pulumi up` builds the environment; `pulumi destroy` removes it in reverse order.
@@ -65,7 +67,12 @@ import * as pulumi from '@pulumi/pulumi';
 import * as random from '@pulumi/random';
 import * as tls from '@pulumi/tls';
 import { parse } from 'yaml';
-import { preflightCluster, resolveKubeTarget } from './components/control-secret';
+import {
+  PGLITE_KEY,
+  pgliteKeyCheckValues,
+  preflightCluster,
+  resolveKubeTarget,
+} from './components/control-secret';
 import { containerEngine, localImageId, PublishedImage } from './components/image';
 import { KubeInstance, latestKubeRelease } from './components/kube';
 import { Mailpit, mailpitDestination } from './components/mailpit';
@@ -426,6 +433,15 @@ const smtpHost: pulumi.Output<string> = mailpit
 const columnKey = new random.RandomBytes('identity-column-key', { length: 32 }).base64;
 const bidxKey = new random.RandomBytes('identity-bidx-key', { length: 32 }).base64;
 const columnEncryption = config.getBoolean('columnEncryption') ?? false;
+/**
+ * The pglite-encfs data directory key (docs/configuration.md#data-directory-encryption): generated
+ * once and kept in the stack state. Losing it loses the database; replacing it locks the guest
+ * out of its volume. `pgliteKeyCheckValue` identifies it without revealing it.
+ */
+const pgliteKey = new random.RandomBytes('identity-pglite-key', { length: 32 }).base64;
+export const pgliteKeyCheckValue = pulumi.unsecret(
+  pgliteKey.apply((key) => pgliteKeyCheckValues({ [PGLITE_KEY]: key })[PGLITE_KEY] as string),
+);
 
 const runtimeValues = pulumi
   .all([
@@ -440,6 +456,7 @@ const runtimeValues = pulumi
     smtpHost,
     columnKey,
     bidxKey,
+    pgliteKey,
   ])
   .apply(
     ([
@@ -454,6 +471,7 @@ const runtimeValues = pulumi
       smtp,
       column,
       bidx,
+      pglite,
     ]) => ({
       ISSUER_URL: config.get('issuerUrl') ?? origin,
       AUTH_PUBLIC_ORIGIN: origin,
@@ -470,6 +488,7 @@ const runtimeValues = pulumi
       IDENTITY_COLUMN_KEY: column,
       IDENTITY_BIDX_KEY: bidx,
       ...(columnEncryption ? { IDENTITY_COLUMN_ENCRYPTION: 'enabled' } : {}),
+      [PGLITE_KEY]: pglite,
     }),
   );
 
