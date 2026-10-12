@@ -1,30 +1,11 @@
-import { Config, OutgoingHttp, Postgres, WasmCloudBinding } from '@di-framework/bindings';
+import { Config, OutgoingHttp, WasmCloudBinding } from '@di-framework/bindings';
 import { Container } from '@di-framework/core/decorators';
-import { assertBatch, type PgText, postgresError, readRows } from '@di-framework/repo/postgres';
 
-@WasmCloudBinding('identity-database', {
-  serviceName: 'directory',
-})
-@Container()
-export class IdentityDatabase extends Postgres {
-  async batch(sql: string): Promise<void> {
-    try {
-      assertBatch(await this.queryBatch(sql));
-    } catch (error) {
-      throw postgresError(error);
-    }
-  }
-
-  async rows(sql: string, params: readonly PgText[] = []): Promise<Record<string, unknown>[]> {
-    try {
-      return await readRows(await this.query(sql, params));
-    } catch (error) {
-      throw postgresError(error);
-    }
-  }
-}
-
-/** Non-secret settings. URLs and passwords stay in `identity_runtime_secret`. */
+/**
+ * Non-secret settings. URLs, keys and passwords come from the `identity-control` Secret through
+ * the WASI environment (see `settings.ts`). The database is the composed pglite provider
+ * (`database.ts`), not a binding.
+ */
 @WasmCloudBinding('identity-config', {
   config: {
     AUTH_SIGNING_ALGORITHM: 'RS256',

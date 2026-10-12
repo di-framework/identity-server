@@ -1,0 +1,12 @@
+# `bun --config=bunfig.pglite.toml test <files>` with IDENTITY_TEST_DATABASE=pglite: runs suites on
+# the in-process PGlite behind the guest's adapter. Same preloads as bunfig.toml; no coverage gate,
+# because only a subset of the suite runs (the full run under bunfig.toml enforces coverage).
+[test]
+preload = [
+  "./apps/guest/scripts/embed-migrations.ts",
+  "./packages/core/tests/support/preload.ts",
+  "./apps/api/scripts/generate-openapi.ts",
+  "./apps/client/src/ui/dom.ts",
+  "./apps/guest/tests/support/pglite-preload.ts",
+]
+coverage = false

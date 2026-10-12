@@ -14,6 +14,9 @@ beforeAll(async () => {
   );
 });
 
+// Bun server only: it needs two pooled connections. The wasmCloud guest runs on pglite, which has
+// one connection per instance, so this test would hang there; its single-connection counterpart
+// is 'transactions serialize on the single pglite connection…' in apps/guest/src/boot.test.ts.
 test('row locks serialize concurrent transactions on separate pooled connections', async () => {
   const order: string[] = [];
   let releaseFirst!: () => void;

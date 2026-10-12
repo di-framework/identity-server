@@ -1,5 +1,6 @@
 import * as pulumi from '@pulumi/pulumi';
-import { portForward, runProcess } from './process';
+import { resetControlSecret } from './control-secret';
+import { kubectlRunner, portForward, runProcess } from './process';
 
 /**
  * A di-framework application deployed with the di-framework CLI, as a Pulumi resource.
@@ -31,11 +32,20 @@ export interface CliWorkloadInputs {
     remotePort: number;
   };
   sourceDigest: string;
+  /**
+   * A control Secret to delete before each deploy. The CLI rewrites `<workload>-control` with only
+   * its control token, and a tenant developer's replace is refused while the Secret holds more
+   * keys (the runtime secrets written after the previous deploy). The tenant is checked for the
+   * Postgres `directory` BackingService first, and a tenant that has it is refused.
+   */
+  resetControlSecret?: { kubeconfig: string; context?: string; namespace: string; name: string };
 }
 
 interface CliWorkloadState extends CliWorkloadInputs {
   image: string;
   namespace: string;
+  /** When this resource last ran the deploy; consumers that the deploy resets key on it. */
+  deployedAt: string;
 }
 
 /** Pulumi resolves outputs nested in resource inputs, so each field may be one. */
@@ -45,16 +55,23 @@ type DeepInput<T> = pulumi.Input<
 type CliWorkloadArgs = { [K in keyof CliWorkloadInputs]: DeepInput<CliWorkloadInputs[K]> };
 
 /** Paths and tools can differ between machines without changing what is deployed. */
-const LOCAL_ONLY = ['workspaceRoot', 'cli', 'registryForward'];
+const LOCAL_ONLY = ['workspaceRoot', 'cli', 'registryForward', 'resetControlSecret'];
 const REPLACE_ON_CHANGE = ['application', 'target'];
 
 export class CliWorkload extends pulumi.dynamic.Resource {
   /** Pull reference of the deployed component. */
   declare readonly image: pulumi.Output<string>;
   declare readonly namespace: pulumi.Output<string>;
+  /** Changes with every deploy, which also rewrites the workload's control Secret. */
+  declare readonly deployedAt: pulumi.Output<string>;
 
   constructor(name: string, args: CliWorkloadArgs, opts?: pulumi.CustomResourceOptions) {
-    super(workloadProvider, name, { ...args, image: undefined, namespace: undefined }, opts);
+    super(
+      workloadProvider,
+      name,
+      { ...args, image: undefined, namespace: undefined, deployedAt: undefined },
+      opts,
+    );
   }
 }
 
@@ -66,7 +83,8 @@ const workloadProvider: pulumi.dynamic.ResourceProvider = {
         !key.startsWith('__') &&
         !LOCAL_ONLY.includes(key) &&
         key !== 'image' &&
-        key !== 'namespace',
+        key !== 'namespace' &&
+        key !== 'deployedAt',
     );
     const differs = (key: string) =>
       JSON.stringify((olds as unknown as Record<string, unknown>)[key]) !==
@@ -89,6 +107,16 @@ const workloadProvider: pulumi.dynamic.ResourceProvider = {
 };
 
 async function deploy(inputs: CliWorkloadInputs): Promise<CliWorkloadState> {
+  const reset = inputs.resetControlSecret;
+  if (reset) {
+    const kubectl = kubectlRunner(
+      reset.kubeconfig,
+      reset.context,
+      `di-framework-reset-${reset.name}.log`,
+    );
+    // Refuses a tenant that still has `directory` (the Postgres-era guest) before deleting.
+    await resetControlSecret(kubectl, { namespace: reset.namespace, name: reset.name });
+  }
   const forward = inputs.registryForward ? await portForward(inputs.registryForward) : undefined;
   try {
     const data = await runCli(inputs, [
@@ -103,6 +131,7 @@ async function deploy(inputs: CliWorkloadInputs): Promise<CliWorkloadState> {
       ...inputs,
       image: String(data.image ?? ''),
       namespace: String(data.namespace ?? ''),
+      deployedAt: new Date().toISOString(),
     };
   } finally {
     await forward?.stop();

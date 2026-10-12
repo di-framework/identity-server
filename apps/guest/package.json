@@ -7,7 +7,11 @@
     "@di-framework/bindings": "6.0.11",
     "@di-framework/core": "6.1.0",
     "@di-framework/http": "6.1.0",
+    "@di-framework/pglite-component": "6.0.11",
     "@di-framework/repo": "6.1.0",
     "@di-framework/wasm-pqc-subtle": "0.2.10"
+  },
+  "devDependencies": {
+    "@electric-sql/pglite": "0.4.6"
   }
 }

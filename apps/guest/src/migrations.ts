@@ -1,4 +1,4 @@
-import type { IdentityDatabase } from './bindings.ts';
+import type { SqlDatabase } from '@di-framework/repo';
 import type { EmbeddedMigration } from './flyway.ts';
 import embeddedMigrations from './migrations.json';
 
@@ -10,8 +10,11 @@ const HISTORY = `CREATE TABLE IF NOT EXISTS identity_schema_migrations (
 
 let schema: Promise<string[]> | undefined;
 
-/** Apply each shipped Flyway file once, as one batch, recording the version in the same batch. */
-export function ensureSchema(database: IdentityDatabase): Promise<string[]> {
+/**
+ * Apply each shipped Flyway file once, in its own transaction together with the row that records
+ * its version, so a failed migration leaves neither behind.
+ */
+export function ensureSchema(database: SqlDatabase): Promise<string[]> {
   schema ??= applySchema(database).catch((error: unknown) => {
     schema = undefined;
     throw error;
@@ -25,14 +28,16 @@ export function resetSchema(): void {
   schema = undefined;
 }
 
-export async function applySchema(database: IdentityDatabase): Promise<string[]> {
-  await database.batch(HISTORY);
-  const existing = await database.rows('SELECT version FROM identity_schema_migrations');
+export async function applySchema(database: SqlDatabase): Promise<string[]> {
+  await database.exec(HISTORY);
+  const existing = await database.query<{ version: unknown }>(
+    'SELECT version FROM identity_schema_migrations',
+  );
   const applied = new Set(existing.map((row) => String(row.version)));
   const ran: string[] = [];
   for (const migration of embeddedMigrations) {
     if (applied.has(migration.version)) continue;
-    await database.batch(migrationStatement(migration));
+    await database.transaction((tx) => tx.exec(migrationStatement(migration)));
     ran.push(migration.version);
   }
   return ran;

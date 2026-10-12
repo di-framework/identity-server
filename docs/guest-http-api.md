@@ -2,6 +2,14 @@
 
 This is the record of moving the Bun identity HTTP surface onto the existing `identity` wasmCloud workload, and of the fixes required before that workload could serve tokens, sessions, mail, and organization writes.
 
+> **Status (identity-server#50).** The guest in this repository now runs on the pglite provider
+> component and reads its runtime secrets from the `identity-control` Secret; see
+> [11. pglite](#11-pglite-identity-server50). Sections 1 to 10 record the Postgres-era guest that
+> still serves the `authproto` instance (tenant `identity`, `directory` BackingService) until the
+> [authproto cutover](#authproto-cutover), which has not happened. Its database adapter, the
+> `identity_runtime_secret` rows and the `psql` seeding described there no longer apply to new
+> deploys.
+
 The cluster was not reinstalled. The workload stayed on tenant `identity` (`di-tenant-identity` / `di-runtime-identity`) and kept the existing `directory` Postgres `BackingService`. `bun start` is still the local server. The guest is the cluster process.
 
 ## Target
@@ -151,7 +159,7 @@ cd deploy/platform
 pulumi up
 ```
 
-The program creates the di-framework-kube instance and platform, then the component registry. It then runs `di-framework platform deploy identity --target identity` whenever the guest's sources change, with the registry port-forwarded for the push. That builds `apps/guest/dist/identity.wasm`, pushes it to `IDENTITY_REGISTRY_PUSH`, and updates `WorkloadDeployment/identity` in `di-tenant-identity`. No second Postgres service is created. Egress is limited to the hosts in `allowedIpNameLookups`.
+The program creates the di-framework-kube instance and platform, then the component registry. It then runs `di-framework platform deploy identity --target identity` whenever the guest's sources change, with the registry port-forwarded for the push. That builds `apps/guest/dist/identity.wasm`, pushes it to `IDENTITY_REGISTRY_PUSH`, and updates `WorkloadDeployment/identity` in `di-tenant-<tenant>` (the stack's required `tenant`). No second Postgres service is created. Egress is limited to the hosts in `allowedIpNameLookups`.
 
 The platform otherwise runs tenant hosts on stock `ghcr.io/wasmcloud/wash:2.8.0`, a default-features build whose host world has no `wasi:tls/client@0.3.0-draft`, and a deploy warns that the component imports `wasi:tls`. `deploy/platform` sets the platform's `tenantHostImage` to `ghcr.io/di-framework/wash:2.8.0-wasi-tls`, pinned by digest, with pull policy `IfNotPresent`. That is the platform repo's `platform/tenant-host` build: `--features wasi-tls` on wasmCloud `v2.8.0`, with the postgres invocation-lease patch. Stack config `tenantHostImage` overrides it, and `tenantHostLocalImage` publishes and runs a local build instead (see `deploy/platform/README.md`).
 
@@ -211,3 +219,135 @@ Bootstrap passwords and client secrets used by the proof were read from `identit
 
 - `packages/cli-plugin-platform/assets/http-adapter.ts` — HTTP 0.3 body future
 - `packages/cli-plugin-platform/src/node-compat/fetch-runtime.ts` — `URLSearchParams` methods and `+` decoding
+
+## 11. pglite (identity-server#50)
+
+The guest no longer binds to a Postgres BackingService. `apps/guest/src/database.ts` opens the
+`di-framework:pglite/database@0.2.0` import with `createWasmPgliteDatabase` from
+`@di-framework/pglite-component` (6.0.11), the `SqlDatabase` adapter the provider publishes, and
+the repositories, migrations and bootstrap run on it unchanged. `di-framework platform build`
+(cli-plugin-platform 6.1.2) composes the provider into the component from
+`ghcr.io/di-framework/pglite-component@sha256:8bc30505…3286`. The deployed workload has one
+replica, `deployPolicy: Recreate`, platform persistent storage at `/data`,
+`DI_PGLITE_DATA_DIR=/data/pglite`, and `di-framework.dev/exclusive-instance`, so the exclusive
+tenant host (`wash:2.8.0-wasi-tls-exclusive`) serves it from one component instance.
+
+What changed against sections 1 and 3:
+
+- **Transactions are real.** The provider has one connection per instance and the adapter puts
+  every statement behind one mutex, so `transaction(fn)` is `BEGIN` … `COMMIT` with savepoints
+  for nested calls, and a second transaction waits for the first instead of blocking on a row
+  lock. The single-statement invariants from section 1 still hold and still protect the Bun
+  server. The pooled-connection test in `packages/core/tests/postgres.test.ts` stays a Bun server
+  test; `apps/guest/src/boot.test.ts` has the single-connection counterpart.
+- **Migrations** run each Flyway file and its `identity_schema_migrations` row in one
+  transaction. All of them apply on PostgreSQL 17.5.
+- **Runtime secrets** come from the WASI environment, filled from `identity-control`
+  (see `docs/configuration.md#wasmcloud-guest`). `V16__runtime_secrets_to_secret.sql` deletes any
+  secret rows an earlier guest stored in `identity_runtime_secret`; that table keeps only the
+  bootstrap fingerprints and the reconcile lease. Without `ISSUER_URL`, `AUTH_PUBLIC_ORIGIN` and
+  `AUTH_ACTIVE_PRIVATE_JWK` the guest answers 503 and names the missing keys.
+- **The instance is warm.** With the exclusive pool policy the instance, its database connection
+  and its `ready` promise survive between requests; requests are served one at a time.
+
+Tests: `apps/guest/src/guest.test.ts` and `boot.test.ts` run the guest on an in-process PGlite
+(`@electric-sql/pglite` 0.4.6, PostgreSQL 17.5) behind the real adapter
+(`apps/guest/tests/support/pglite.ts`): every migration, boot and bootstrap fingerprints and lease,
+the admin API, a browser sign-in with consent and a PKCE code exchange, transactions on one
+connection, and a restart on the same data directory.
+
+### Proof on a fresh instance
+
+2026-10-12, kube instance `pgprove` (platform 6.0.11-equivalent main, published
+`wash:2.8.0-wasi-tls-exclusive`), tenant `pgprove`, deployed as the tenant developer with
+`deploy/guest/deploy.sh` and freshly generated values; pushed to the tenant registry. The
+authorization-code rows are from the redeploy after the security review (the tenant check passed
+as the developer: `di-tenant-pgprove has no Postgres directory BackingService`).
+`apps/guest/scripts/live-check.ts` drove the gateway with `Host: identity.pgprove.localhost`:
+
+| Check | Result |
+| --- | --- |
+| `/health` before the Secret had values | 503, `runtime settings missing from the identity-control Secret: ISSUER_URL, AUTH_PUBLIC_ORIGIN, AUTH_ACTIVE_PRIVATE_JWK` (database opened and migrated first) |
+| After `runtime-secrets.ts apply` | `/health` 200 within 12 s; `/ready` all true |
+| Provisioner client credentials, `POST /api/admin/organizations` | 201, then 409 for the same slug; `GET` 200 |
+| Owner sign-in, consent, PKCE code exchange, UserInfo | 303, 303, 200, 200 |
+| 32 parallel `/ready`, `/oauth2/jwks`, `/login` | all 200 in 0.7 s |
+| Tenant host pod deleted | workload Ready again without a re-push; the organization reads back, the owner signs in with the password hashed before the restart, the stored consent is reused, same subject |
+| Second `deploy.sh` (Secret deleted, CLI deploy, values re-applied) | 503 for one poll while the CLI's roll ran without values, then 200; data intact |
+| Authorize validation: unknown client, unregistered redirect URI | 400, 400 |
+| Code exchange: wrong PKCE verifier, wrong redirect URI, correct exchange, ID token verified against `/oauth2/jwks` (RS256, nonce, subject), code replay, wrong client secret | 400, 400, 200, verified, 400, 401 |
+| Refresh: rotation, narrowing to `profile`, widening to `admin:write`, reuse of a rotated token, the family after reuse | 200, 200, `invalid_scope`, `invalid_grant`, 400 |
+
+### The acceptance suites from #50
+
+#50 asks for `examples/app/src/journey.test.ts` and `apps/server/tests/authorization-code.test.ts`
+on the fresh instance. Neither can be pointed at a deployed guest as written:
+
+- `examples/app/src/journey.test.ts` tests `examples/app`, a separate `@di-framework/auth` demo
+  (`/auth/register`, `/me`, `__Host-sid`) with its own in-memory store. It imports no identity
+  code and the guest has none of its routes, so there is nothing of it to run against `pgprove`.
+  It passes in `bun test` as before.
+- `apps/server/tests/authorization-code.test.ts` sets up through the database: it registers
+  clients and inserts users with repositories, changes rows with SQL (avatar, archived and
+  inactive users, expired codes) and reads audit rows. The pglite database inside the workload
+  has no network path, so those steps cannot run remotely. Instead:
+  - the whole suite (9 tests) runs on PGlite 17.5 behind the guest's adapter, in CI:
+    `IDENTITY_TEST_DATABASE=pglite bun --config=bunfig.pglite.toml test apps/server/tests/authorization-code.test.ts`
+    (9 pass);
+  - its HTTP-only assertions run against `pgprove` through `authorizationCodeChecks` in
+    `apps/guest/tests/support/flows.ts` (rows above), also run in-process by `boot.test.ts`.
+
+| authorization-code.test.ts | On `pgprove` (live-check.ts) | On PGlite in CI |
+| --- | --- | --- |
+| login, consent, code, tokens, ID token, UserInfo, consent reuse, code replay | sign-in, consent, exchange, ID token verified, UserInfo, consent reused after restart, replay 400 | yes |
+| refresh rotation and reuse revoking the authorization | rotate, narrow, widen refused, reuse `invalid_grant`, family revoked (the audit row is not readable remotely) | yes |
+| authorize request validation | unknown client, unregistered redirect URI (the other cases need extra clients) | yes |
+| code exchange checks client, expiry, redirect URI, PKCE | wrong secret 401, wrong redirect 400, wrong verifier 400 (expiry needs SQL) | yes |
+| consent bound to the pending request and user | not remote (needs a second user) | yes |
+| UserInfo refuses inactive users | not remote (needs SQL) | yes |
+| prompt=login, max_age, prompt=none | not remote | yes |
+| archived users get nothing | not remote (needs SQL) | yes |
+| public loopback client | not remote (needs a public client) | yes |
+
+### authproto cutover
+
+Not done; it needs explicit sign-off. `authproto` still runs the Postgres guest on tenant
+`identity` with the `directory` BackingService and the `identity_runtime_secret` rows, deployed
+from an earlier commit. `deploy/guest/deploy.sh` and the Pulumi program refuse any tenant whose
+namespace has the `directory` BackingService, the Pulumi program also refuses any stack without
+`database: pglite`, and neither has a default tenant.
+
+> **Gate: export the runtime-secret rows before any migration at V16 or later touches
+> `directory`.** V16 deletes every `identity_runtime_secret` row except the bootstrap state. On
+> authproto those rows may be the only copy of the signing key (`AUTH_ACTIVE_PRIVATE_JWK`) and the
+> client secrets. Any migrator from this repository at or after V16 does it: the pglite guest
+> never connects to Postgres, but the Bun server (`bun start`, `applyMigrations`) with
+> `DATABASE_URL` pointed at `directory` would. Export first (`SELECT name, value FROM
+> identity_runtime_secret`, to an encrypted store, never a log), and check the export before
+> running anything newer than V15 there. A `DELETE` does not erase the values: they stay in dead
+> tuples until `VACUUM`, in WAL until it is recycled, and in every existing `pg_dump` or volume
+> backup until rotation. Treat those as secret-bearing until then.
+
+The guards refuse a deploy to any tenant, and any Pulumi run on any cluster, that still has the
+`directory` BackingService, and they refuse the instance name `authproto` outright. The cutover
+therefore deploys the pglite guest into a **new tenant** and never into `identity` while
+`directory` exists. Every step needs the user's sign-off first; none is automated here.
+
+1. Freeze writes on the Postgres guest, and export the directory data (`pg_dump --data-only` of the
+   identity tables) and the runtime secret rows (names and values, kept out of logs), per the
+   gate above.
+2. Create a new tenant on the instance (for example `identity-pg`) with the exclusive tenant host
+   image, and deploy the pglite guest there with `deploy/guest/deploy.sh <instance> <new tenant>
+   <values>`, the values taken from the export (keeping the issuer, origin and signing key keeps
+   issued tokens valid). The `authproto` name refusal in `deploy.sh` and the Pulumi preflight is
+   what the sign-off lifts, by a deliberate change, not a flag.
+3. Load the data into the new database. There is no network path into pglite; this needs a
+   one-off import (for example a guest admin endpoint or a one-shot component on the same data
+   directory) that does not exist yet.
+4. Move the public route to the new tenant once the new guest is verified, then retire the old
+   workload and, after a final backup, the `directory` BackingService and tenant `identity`.
+
+Open choices for that change: whether to migrate the data or start from a fresh bootstrap; how
+to import into pglite; and the backup of the pglite data directory (the backup agent only runs
+`pg_dump` over the network today).
+

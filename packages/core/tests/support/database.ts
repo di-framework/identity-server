@@ -20,12 +20,15 @@ export function databaseUrl(name: string): string {
  * Every call reconnects it, so a file that used an isolated database hands the container back.
  */
 export async function useTestDatabase(): Promise<SqlDatabase> {
-  shared ??= (async () => {
-    await recreate(testDatabaseName);
-    const database = await openPostgresDatabase(databaseUrl(testDatabaseName));
-    await applyMigrations(database);
-    return database;
-  })();
+  shared ??=
+    process.env.IDENTITY_TEST_DATABASE === 'pglite'
+      ? pgliteTestDatabase()
+      : (async () => {
+          await recreate(testDatabaseName);
+          const database = await openPostgresDatabase(databaseUrl(testDatabaseName));
+          await applyMigrations(database);
+          return database;
+        })();
   const database = await shared;
   IdentityModule.connect(database);
   return database;
@@ -78,4 +81,17 @@ async function drop(name: string): Promise<void> {
   const admin = await openPostgresDatabase(localPostgresUrl, { max: 1 });
   await admin.exec(`DROP DATABASE IF EXISTS ${name} WITH (FORCE)`);
   await admin.close?.();
+}
+
+/**
+ * `IDENTITY_TEST_DATABASE=pglite`: the shared test database is an in-process PGlite (PostgreSQL
+ * 17.5) behind the guest's pglite adapter, with one connection, instead of the Postgres pool.
+ * Suites that only use `useTestDatabase` (for example apps/server/tests/authorization-code.test.ts)
+ * then run on the engine and adapter the wasmCloud guest uses.
+ */
+async function pgliteTestDatabase(): Promise<SqlDatabase> {
+  const { openTestPglite } = await import('../../../../apps/guest/tests/support/pglite.ts');
+  const database = await openTestPglite();
+  await applyMigrations(database);
+  return database;
 }

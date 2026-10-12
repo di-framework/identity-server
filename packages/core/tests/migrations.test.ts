@@ -40,6 +40,7 @@ test('discovers the reused Flyway migrations in version order', async () => {
     ['13', 'runtime secrets'],
     ['14', 'varchar hashes'],
     ['15', 'concurrency indexes'],
+    ['16', 'runtime secrets to secret'],
   ]);
 });
 
@@ -63,6 +64,7 @@ test('applies the reused migrations and reads a user through UserRepository', as
       '13',
       '14',
       '15',
+      '16',
     ]);
 
     const again = await applyMigrations(db);
@@ -124,6 +126,7 @@ test('V12 unwraps metadata and session attributes stored as JSON string scalars'
         '13',
         '14',
         '15',
+        '16',
       ]);
       expect(
         await db.first<Record<string, unknown>>(
@@ -140,6 +143,44 @@ test('V12 unwraps metadata and session attributes stored as JSON string scalars'
       ).toEqual({
         saved: '/admin',
       });
+    });
+  } finally {
+    rmSync(earlier, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test('V16 removes runtime secrets from identity_runtime_secret and keeps bootstrap state', async () => {
+  const earlier = mkdtempSync(join(tmpdir(), 'identity-v15-'));
+  const root = join(earlier, 'migrations');
+  cpSync(migrationsDirectory, root, { recursive: true });
+  for (const name of readdirSync(root)) {
+    const version = /^V(\d+)__/.exec(name);
+    if (version && Number(version[1]) >= 16) rmSync(join(root, name));
+  }
+  try {
+    await withThrowawayDatabase('identity_v16_test', async (db) => {
+      await applyMigrations(db, root);
+      const names = [
+        'AUTH_ACTIVE_PRIVATE_JWK',
+        'SMTP_PASSWORD',
+        // Written by hand under a name no writer in this repository ever used.
+        'LEGACY_HAND_SEEDED_KEY',
+        'bootstrap_fingerprint',
+        'bootstrap_client_fingerprints',
+        'bootstrap_lease',
+      ];
+      for (const name of names) {
+        await db.run('INSERT INTO identity_runtime_secret (name, value) VALUES (?, ?)', [
+          name,
+          'stored',
+        ]);
+      }
+      expect((await applyMigrations(db)).applied.map((record) => record.version)).toEqual(['16']);
+      expect(await db.query('SELECT name FROM identity_runtime_secret ORDER BY name')).toEqual([
+        { name: 'bootstrap_client_fingerprints' },
+        { name: 'bootstrap_fingerprint' },
+        { name: 'bootstrap_lease' },
+      ]);
     });
   } finally {
     rmSync(earlier, { recursive: true, force: true });

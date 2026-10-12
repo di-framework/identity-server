@@ -1,37 +1,41 @@
 import * as pulumi from '@pulumi/pulumi';
-import { portForward, runLogged, runProcess } from './process';
+import { applyRuntimeSecrets } from './control-secret';
+import { kubectlRunner, portForward } from './process';
 
 /**
- * Rows in a wasmCloud guest's `identity_runtime_secret` table, the channel for settings that
- * wasi:config refuses (keys, passwords, URLs).
+ * The identity guest's runtime secrets (issuer, origin, signing key, passwords, client secrets,
+ * SMTP host and password), written to the workload's `<workload>-control` Secret. The platform
+ * merges that Secret into the guest's WASI environment (`localResources.environment.secretFrom`),
+ * and the guest reads the values from there (apps/guest/src/settings.ts). They never reach the
+ * database. Tenant admission lets a workload without an environment label reference only that
+ * Secret, and wasi:config refuses secrets and URLs.
  *
- * The table lives in a platform Postgres BackingService. Its network policy admits only
- * wasmCloud host pods, so rows are written by `psql` inside the Postgres pod through
- * `kubectl exec`, with the SQL on stdin. The guest's own migrations create the table on its
- * first request, so this resource sends one request through the tenant's `di-http` Service
- * first, and afterwards waits until the guest boots healthy with the new values.
- *
- * Only the names in `values` are managed. Other rows, such as the guest's bootstrap
- * fingerprint, are left alone.
+ * `di-framework platform deploy` rewrites the control Secret on every deploy with only
+ * DI_CONTROL_TOKEN and DI_CONTROL_IDENTITY, so this resource writes the whole Secret after each
+ * deploy of `CliWorkload` (its `deployment` input changes with every deploy): a fresh control
+ * token (the identity workload has no cron or queue invokers that use it), the identity, and the
+ * values. The document goes to kubectl on stdin; no value is in an argument list or a log.
+ * It then rolls the workload with a revision entry in its environment config, since a running
+ * instance keeps the environment it started with, and waits until `/health` answers 200 through
+ * the tenant's `di-http` Service. Until then the guest fails closed with HTTP 503.
  */
 export interface RuntimeSecretsInputs {
   kubeconfig: string;
   context?: string;
-  /** Tenant runtime namespace holding Postgres and the `di-http` Service. */
+  /** Tenant namespace holding the WorkloadDeployment and its control Secret. */
+  tenantNamespace: string;
+  /** Tenant runtime namespace holding the `di-http` Service. */
   runtimeNamespace: string;
-  /** BackingService name; its Postgres pods carry `app=di-bs-<service>`. */
-  service: string;
+  /** WorkloadDeployment name; the Secret is `<workload>-control`. */
+  workload: string;
   /** Host header that routes to the workload through `di-http`. */
   workloadHost: string;
   /** Loopback port for the `di-http` port-forward. */
   localPort: number;
-  /** Row name to value. */
+  /** Changes with every CLI deploy, which drops the values from the Secret. */
+  deployment: string;
+  /** Environment name to value. */
   values: Record<string, string>;
-}
-
-interface RuntimeSecretsState extends RuntimeSecretsInputs {
-  /** Managed row names, so a later update or delete knows which rows are ours. */
-  names: string[];
 }
 
 type DeepInput<T> = pulumi.Input<
@@ -40,47 +44,54 @@ type DeepInput<T> = pulumi.Input<
 type RuntimeSecretsArgs = { [K in keyof RuntimeSecretsInputs]: DeepInput<RuntimeSecretsInputs[K]> };
 
 export class RuntimeSecrets extends pulumi.dynamic.Resource {
-  declare readonly names: pulumi.Output<string[]>;
-
   constructor(name: string, args: RuntimeSecretsArgs, opts?: pulumi.CustomResourceOptions) {
-    super(
-      secretsProvider,
-      name,
-      { ...args, names: undefined },
-      {
-        ...opts,
-        additionalSecretOutputs: ['values'],
-      },
-    );
+    super(secretsProvider, name, args, { ...opts, additionalSecretOutputs: ['values'] });
   }
 }
 
 const secretsProvider: pulumi.dynamic.ResourceProvider = {
-  async diff(_id: string, olds: RuntimeSecretsState, news: RuntimeSecretsInputs) {
-    const keys = ['runtimeNamespace', 'service', 'values'];
+  async diff(_id: string, olds: RuntimeSecretsInputs, news: RuntimeSecretsInputs) {
+    const keys = ['tenantNamespace', 'workload', 'deployment', 'values'];
     const differs = (key: string) =>
       JSON.stringify((olds as unknown as Record<string, unknown>)[key]) !==
       JSON.stringify((news as unknown as Record<string, unknown>)[key]);
     return { changes: keys.some(differs) };
   },
   async create(inputs: RuntimeSecretsInputs) {
-    return { id: `${inputs.runtimeNamespace}/${inputs.service}`, outs: await write(inputs, []) };
+    await write(inputs);
+    return { id: `${inputs.tenantNamespace}/${inputs.workload}-control`, outs: inputs };
   },
-  async update(_id: string, olds: RuntimeSecretsState, news: RuntimeSecretsInputs) {
-    return { outs: await write(news, olds.names ?? []) };
+  async update(_id: string, _olds: RuntimeSecretsInputs, news: RuntimeSecretsInputs) {
+    await write(news);
+    return { outs: news };
   },
-  async delete(_id: string, state: RuntimeSecretsState) {
-    const pod = await postgresPod(state, false);
-    if (!pod) return; // The database is already gone.
-    await psql(state, pod, deleteRows(state.names ?? Object.keys(state.values)).join('\n'));
-  },
+  // `di-framework platform destroy` deletes the control Secret with the workload.
+  async delete() {},
 };
 
-async function write(
-  inputs: RuntimeSecretsInputs,
-  previous: string[],
-): Promise<RuntimeSecretsState> {
-  const pod = (await postgresPod(inputs, true)) as string;
+async function write(inputs: RuntimeSecretsInputs): Promise<void> {
+  const crypto = require('node:crypto') as typeof import('node:crypto');
+  const kubectl = kubectlRunner(
+    inputs.kubeconfig,
+    inputs.context,
+    `runtime-secrets-${inputs.workload}.log`,
+  );
+  // Refuses a tenant that still has the Postgres `directory` BackingService (authproto), writes
+  // the whole Secret on stdin, and rolls the workload by setting only the revision key. A new
+  // revision on every write: the Secret always gets a fresh control token.
+  await applyRuntimeSecrets(kubectl, {
+    tenant: inputs.tenantNamespace.replace(/^di-tenant-/, ''),
+    workload: inputs.workload,
+    values: inputs.values,
+    token: crypto.randomBytes(32).toString('base64url'),
+    revision: crypto
+      .createHash('sha256')
+      .update(inputs.deployment)
+      .update(crypto.randomBytes(16))
+      .digest('hex')
+      .slice(0, 16),
+  });
+
   const forward = await portForward({
     kubeconfig: inputs.kubeconfig,
     context: inputs.context,
@@ -90,40 +101,13 @@ async function write(
     remotePort: 80,
   });
   try {
-    await waitForTable(inputs, pod);
-    const names = Object.keys(inputs.values).sort();
-    const stale = previous.filter((name) => !names.includes(name));
-    const upserts = names.map(
-      (name) =>
-        `INSERT INTO identity_runtime_secret (name, value) VALUES (${literal(name)}, ${literal(
-          inputs.values[name] as string,
-        )}) ON CONFLICT (name) DO UPDATE SET value = EXCLUDED.value;`,
-    );
-    await psql(inputs, pod, ['BEGIN;', ...upserts, ...deleteRows(stale), 'COMMIT;'].join('\n'));
     await waitForHealthy(inputs);
-    return { ...inputs, names };
   } finally {
     await forward.stop();
   }
 }
 
-/** The guest creates the table in its first request's migrations; prompt one and wait. */
-async function waitForTable(inputs: RuntimeSecretsInputs, pod: string): Promise<void> {
-  for (let attempt = 1; attempt <= 60; attempt++) {
-    const exists = await psql(
-      inputs,
-      pod,
-      "SELECT to_regclass('public.identity_runtime_secret') IS NOT NULL;",
-      true,
-    );
-    if (exists.trim() === 't') return;
-    await request(inputs, '/health').catch(() => undefined);
-    await new Promise((resolve) => setTimeout(resolve, 5000));
-  }
-  throw new Error('the guest did not create identity_runtime_secret within 5 minutes');
-}
-
-/** Boot runs Argon2id over the bootstrap secrets on QuickJS, which takes a minute or two. */
+/** The first boot runs initdb and hashes the bootstrap secrets; later rolls take seconds. */
 async function waitForHealthy(inputs: RuntimeSecretsInputs): Promise<void> {
   const deadline = Date.now() + 10 * 60_000;
   let last = '';
@@ -169,85 +153,4 @@ function request(
     req.on('error', reject);
     req.end();
   });
-}
-
-async function postgresPod(
-  inputs: RuntimeSecretsInputs,
-  required: boolean,
-): Promise<string | undefined> {
-  const result = await runProcess(
-    'kubectl',
-    [
-      ...kubectlBase(inputs),
-      'get',
-      'pods',
-      '-l',
-      `app=di-bs-${inputs.service}`,
-      '--field-selector=status.phase=Running',
-      '-o',
-      'jsonpath={.items[0].metadata.name}',
-    ],
-    { log: `runtime-secrets-${inputs.service}.log`, capture: true },
-  );
-  const pod = result.code === 0 ? result.stdout.trim() : '';
-  if (!pod && required) {
-    throw new Error(`no running Postgres pod for ${inputs.service} in ${inputs.runtimeNamespace}`);
-  }
-  return pod || undefined;
-}
-
-/**
- * Runs SQL as the local superuser over the pod's Unix socket, in the single application
- * database the BackingService created.
- */
-async function psql(
-  inputs: RuntimeSecretsInputs,
-  pod: string,
-  sql: string,
-  capture = false,
-): Promise<string> {
-  const log = `runtime-secrets-${inputs.service}.log`;
-  const exec = (args: string[], input: string, quiet: boolean) =>
-    runLogged(
-      'kubectl',
-      [...kubectlBase(inputs), 'exec', '-i', pod, '-c', 'postgres', '--', ...args],
-      { log, input, capture: quiet },
-    );
-  const database = (
-    await exec(
-      ['psql', '-U', 'postgres', '-At', '-v', 'ON_ERROR_STOP=1'],
-      "SELECT datname FROM pg_database WHERE NOT datistemplate AND datname <> 'postgres';",
-      true,
-    )
-  )
-    .trim()
-    .split('\n');
-  if (database.length !== 1 || !database[0]) {
-    throw new Error(`expected one application database, found: ${database.join(', ')}`);
-  }
-  return exec(
-    ['psql', '-U', 'postgres', '-d', database[0], '-At', '-v', 'ON_ERROR_STOP=1'],
-    sql,
-    capture,
-  );
-}
-
-function kubectlBase(inputs: RuntimeSecretsInputs): string[] {
-  return [
-    '--kubeconfig',
-    inputs.kubeconfig,
-    ...(inputs.context ? ['--context', inputs.context] : []),
-    '--namespace',
-    inputs.runtimeNamespace,
-  ];
-}
-
-function deleteRows(names: string[]): string[] {
-  if (names.length === 0) return [];
-  return [`DELETE FROM identity_runtime_secret WHERE name IN (${names.map(literal).join(', ')});`];
-}
-
-/** A standard SQL string literal; the only escape is a doubled single quote. */
-function literal(value: string): string {
-  return `'${value.replaceAll("'", "''")}'`;
 }

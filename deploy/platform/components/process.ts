@@ -144,3 +144,26 @@ export async function portForward(options: {
   child.stderr?.resume();
   return { stop };
 }
+
+/**
+ * A `Kubectl` for components/control-secret.ts: kubectl bound to a kubeconfig and context. Stdout
+ * is kept in memory (a created Secret echoes its data there); stderr goes to the log, and its tail
+ * is what the caller sees.
+ */
+export function kubectlRunner(
+  kubeconfig: string,
+  context: string | undefined,
+  log: string,
+): (
+  args: string[],
+  input?: string,
+) => Promise<{ code: number | null; stdout: string; stderr: string }> {
+  return async (args, input) => {
+    const result = await runProcess(
+      'kubectl',
+      ['--kubeconfig', kubeconfig, ...(context ? ['--context', context] : []), ...args],
+      { log, input, capture: true },
+    );
+    return { code: result.code, stdout: result.stdout, stderr: result.tail };
+  };
+}

@@ -1,4 +1,5 @@
 import * as pulumi from '@pulumi/pulumi';
+import { kubeInstanceDiff } from './kube-diff';
 import { runLogged } from './process';
 
 /**
@@ -52,20 +53,6 @@ interface KubeInstanceState extends KubeInstanceInputs {
 }
 
 type KubeInstanceArgs = { [K in keyof KubeInstanceInputs]: pulumi.Input<KubeInstanceInputs[K]> };
-
-/** Inputs whose change means a different instance rather than an upgrade of this one. */
-const REPLACE_ON_CHANGE = ['name', 'stateDir', 'existingKubeconfig', 'existingContext'];
-const INPUT_KEYS = [
-  ...REPLACE_ON_CHANGE,
-  'version',
-  'binary',
-  'httpPort',
-  'platformPackage',
-  'platformConfig',
-  'values',
-  'allowInsecureRegistries',
-  'purgeOnDelete',
-];
 
 export class KubeInstance extends pulumi.dynamic.Resource {
   /** Admin kubeconfig path in kube's state directory. */
@@ -162,11 +149,12 @@ function newestCachedRelease(): string | undefined {
 
 const kubeProvider: pulumi.dynamic.ResourceProvider = {
   async diff(_id: string, olds: KubeInstanceState, news: KubeInstanceInputs) {
-    const differs = (key: string) =>
-      JSON.stringify((olds as unknown as Record<string, unknown>)[key]) !==
-      JSON.stringify((news as unknown as Record<string, unknown>)[key]);
-    const replaces = REPLACE_ON_CHANGE.filter(differs);
-    return { changes: INPUT_KEYS.some(differs), replaces, deleteBeforeReplace: true };
+    const path = require('node:path') as typeof import('node:path');
+    return kubeInstanceDiff(
+      olds as unknown as Record<string, unknown>,
+      news as unknown as Record<string, unknown>,
+      (value) => path.resolve(value),
+    );
   },
   async create(inputs: KubeInstanceInputs) {
     return { id: inputs.name, outs: await kubeUp(inputs) };
