@@ -24,6 +24,7 @@ import {
   type AccountCaller,
   LinkService,
 } from '@di-framework/identity/src/linking/application/link-service.ts';
+import { SecretFlash } from '@di-framework/identity/src/sessions/application/secret-flash.ts';
 import {
   type ActiveSession,
   SessionService,
@@ -51,7 +52,8 @@ import type {
 
 /** Passwordless challenge cookie (`WebController.challengeCookie`). */
 export const CHALLENGE_COOKIE = 'gsio_passwordless_challenge';
-const SECRET_ATTRIBUTE = 'IDENTITY_CLIENT_SECRET_REVEAL';
+/** `SecretFlash` scope for a newly minted client secret, per client. */
+const clientSecretScope = (clientId: string) => `oauth-client-secret:${clientId}`;
 
 type Body<P> = P extends PageModel ? Omit<P, keyof ActorFields> : never;
 type PageBody = Body<PageModel>;
@@ -621,15 +623,8 @@ export class WebApp {
 
   private async clientPage(c: Context, actor: string, id: string, q: Query): Promise<Result> {
     return this.admin(await this.clients.detail(actor, id), async (client: RegisteredClient) => {
-      const reveal = c.active.session.attributes[SECRET_ATTRIBUTE];
-      let secret: string | null = null;
-      if (reveal) {
-        const parsed = JSON.parse(reveal) as { clientId: string; secret: string };
-        if (parsed.clientId === client.clientId) {
-          secret = parsed.secret;
-          c.active = await this.sessions.setAttribute(c.active, SECRET_ATTRIBUTE, null);
-        }
-      }
+      const secret =
+        this.flash.take(c.active.session.id, clientSecretScope(client.clientId)) ?? null;
       return page({
         page: 'client',
         client: {
@@ -677,18 +672,17 @@ export class WebApp {
     });
   }
 
-  /** The new secret goes in the session for one page view, never in the URL. */
+  /**
+   * The new secret is flashed in memory for one page view: never in the URL, and never in the
+   * session row (#54).
+   */
   private async revealThenRedirect(
     c: Context,
     result: AdminResult<{ clientId: string; secret: string }>,
     flag: string,
   ): Promise<Result> {
-    return this.admin(result, async ({ clientId, secret }) => {
-      c.active = await this.sessions.setAttribute(
-        c.active,
-        SECRET_ATTRIBUTE,
-        JSON.stringify({ clientId, secret }),
-      );
+    return this.admin(result, ({ clientId, secret }) => {
+      this.flash.put(c.active.session.id, clientSecretScope(clientId), secret);
       return redirect(`/admin/oauth-clients/${clientId}?${flag}=1`);
     });
   }
@@ -713,7 +707,8 @@ export class WebApp {
       sessionId: c.active.session.id,
       lastAuthenticatedAt: c.active.session.lastAuthenticatedAt,
     };
-    const pendingToken = c.active.session.attributes[SESSION_ATTRIBUTES.pendingLink];
+    const pendingHash = c.active.session.attributes[SESSION_ATTRIBUTES.pendingLink];
+    const pendingRef = pendingHash ? { tokenHash: pendingHash } : undefined;
     const unavailable = (message: string | null) =>
       page({ page: 'link-unavailable', message }, 400);
     if (path === '/account/identity-links' && get) {
@@ -763,12 +758,12 @@ export class WebApp {
       c.active = await this.sessions.setAttribute(
         c.active,
         SESSION_ATTRIBUTES.pendingLink,
-        result.token,
+        result.tokenHash,
       );
       return redirect('/account/identity-links/confirm');
     }
     if (path === '/account/identity-links/confirm') {
-      const token = (get ? c.url.searchParams.get('token') : c.form.get('token')) || pendingToken;
+      const token = (get ? c.url.searchParams.get('token') : c.form.get('token')) || pendingRef;
       if (get) {
         const pending = this.flows.pendingFor(token, user.id);
         if (!pending) {
@@ -798,21 +793,21 @@ export class WebApp {
       return redirect('/account/identity-links?linked=1');
     }
     if (path === '/account/identity-links/cancel' && !get) {
-      this.flows.cancel(c.form.get('token') || pendingToken, user.id);
+      this.flows.cancel(c.form.get('token') || pendingRef, user.id);
       c.active = await this.sessions.setAttribute(c.active, SESSION_ATTRIBUTES.pendingLink, null);
       return redirect('/account/identity-links?canceled=1');
     }
     if (path === '/account/identity-links/unlink/start' && !get) {
-      const token = await this.links.startUnlink(caller, c.form.get('id') ?? '');
-      if (token instanceof ServiceResult) {
-        return token.status === 403
+      const tokenHash = await this.links.startUnlink(caller, c.form.get('id') ?? '');
+      if (tokenHash instanceof ServiceResult) {
+        return tokenHash.status === 403
           ? page({ page: 'denied', reason: 'member' }, 403)
           : unavailable('This unlink confirmation is invalid or expired.');
       }
       c.active = await this.sessions.setAttribute(
         c.active,
         SESSION_ATTRIBUTES.unlinkConfirmation,
-        token,
+        tokenHash,
       );
       return redirect('/account/identity-links/unlink/confirm');
     }
@@ -904,6 +899,9 @@ export class WebApp {
   }
   private get flows() {
     return this.container.resolve(LinkFlowService);
+  }
+  private get flash() {
+    return this.container.resolve(SecretFlash);
   }
 }
 

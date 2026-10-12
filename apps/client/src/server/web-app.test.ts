@@ -31,6 +31,14 @@ const directory = () => useContainer().resolve<DirectoryRepository>(DIRECTORY);
 const ids = { admin: '', owner: '', member: '', inactive: '', acme: '', beta: '' };
 const PASSWORD = 'correct-horse-battery';
 
+/** Every browser session row's attributes, as the database (or a backup of it) holds them. */
+async function storedSessionAttributes(): Promise<string> {
+  const rows = await isolated.database.query<{ attributes: unknown }>(
+    'SELECT attributes FROM browser_sessions',
+  );
+  return JSON.stringify(rows.map((row) => row.attributes));
+}
+
 /** A cookie jar over `handle`, as a browser would use the pages. */
 class Browser {
   private jar = new Map<string, string>();
@@ -547,7 +555,10 @@ describe('admin pages', () => {
     const location = registered.headers.get('location') ?? '';
     expect(location).toMatch(/^\/admin\/oauth-clients\/cli_[0-9a-f]{16}\?newSecret=1$/);
     expect(location).not.toContain('secret=');
+    // #54: the secret waiting to be shown is not in any session row.
+    expect(await storedSessionAttributes()).not.toContain('IDENTITY_CLIENT_SECRET_REVEAL');
     const shown = await owner.page(location);
+    const revealed = String((shown as { secret?: unknown }).secret);
     expect(shown).toMatchObject({
       page: 'client',
       banner: 'registered',
@@ -560,6 +571,9 @@ describe('admin pages', () => {
       },
     });
     expect(await owner.page(location)).toMatchObject({ secret: null });
+    const afterReveal = await storedSessionAttributes();
+    expect(typeof afterReveal).toBe('string');
+    expect(afterReveal.includes(revealed)).toBe(false);
     const id = location.split('/')[3]?.split('?')[0] ?? '';
     expect(await owner.page('/admin/oauth-clients?orgSlug=acme&status=active')).toMatchObject({
       page: 'clients',
@@ -610,6 +624,8 @@ describe('admin pages', () => {
       orgSlug: 'acme',
       clientName: 'Other',
     });
+    // The flash belongs to the session that registered the client.
+    expect(await admin.page(other.headers.get('location') ?? '')).toMatchObject({ secret: null });
     expect(await owner.page(other.headers.get('location') ?? '')).toMatchObject({
       secret: expect.any(String),
     });
@@ -673,6 +689,11 @@ describe('linked identities', () => {
     );
     expect(callback.headers.get('location')).toBe('/account/identity-links/confirm');
     const confirm = await browser.page('/account/identity-links/confirm');
+    // #54: the session keeps the SHA-256 of the pending link token, never the token itself.
+    const pendingToken = (confirm as { token: string }).token;
+    const stored = await storedSessionAttributes();
+    expect(stored).not.toContain(pendingToken);
+    expect(stored).toContain(new Bun.CryptoHasher('sha256').update(pendingToken).digest('hex'));
     expect(confirm).toMatchObject({
       page: 'link-confirm',
       account: { login: 'member', email: 'member@example.com' },
@@ -711,6 +732,12 @@ describe('linked identities', () => {
     });
     const startUnlink = await browser.post('/account/identity-links/unlink/start', { id: linkId });
     expect(startUnlink.headers.get('location')).toBe('/account/identity-links/unlink/confirm');
+    const confirmation = await isolated.database.first<{ token_hash: string }>(
+      'SELECT token_hash FROM identity_unlink_confirmations ORDER BY created_at DESC LIMIT 1',
+    );
+    expect(await storedSessionAttributes()).toContain(
+      `"GSIO_IDENTITY_UNLINK_CONFIRMATION_TOKEN_HASH":"${confirmation?.token_hash}"`,
+    );
     expect(await browser.page('/account/identity-links/unlink/confirm')).toMatchObject({
       page: 'unlink-confirm',
       provider: 'acme',

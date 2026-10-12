@@ -31,8 +31,15 @@ export interface PendingLink {
   expiresAt: number;
 }
 
+/**
+ * Names a pending link: the raw token a confirm form posts back, or the SHA-256 hex of it that the
+ * browser session keeps. Pending links are keyed by that hash, so a session row never holds a
+ * token that could complete the link.
+ */
+export type PendingLinkRef = string | { tokenHash: string } | null | undefined;
+
 export type CallbackResult =
-  | { kind: 'pending'; token: string }
+  | { kind: 'pending'; token: string; tokenHash: string }
   | { kind: 'error'; message: string };
 
 export const CALLBACK_INCOMPLETE =
@@ -142,32 +149,31 @@ export class LinkFlowService {
         correlationId: Hashing.sha256Hex(input.sessionId),
         after: { issuer: pending.issuer, providerName: pending.providerName },
       });
-      return { kind: 'pending', token: pending.token };
+      return { kind: 'pending', token: pending.token, tokenHash: Hashing.sha256Hex(pending.token) };
     } catch {
       return { kind: 'error', message: CALLBACK_FAILED };
     }
   }
 
   /** A live pending link for this user, or undefined. Expired entries are dropped. */
-  pendingFor(token: string | null | undefined, userId: string): PendingLink | undefined {
-    if (!token) return undefined;
-    const pending = this.pending.get(token);
+  pendingFor(ref: PendingLinkRef, userId: string): PendingLink | undefined {
+    const key = pendingKey(ref);
+    if (!key) return undefined;
+    const pending = this.pending.get(key);
     if (!pending) return undefined;
     if (pending.expiresAt < this.clock.now()) {
-      this.pending.delete(token);
+      this.pending.delete(key);
       return undefined;
     }
     return pending.userId === userId ? pending : undefined;
   }
 
   /** Writes `(issuer, subject)` under a row lock. Undefined when the pending link is not valid. */
-  async confirm(
-    token: string | null | undefined,
-    userId: string,
-  ): Promise<IdentityLink | undefined> {
-    if (!token) return undefined;
-    const pending = this.pending.get(token);
-    this.pending.delete(token);
+  async confirm(ref: PendingLinkRef, userId: string): Promise<IdentityLink | undefined> {
+    const key = pendingKey(ref);
+    if (!key) return undefined;
+    const pending = this.pending.get(key);
+    this.pending.delete(key);
     if (!pending || pending.userId !== userId || pending.expiresAt < this.clock.now())
       return undefined;
     const link = await this.directory.transaction(async () => {
@@ -189,7 +195,7 @@ export class LinkFlowService {
       action: 'identity_link.created',
       actor: userId,
       target: target(link.issuer, link.subject),
-      correlationId: Hashing.sha256Hex(token),
+      correlationId: key,
       after: {
         id: link.id,
         issuer: link.issuer,
@@ -200,8 +206,9 @@ export class LinkFlowService {
     return link;
   }
 
-  cancel(token: string | null | undefined, userId: string): void {
-    if (token && this.pending.get(token)?.userId === userId) this.pending.delete(token);
+  cancel(ref: PendingLinkRef, userId: string): void {
+    const key = pendingKey(ref);
+    if (key && this.pending.get(key)?.userId === userId) this.pending.delete(key);
   }
 
   private async verify(
@@ -237,9 +244,14 @@ export class LinkFlowService {
       providerEmail: identity.email,
       expiresAt: this.clock.now() + LINK_TTL_MS,
     };
-    this.pending.set(pending.token, pending);
+    this.pending.set(Hashing.sha256Hex(pending.token), pending);
     return pending;
   }
+}
+
+function pendingKey(ref: PendingLinkRef): string | undefined {
+  if (!ref) return undefined;
+  return typeof ref === 'string' ? Hashing.sha256Hex(ref) : ref.tokenHash || undefined;
 }
 
 /** Audit target `issuer#sha256(subject)`: the subject itself is never written to audit. */

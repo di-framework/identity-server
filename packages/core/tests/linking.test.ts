@@ -343,6 +343,9 @@ describe('link flow', () => {
     expect(flows.pendingFor(undefined, userId)).toBeUndefined();
     expect(flows.pendingFor('missing', userId)).toBeUndefined();
     expect(await flows.confirm(undefined, userId)).toBeUndefined();
+    expect(flows.pendingFor({ tokenHash: '' }, userId)).toBeUndefined();
+    // The browser session keeps only the hash; it names the same pending link as the raw token.
+    expect(flows.pendingFor({ tokenHash: Hashing.sha256Hex(token) }, userId)?.token).toBe(token);
     const link = await flows.confirm(token, userId);
     expect(link).toMatchObject({ userId, issuer: idp.issuer, subject, providerName: 'acme' });
     expect(await flows.confirm(token, userId)).toBeUndefined();
@@ -387,8 +390,12 @@ describe('link flow', () => {
     const owner = await person();
     const staged = await linkedViaFlow(owner);
     staged.flows.cancel(undefined, owner);
-    staged.flows.cancel(staged.token, owner);
+    staged.flows.cancel({ tokenHash: Hashing.sha256Hex(staged.token) }, owner);
     expect(staged.flows.pendingFor(staged.token, owner)).toBeUndefined();
+    const byHash = await linkedViaFlow(owner);
+    expect(
+      await byHash.flows.confirm({ tokenHash: Hashing.sha256Hex(byHash.token) }, owner),
+    ).toMatchObject({ userId: owner });
 
     const late = await linkedViaFlow(owner);
     clock.advance(LINK_TTL_MS + 1);
@@ -771,7 +778,14 @@ describe('unlinking', () => {
     expect(await unlinks.pendingUnlink({ userId })).toBeUndefined();
     expect(await unlinks.pendingUnlink(caller(userId))).toBeUndefined();
     const token = await unlinks.startUnlink(caller(userId), link.id);
-    expect(typeof token).toBe('string');
+    // The session keeps only the SHA-256 hex of the confirmation token (#54).
+    expect(token).toMatch(/^[0-9a-f]{64}$/);
+    const stored = await database.first<{ token_hash: string }>(
+      `SELECT token_hash FROM identity_unlink_confirmations WHERE user_id = ?`,
+      [userId],
+    );
+    expect(stored?.token_hash).toBe(token as string);
+    expect(await unlinks.confirmUnlink(caller(userId), 'not-a-hash')).toBe(false);
     expect(await unlinks.pendingUnlink(caller(userId))).toMatchObject({ id: link.id });
     expect(await unlinks.confirmUnlink(caller(userId), null)).toBe(false);
     expect(await unlinks.confirmUnlink({ userId }, token as string)).toBe(false);

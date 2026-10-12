@@ -14,6 +14,7 @@ import { rsaPrivateJwk } from '../../../packages/core/tests/support/keys.ts';
 import { authorizationCodeChecks, identityFlows } from '../tests/support/flows.ts';
 import { type PgliteFixture, pgliteFixture } from '../tests/support/pglite.ts';
 import { DATABASE_ROOT_ENV, pgliteDatabase } from './database.ts';
+import { embeddedMigrations } from './migrations.ts';
 import { type GuestRuntime, handle, resetGuest } from './runtime.ts';
 import { RUNTIME_SECRET_SETTINGS } from './settings.ts';
 
@@ -352,7 +353,7 @@ test('data survives an instance restart on the same database root', async () => 
       // The schema was already there, and the stored fingerprint skipped reconcile.
       expect(
         await db.first<{ n: number }>('SELECT count(*)::int AS n FROM identity_schema_migrations'),
-      ).toEqual({ n: 16 });
+      ).toEqual({ n: embeddedMigrations.length });
       // The owner signs in again with the bootstrap password hashed before the restart.
       const again = await identityFlows({
         ...flowInputs(serveAgain, 'second'),
