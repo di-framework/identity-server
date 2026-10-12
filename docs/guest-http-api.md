@@ -227,7 +227,7 @@ The guest no longer binds to a Postgres BackingService. `apps/guest/src/database
 `@di-framework/pglite-component` (6.0.11), the `SqlDatabase` adapter the provider publishes, and
 the repositories, migrations and bootstrap run on it unchanged. `di-framework platform build`
 (cli-plugin-platform 6.1.2) composes the provider into the component from
-`ghcr.io/di-framework/pglite-component@sha256:8bc30505…3286`. The deployed workload has one
+`ghcr.io/di-framework/pglite-component@sha256:9a00ac39…7d5e` (with pgcrypto; earlier `8bc30505…3286`). The deployed workload has one
 replica, `deployPolicy: Recreate`, platform persistent storage at `/data`,
 `DI_PGLITE_DATA_DIR=/data/pglite`, and `di-framework.dev/exclusive-instance`, so the exclusive
 tenant host (`wash:2.8.0-wasi-tls-exclusive`) serves it from one component instance.
@@ -281,6 +281,31 @@ as the developer: `di-tenant-pgprove has no Postgres directory BackingService`).
 | Authorize validation: unknown client, unregistered redirect URI | 400, 400 |
 | Code exchange: wrong PKCE verifier, wrong redirect URI, correct exchange, ID token verified against `/oauth2/jwks` (RS256, nonce, subject), code replay, wrong client secret | 400, 400, 200, verified, 400, 401 |
 | Refresh: rotation, narrowing to `profile`, widening to `admin:write`, reuse of a rotated token, the family after reuse | 200, 200, `invalid_scope`, `invalid_grant`, 400 |
+
+### Column encryption on `pgprove`
+
+2026-10-12, the same instance and tenant, with the pglite provider pinned to
+`sha256:9a00ac39…7d5e` (pgcrypto 1.3). The guest was built with cli-plugin-platform 6.1.2 and
+pushed as the tenant developer `pgdev` through the tenant registry front, the same path as the
+proving-grounds harness. Opted in with `runtime-secrets.ts column-keys --enable` and `apply`. The
+database already held data from before the opt-in. Only status codes, counts and booleans were
+recorded:
+
+| Check | Result |
+| --- | --- |
+| Opt-in boot (V17–V19, pgcrypto probe, latch) | `/health` 200, `/ready` all true; state row enabled with both key checks; 11 encryption triggers |
+| Admin API: create a user after opt-in, read it back, list | 201, 200 with the decrypted email and display name, list decrypted |
+| Duplicate email of the new row (padded, lower-cased) | 409 through the blind index |
+| Duplicate email of a legacy row (upper-cased) | 409 through legacy plaintext |
+| Owner sign-in with the upper-cased email | signed in (legacy plaintext lookup) |
+| Organization create/duplicate/read; sign-in, token, UserInfo; code exchange with ID token verification; refresh rotation and reuse | 201/409/200; 303, 200, 200; all as before. Consent was already stored for the owner, so it was reused rather than shown. |
+| At rest, on a copy of PGDATA (database `template1`) taken after a clean shutdown, checked with the key and printing counts only | users: 2 encrypted rows, plaintext NULL, blind index set, both decrypt to an address, 2 legacy plaintext rows. `browser_sessions` 5, `auth_audit_records` 6, `oauth2_authorization` 3, `email_challenges` 2 encrypted rows, none with plaintext beside them, all decrypt. No ciphertext contains its plaintext. Legacy rows stay plaintext. |
+| Restart with a Secret without the keys or the switch | `/health`, `/ready`, `/login`: 503 `{"error":"service unavailable","reason":"column-encryption-unavailable"}` |
+| Keys restored | `/health` 200, `/ready` all true, flows and lookups as above |
+
+As a tenant developer, replacing `identity-control` with a copy that drops keys is refused by
+`tenant-secret-update`. The no-keys restart therefore deleted the Secret first, as `deploy.sh`
+does.
 
 ### The acceptance suites from #50
 
