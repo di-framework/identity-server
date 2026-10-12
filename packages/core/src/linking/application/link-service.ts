@@ -17,6 +17,7 @@ export const RECENT_AUTHENTICATION_MS = 15 * 60 * 1000;
 export const UNLINK_TTL_MS = 300_000;
 
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const SHA256_HEX = /^[0-9a-f]{64}$/;
 
 /** The caller of an account route. `sessionId` is absent for bearer-token callers. */
 export interface AccountCaller {
@@ -87,7 +88,11 @@ export class LinkService {
     if (issuer instanceof ServiceResult) return issuer;
     const subject = input.subject?.trim() ?? '';
     if (!subject) return new ServiceResult(400);
-    const result = await this.consume(caller, input.confirmationToken, { issuer, subject });
+    if (!TOKEN_PATTERN.test(input.confirmationToken)) return new ServiceResult(400);
+    const result = await this.consume(caller, Hashing.sha256Hex(input.confirmationToken), {
+      issuer,
+      subject,
+    });
     if (result instanceof ServiceResult) return result;
     return new ServiceResult(200, {
       unlinked: true,
@@ -96,13 +101,16 @@ export class LinkService {
     });
   }
 
-  /** `POST /account/identity-links/unlink/start`: returns the token the session keeps. */
+  /**
+   * `POST /account/identity-links/unlink/start`: returns the SHA-256 hex of the confirmation token,
+   * which is all the session keeps. The raw token is never stored anywhere.
+   */
   async startUnlink(caller: AccountCaller, linkId: string): Promise<string | ServiceResult> {
     if (!this.recent(caller)) return new ServiceResult(403);
     const link = UUID.test(linkId) ? await this.links.findById(linkId) : undefined;
     if (!link || link.userId !== caller.userId) return new ServiceResult(403);
     const created = await this.createConfirmation(caller, link.issuer, link.subject);
-    return created instanceof ServiceResult ? created : created.token;
+    return created instanceof ServiceResult ? created : Hashing.sha256Hex(created.token);
   }
 
   /** The identity a live confirmation for this user and session points at. */
@@ -117,10 +125,16 @@ export class LinkService {
     return link ? this.view(link) : undefined;
   }
 
-  /** `POST /account/identity-links/unlink/confirm`. True when the identity was removed. */
-  async confirmUnlink(caller: AccountCaller, token: string | null | undefined): Promise<boolean> {
-    if (!token || !caller.sessionId) return false;
-    return !((await this.consume(caller, token)) instanceof ServiceResult);
+  /**
+   * `POST /account/identity-links/unlink/confirm` with the token hash from `startUnlink`. True when
+   * the identity was removed.
+   */
+  async confirmUnlink(
+    caller: AccountCaller,
+    tokenHash: string | null | undefined,
+  ): Promise<boolean> {
+    if (!tokenHash || !SHA256_HEX.test(tokenHash) || !caller.sessionId) return false;
+    return !((await this.consume(caller, tokenHash)) instanceof ServiceResult);
   }
 
   private recent(caller: AccountCaller): boolean {
@@ -159,11 +173,10 @@ export class LinkService {
   /** Single-use: the confirmation is deleted, in the same statement that reads it, before it is checked. */
   private async consume(
     caller: AccountCaller,
-    token: string,
+    tokenHash: string,
     expected?: { issuer: string; subject: string },
   ): Promise<IdentityLink | ServiceResult> {
-    if (!TOKEN_PATTERN.test(token)) return new ServiceResult(400);
-    const confirmation = await this.links.takeConfirmation(Hashing.sha256Hex(token));
+    const confirmation = await this.links.takeConfirmation(tokenHash);
     if (!confirmation) return new ServiceResult(400);
     if (
       confirmation.userId !== caller.userId ||

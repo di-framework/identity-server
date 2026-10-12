@@ -41,6 +41,7 @@ test('discovers the reused Flyway migrations in version order', async () => {
     ['14', 'varchar hashes'],
     ['15', 'concurrency indexes'],
     ['16', 'runtime secrets to secret'],
+    ['17', 'clear session secrets'],
   ]);
 });
 
@@ -65,6 +66,7 @@ test('applies the reused migrations and reads a user through UserRepository', as
       '14',
       '15',
       '16',
+      '17',
     ]);
 
     const again = await applyMigrations(db);
@@ -127,6 +129,7 @@ test('V12 unwraps metadata and session attributes stored as JSON string scalars'
         '14',
         '15',
         '16',
+        '17',
       ]);
       expect(
         await db.first<Record<string, unknown>>(
@@ -175,11 +178,58 @@ test('V16 removes runtime secrets from identity_runtime_secret and keeps bootstr
           'stored',
         ]);
       }
-      expect((await applyMigrations(db)).applied.map((record) => record.version)).toEqual(['16']);
+      expect((await applyMigrations(db)).applied.map((record) => record.version)).toEqual([
+        '16',
+        '17',
+      ]);
       expect(await db.query('SELECT name FROM identity_runtime_secret ORDER BY name')).toEqual([
         { name: 'bootstrap_client_fingerprints' },
         { name: 'bootstrap_fingerprint' },
         { name: 'bootstrap_lease' },
+      ]);
+    });
+  } finally {
+    rmSync(earlier, { recursive: true, force: true });
+  }
+}, 30_000);
+
+test('V17 removes raw secrets from existing browser session attributes', async () => {
+  const earlier = mkdtempSync(join(tmpdir(), 'identity-v16-'));
+  const root = join(earlier, 'migrations');
+  cpSync(migrationsDirectory, root, { recursive: true });
+  for (const name of readdirSync(root)) {
+    const version = /^V(\d+)__/.exec(name);
+    if (version && Number(version[1]) >= 17) rmSync(join(root, name));
+  }
+  try {
+    await withThrowawayDatabase('identity_v17_test', async (db) => {
+      await applyMigrations(db, root);
+      const insert = (id: string, attributes: Record<string, string>) =>
+        db.run(
+          `INSERT INTO browser_sessions (id, csrf_token, attributes, expires_at)
+           VALUES (?, 'csrf', ?::text::jsonb, now())`,
+          [id, JSON.stringify(attributes)],
+        );
+      await insert('a'.repeat(64), {
+        IDENTITY_CLIENT_SECRET_REVEAL: '{"clientId":"cli_1","secret":"s"}',
+        GSIO_IDENTITY_LINK_PENDING_TOKEN: 'raw-link',
+        GSIO_IDENTITY_UNLINK_CONFIRMATION_TOKEN: 'raw-unlink',
+        SPRING_SECURITY_SAVED_REQUEST: '/admin',
+      });
+      await insert('b'.repeat(64), { SPRING_SECURITY_SAVED_REQUEST: '/account' });
+      // Not objects: left as they are instead of failing the migration.
+      await db.run(
+        `INSERT INTO browser_sessions (id, csrf_token, attributes, expires_at)
+         VALUES (?, 'csrf', '"GSIO_IDENTITY_LINK_PENDING_TOKEN"'::jsonb, now()),
+                (?, 'csrf', '["IDENTITY_CLIENT_SECRET_REVEAL"]'::jsonb, now())`,
+        ['c'.repeat(64), 'd'.repeat(64)],
+      );
+      expect((await applyMigrations(db)).applied.map((record) => record.version)).toEqual(['17']);
+      expect(await db.query('SELECT id, attributes FROM browser_sessions ORDER BY id')).toEqual([
+        { id: 'a'.repeat(64), attributes: { SPRING_SECURITY_SAVED_REQUEST: '/admin' } },
+        { id: 'b'.repeat(64), attributes: { SPRING_SECURITY_SAVED_REQUEST: '/account' } },
+        { id: 'c'.repeat(64), attributes: 'GSIO_IDENTITY_LINK_PENDING_TOKEN' },
+        { id: 'd'.repeat(64), attributes: ['IDENTITY_CLIENT_SECRET_REVEAL'] },
       ]);
     });
   } finally {

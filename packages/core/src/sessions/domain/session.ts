@@ -1,10 +1,14 @@
 /** Browser session cookie (HttpOnly, `Secure` per settings, SameSite=Lax). */
 export const SESSION_COOKIE = 'identity_session';
 
-/** Session attribute names, kept from the auth server's servlet session. */
+/**
+ * Session attribute names. The link and unlink entries hold only the SHA-256 hex of their tokens,
+ * never a raw token that could complete the flow (#54); the names differ from the auth server's
+ * raw-token attributes, which `V17__clear_session_secrets.sql` removes from existing rows.
+ */
 export const SESSION_ATTRIBUTES = {
-  pendingLink: 'GSIO_IDENTITY_LINK_PENDING_TOKEN',
-  unlinkConfirmation: 'GSIO_IDENTITY_UNLINK_CONFIRMATION_TOKEN',
+  pendingLink: 'GSIO_IDENTITY_LINK_PENDING_TOKEN_HASH',
+  unlinkConfirmation: 'GSIO_IDENTITY_UNLINK_CONFIRMATION_TOKEN_HASH',
   savedRequest: 'SPRING_SECURITY_SAVED_REQUEST',
 } as const;
 
