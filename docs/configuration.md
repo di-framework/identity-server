@@ -358,7 +358,9 @@ required) runs:
    It prints the workload name, which is the config's `name`. Then `di-tenant-<tenant>` must have
    no Postgres `directory` BackingService (that tenant still runs the Postgres-era guest, as
    authproto's `identity` does; the check reads the cluster, so it holds whichever kubeconfig or
-   tenant was passed);
+   tenant was passed). The instance `authproto` is refused too, except for the signed-off cutover
+   into a new tenant, confirmed with `IDENTITY_AUTHPROTO_CUTOVER=authproto/<tenant>`
+   ([authproto cutover](guest-http-api.md#authproto-cutover));
 2. `di-framework platform build`, before anything on the cluster changes;
 3. `di-framework platform deploy <name> --target identity`;
 4. `bun deploy/guest/runtime-secrets.ts apply`, which repeats both checks, writes the whole

@@ -33,6 +33,9 @@
  *   kubeVersion            kube release tag, or `latest` (default: latest)
  *   kubeBinary             local di-framework-kube build instead of a release
  *   kubeInstance           kube instance name (default: identity)
+ *   cutoverConfirm         `authproto/<tenant>`: lets kubeInstance be authproto for a new tenant
+ *                          (docs/guest-http-api.md#authproto-cutover); still refused while the
+ *                          cluster has a `directory` BackingService
  *   kubeStateDir           kube --state-dir (default: kube's per-user directory)
  *   kubeconfig, context    install onto this existing cluster instead of Kubesolo
  *   httpPort               loopback gateway port of a new Kubesolo container (default: 28180)
@@ -111,7 +114,8 @@ if (!/^[a-z]([-a-z0-9]{0,40}[a-z0-9])?$/.test(TENANT)) {
 }
 
 /**
- * Before any resource: refuse `authproto`, and refuse a target cluster (the stack's `kubeconfig`,
+ * Before any resource: refuse `authproto` (unless `cutoverConfirm` is `authproto/<tenant>` for a
+ * new tenant, see assertInstanceAllowed), and refuse a target cluster (the stack's `kubeconfig`,
  * or the managed instance's kubeconfig in kube's state directory) that has a Postgres
  * `directory` BackingService in any namespace. `di-framework-kube up` would otherwise upgrade it
  * in place, and the tenant host patch and Mailpit would run before CliWorkload's own check. See
@@ -134,6 +138,8 @@ const kubeTarget = resolveKubeTarget(
 const preflight = preflightCluster(
   {
     instance: kubeTarget.instance,
+    tenant: TENANT,
+    cutoverConfirm: config.get('cutoverConfirm'),
     stateDir: kubeTarget.stateDir,
     kubeconfig: kubeTarget.kubeconfig,
     context: kubeTarget.context,

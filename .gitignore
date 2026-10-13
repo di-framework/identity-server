@@ -38,3 +38,6 @@ report.[0-9]_.[0-9]_.[0-9]_.[0-9]_.json
 **/openapi.yaml
 **/openapi.yml
 **/openapi.json
+
+# The cutover pglite runner (deploy/cutover/pglite-runner)
+deploy/cutover/pglite-runner/target

@@ -532,8 +532,195 @@ export async function applyRuntimeSecrets(
   return { names: Object.keys(options.values).sort(), revision: options.revision, pgliteKey };
 }
 
-/** The di-framework-kube instance that runs the Postgres-era guest; never a target here. */
+/** The di-framework-kube instance that runs the Postgres-era guest. */
 export const LEGACY_INSTANCE = 'authproto';
+/** The tenant the Postgres-era guest runs in on authproto; never a target. */
+export const LEGACY_TENANT = 'identity';
+/**
+ * Confirms the authproto cutover (docs/guest-http-api.md#authproto-cutover): the environment
+ * variable of deploy.sh and `runtime-secrets.ts guard`, and the Pulumi stack config
+ * `cutoverConfirm`. Its value must be `authproto/<tenant>`, naming the new tenant.
+ */
+export const CUTOVER_CONFIRM_ENV = 'IDENTITY_AUTHPROTO_CUTOVER';
+
+/** A tenant name: a DNS-1123 label, as Kubernetes namespaces `di-tenant-<tenant>` require. */
+const TENANT_NAME = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/;
+
+export function assertTenantName(tenant: string): void {
+  if (!TENANT_NAME.test(tenant)) {
+    throw new Error(`tenant ${JSON.stringify(tenant)} is not a DNS-1123 label; refusing`);
+  }
+}
+
+/**
+ * The signed-off cutover (docs/guest-http-api.md#authproto-cutover) for a target that runs the
+ * Postgres-era guest (`why` says how that was recognised): only a tenant other than `identity`,
+ * and only with `authproto/<tenant>` given exactly.
+ */
+export function assertCutoverConfirmed(
+  tenant: string,
+  confirmation: string | undefined,
+  why: string,
+): void {
+  assertTenantName(tenant);
+  if (tenant === LEGACY_TENANT) {
+    throw new Error(
+      `tenant ${LEGACY_TENANT} on ${LEGACY_INSTANCE} runs the Postgres-era identity guest; the cutover deploys into a new tenant (docs/guest-http-api.md#authproto-cutover). Refusing`,
+    );
+  }
+  const expected = `${LEGACY_INSTANCE}/${tenant}`;
+  if (confirmation !== expected) {
+    throw new Error(
+      `${why}; deploying there is the cutover in docs/guest-http-api.md#authproto-cutover. To confirm it for the new tenant, set ${CUTOVER_CONFIRM_ENV}=${expected}. Refusing`,
+    );
+  }
+}
+
+/**
+ * Whether a deploy may target `instance` and `tenant` by name (the Pulumi preflight; deploy.sh
+ * and runtime-secrets.ts use `assertDeployTarget`, which also reads the cluster). Any instance
+ * but authproto passes; authproto only as the confirmed cutover.
+ */
+export function assertInstanceAllowed(
+  instance: string,
+  tenant: string,
+  confirmation: string | undefined,
+): 'other-instance' | 'authproto-cutover' {
+  assertTenantName(tenant);
+  if (instance !== LEGACY_INSTANCE) return 'other-instance';
+  assertCutoverConfirmed(
+    tenant,
+    confirmation,
+    `${LEGACY_INSTANCE} runs the Postgres-era identity guest`,
+  );
+  return 'authproto-cutover';
+}
+
+/** `server:` of a kubeconfig's first cluster, or undefined. */
+export function kubeconfigServer(text: string): string | undefined {
+  return /^\s*server:\s*["']?([^\s"']+)/m.exec(text)?.[1];
+}
+
+/**
+ * Whether `kubeconfig` points at authproto whatever the instance argument says: it is
+ * authproto's kubeconfig in kube's state directory, or it names the same API server.
+ *
+ * The server match is textual and reads only the first `server:` line of each file: an alias of
+ * the same address (`localhost` for `127.0.0.1`, another port forward) or a multi-cluster
+ * kubeconfig used with `--context` does not match. While a `directory` BackingService exists the
+ * cluster-wide check in `assertDeployTarget` still recognises authproto; after it is retired only
+ * the instance name, this path and this server match do.
+ */
+export function kubeconfigIsLegacy(
+  kubeconfig: string,
+  io: { stateDir: string; resolve(path: string): string; read(path: string): string | undefined },
+): boolean {
+  const legacy = io.resolve(`${io.stateDir}/${LEGACY_INSTANCE}/kubeconfig`);
+  if (io.resolve(kubeconfig) === legacy) return true;
+  const legacyServer = kubeconfigServer(io.read(legacy) ?? '');
+  const server = kubeconfigServer(io.read(kubeconfig) ?? '');
+  return legacyServer !== undefined && server === legacyServer;
+}
+
+/** The exclusive-instance tenant host build the pglite guest needs. */
+const EXCLUSIVE_HOST_IMAGE = /(^|\/)wash:[^\s@]*exclusive/;
+
+/**
+ * deploy.sh's and runtime-secrets.ts's check of the target, before anything changes:
+ *
+ * - the tenant name is a DNS-1123 label;
+ * - the target is treated as authproto when the instance is named `authproto`, when the
+ *   kubeconfig is authproto's (`legacyKubeconfig`), or when the cluster has a `directory`
+ *   BackingService in any namespace, as the Pulumi preflight does. Then the cutover must be
+ *   confirmed for this tenant, and the tenant's host must run the exclusive-instance wash build;
+ * - a tenant developer kubeconfig may not list BackingServices cluster-wide. When that list is
+ *   Forbidden and neither the instance nor the kubeconfig names authproto, the cluster-wide check
+ *   is skipped (and `warn` says so); a Forbidden list on a target named authproto, and any other
+ *   failed list, refuses;
+ * - the tenant itself must not have the `directory` BackingService.
+ *
+ * Every failed kubectl call refuses.
+ */
+export async function assertDeployTarget(
+  kubectl: Kubectl,
+  target: {
+    instance?: string;
+    tenant: string;
+    confirmation: string | undefined;
+    legacyKubeconfig: boolean;
+    /** Told when the cluster-wide check is skipped (a forbidden list, see below). */
+    warn?: (line: string) => void;
+  },
+): Promise<'other-target' | 'authproto-cutover'> {
+  assertTenantName(target.tenant);
+  const listed = await kubectl([
+    'get',
+    'backingservices.platform.di-framework.dev',
+    '--all-namespaces',
+    '-o',
+    'jsonpath={range .items[*]}{.metadata.namespace}/{.metadata.name}{"\\n"}{end}',
+  ]);
+  // A tenant developer kubeconfig (namespaced Role di-developer) may not list cluster-wide. Only
+  // then, and only for a target not already recognised as authproto, the per-tenant check below
+  // stands alone; every other failure refuses.
+  const forbidden = listed.code !== 0 && /\bForbidden\b/i.test(listed.stderr);
+  const named = target.instance === LEGACY_INSTANCE || target.legacyKubeconfig;
+  if (listed.code !== 0 && (!forbidden || named)) {
+    throw new Error(
+      `cannot list BackingServices (kubectl exit ${listed.code}${forbidden ? ', Forbidden' : ''}); refusing to deploy`,
+    );
+  }
+  if (forbidden) {
+    target.warn?.(
+      `this kubeconfig may not list BackingServices in every namespace; skipped the cluster-wide \`${LEGACY_DATABASE}\` check, checking di-tenant-${target.tenant} only`,
+    );
+  }
+  const directories = (forbidden ? '' : listed.stdout)
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line.endsWith(`/${LEGACY_DATABASE}`));
+  const reasons = [
+    ...(target.instance === LEGACY_INSTANCE ? [`the instance is ${LEGACY_INSTANCE}`] : []),
+    ...(target.legacyKubeconfig ? [`the kubeconfig is ${LEGACY_INSTANCE}'s`] : []),
+    ...(directories.length > 0
+      ? [`the cluster has the Postgres BackingService ${directories.join(', ')}`]
+      : []),
+  ];
+  if (reasons.length > 0) {
+    assertCutoverConfirmed(
+      target.tenant,
+      target.confirmation,
+      `${reasons.join(' and ')}, so the target runs the Postgres-era identity guest`,
+    );
+  }
+  await refuseLegacyTenant(kubectl, `di-tenant-${target.tenant}`);
+  if (reasons.length === 0) return 'other-target';
+  const image = await kubectl([
+    '--namespace',
+    `di-runtime-${target.tenant}`,
+    'get',
+    'deployment',
+    `hostgroup-tenant-${target.tenant}`,
+    '-o',
+    'jsonpath={.spec.template.spec.containers[*].image}',
+  ]);
+  const images = image.stdout.trim().split(/\s+/).filter(Boolean);
+  if (image.code !== 0 || !images.some((name) => EXCLUSIVE_HOST_IMAGE.test(name))) {
+    throw new Error(
+      `the tenant host of ${target.tenant} does not run the exclusive-instance wash build (${images.join(', ') || `kubectl exit ${image.code}`}); the pglite guest needs it. Refusing`,
+    );
+  }
+  return 'authproto-cutover';
+}
+
+/** `JSON.parse` whose error names `what` and the size, never the input (it may be a secret). */
+export function parseJsonQuietly<T>(text: string, what: string): T {
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    throw new Error(`${what} is not JSON (${Buffer.byteLength(text)} bytes)`);
+  }
+}
 
 /** kubectl run synchronously, for checks at Pulumi program evaluation, before any resource. */
 export type SyncKubectl = (
@@ -545,6 +732,10 @@ export type SyncKubectl = (
 export interface PreflightTarget {
   /** di-framework-kube instance name (`kubeInstance`). */
   instance: string;
+  /** The stack's tenant. */
+  tenant: string;
+  /** Stack config `cutoverConfirm`: `authproto/<tenant>` for the signed-off cutover. */
+  cutoverConfirm?: string;
   /** kube `--state-dir`; kube's default (`os.UserConfigDir()/di-framework-kube`) when unset. */
   stateDir: string;
   /** `kubeconfig` and `context` of an existing cluster, instead of the managed instance's. */
@@ -572,7 +763,10 @@ export function defaultKubeStateDir(
  * upgrades a managed instance in place and replaces its tenant declarations and host image),
  * the tenant host patches and Mailpit.
  *
- * - The instance name `authproto` is refused outright.
+ * - The instance name `authproto` is refused unless the cutover is confirmed for a new tenant
+ *   (`assertInstanceAllowed`). Even then the next check refuses it while authproto still has the
+ *   `directory` BackingService: `kube up` would rewrite that install, tenant `identity`
+ *   included. The cutover deploys with deploy/guest/deploy.sh instead.
  * - The target cluster is the stack's `kubeconfig`, or else the managed instance's kubeconfig in
  *   kube's state directory. A managed instance whose directory does not exist yet is new and has
  *   nothing to protect. One that exists without a kubeconfig is refused (fail closed).
@@ -585,11 +779,7 @@ export function preflightCluster(
   target: PreflightTarget,
   io: { exists(path: string): boolean; kubectl: SyncKubectl },
 ): 'new-instance' | 'checked' {
-  if (target.instance === LEGACY_INSTANCE) {
-    throw new Error(
-      `kubeInstance ${LEGACY_INSTANCE} runs the Postgres-era identity guest; deploying there is the cutover in docs/guest-http-api.md#authproto-cutover. Refusing`,
-    );
-  }
+  assertInstanceAllowed(target.instance, target.tenant, target.cutoverConfirm);
   let kubeconfig = target.kubeconfig;
   if (kubeconfig === undefined) {
     const instanceDir = `${target.stateDir}/${target.instance}`;

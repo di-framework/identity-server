@@ -12,12 +12,21 @@
 # The variables di-framework.deploy.toml interpolates for target `identity` default to the
 # instance's admin kubeconfig and the in-cluster `examples-registry` behind a port-forward on
 # REGISTRY_FORWARD_PORT; override any of them through the environment. A tenant developer
-# kubeconfig works too: the Secret steps only create and replace.
+# kubeconfig works too: the Secret steps only create and replace, and since its namespaced Role
+# may not list BackingServices in every namespace, the guard then skips the cluster-wide
+# `directory` check with a warning and checks di-tenant-<tenant> only. It does not skip it for a
+# target named authproto (the instance, or authproto's kubeconfig by path or API server): there a
+# forbidden list refuses, so the cutover needs the admin kubeconfig.
 #
 # The script refuses a tenant whose di-tenant-<tenant> namespace still has the Postgres
 # `directory` BackingService, i.e. the Postgres-era guest on authproto, however the kubeconfig and
-# tenant were chosen. Replacing that guest is the signed-off cutover in
-# docs/guest-http-api.md#authproto-cutover.
+# tenant were chosen. It treats the target as authproto when the instance is named `authproto`,
+# when the kubeconfig is authproto's (its path in kube's state directory, or the same API server),
+# or when the cluster has a `directory` BackingService in any namespace, whatever the instance
+# argument says. Such a target is refused except for the signed-off cutover
+# (docs/guest-http-api.md#authproto-cutover): a new tenant (never `identity`), confirmed with
+# exactly IDENTITY_AUTHPROTO_CUTOVER=authproto/<tenant> in the environment, whose tenant host runs
+# the exclusive-instance wash build. The check runs before the build, so a refusal changes nothing.
 #
 # The workload, and its `<workload>-control` Secret, are named by `name` in
 # apps/guest/di-framework.config.json. That config encrypts the data directory at rest
@@ -52,13 +61,11 @@ if [ -z "$instance" ] || [ -z "$tenant" ] || [ -z "$values" ]; then
   echo "usage: $0 <instance> <tenant> <values-file>" >&2
   exit 2
 fi
-if [ "$instance" = authproto ]; then
-  echo "refusing to deploy the pglite guest to authproto; see docs/guest-http-api.md#authproto-cutover" >&2
-  exit 2
-fi
 
 root="$(cd "$(dirname "$0")/../.." && pwd)"
 state_dir="${DI_FRAMEWORK_KUBE_STATE_DIR:-$HOME/Library/Application Support/di-framework-kube}"
+# runtime-secrets.ts guard recognises authproto's kubeconfig in the same state directory.
+export DI_FRAMEWORK_KUBE_STATE_DIR="$state_dir"
 secrets="$root/deploy/guest/runtime-secrets.ts"
 
 export IDENTITY_TENANT="$tenant"
@@ -69,8 +76,9 @@ export IDENTITY_REGISTRY_PULL="${IDENTITY_REGISTRY_PULL:-examples-registry.wasmc
 
 # Values file (mode 0600, known names) against the guest config; prints the workload name.
 workload="$(bun "$secrets" preflight --values "$values")"
-# The target tenant must not run the Postgres-era guest.
-bun "$secrets" guard --kubeconfig "$IDENTITY_KUBECONFIG" --context "$IDENTITY_KUBE_CONTEXT" --tenant "$tenant"
+# The target tenant must not run the Postgres-era guest; authproto (by name, kubeconfig or
+# cluster) only as the confirmed cutover.
+bun "$secrets" guard --instance "$instance" --kubeconfig "$IDENTITY_KUBECONFIG" --context "$IDENTITY_KUBE_CONTEXT" --tenant "$tenant"
 
 # Build before touching the cluster, so a build failure leaves the running guest and its Secret.
 (cd "$root/apps/guest" && di-framework platform build)
