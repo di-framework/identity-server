@@ -378,7 +378,9 @@ tenant** on authproto, and keep the issuer by moving its host to the new tenant 
 **gateway route alias** (decided 2026-10-13). The tools below are proven offline against a
 synthetic Postgres-era database, and the whole runbook, platform upgrade, route switch and
 rollback included, ran end to end on the `pgprove` rehearsal instance (see
-[Proof](#proof-of-the-cutover-tooling)). Nothing here has run against authproto yet. It needs
+[Proof](#proof-of-the-cutover-tooling)), except one dependency pgprove did not have: authproto's
+tenant-auth pods discover the issuer that is being cut over. Nothing here has run against
+authproto yet. It needs
 `@di-framework/platform` 6.0.13 and `di-framework-kube` v0.0.5 or later ([Runbook](#runbook)).
 
 #### What moves, and how
@@ -501,6 +503,18 @@ up_platform() {
 # directory's Postgres pod, for the read-only checks below and step 2.
 POD="$(kubectl --kubeconfig "$KC" -n di-runtime-identity get pods -l app=di-bs-directory -o jsonpath='{.items[0].metadata.name}')"
 psql_directory() { kubectl --kubeconfig "$KC" -n di-runtime-identity exec "$POD" -- psql -X -A -t -U app -d app -c "$1"; }
+# Every Tenant's TenantAuthReady, each tenant-auth Deployment's readiness, and its pods with their
+# restart counts, sorted. Two snapshots compared with diff show any restart (a new pod name too).
+tenant_auth_state() {
+  for t in $(kubectl --kubeconfig "$KC" get tenants.platform.di-framework.dev -o jsonpath='{.items[*].metadata.name}'); do
+    echo "tenant $t TenantAuthReady=$(kubectl --kubeconfig "$KC" get tenants.platform.di-framework.dev "$t" -o 'jsonpath={.status.conditions[?(@.type=="TenantAuthReady")].status}')"
+    for d in tenant-controller tenant-console; do
+      echo "deploy di-runtime-$t/$d ready=$(kubectl --kubeconfig "$KC" -n "di-runtime-$t" get deploy "$d" -o 'jsonpath={.status.readyReplicas}/{.spec.replicas}')"
+    done
+    kubectl --kubeconfig "$KC" -n "di-runtime-$t" get pods -l 'app in (tenant-controller,tenant-console)' -o json \
+      | jq -r '.items[] | "pod \(.metadata.namespace)/\(.metadata.name) ready=\([.status.containerStatuses[]?.ready] | all) restarts=\([.status.containerStatuses[]?.restartCount] | add // 0)"'
+  done | LC_ALL=C sort
+}
 ```
 
 The confirmation the guard wants is literally `IDENTITY_AUTHPROTO_CUTOVER=authproto/<tenant>`:
@@ -587,32 +601,51 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
        (`--node-port`, `--namespace`, `--release`, `--chart-version`, `--kubesolo-version`,
        `--run-mode`) to `up_platform`. If you cannot tell why it differs, STOP.
     2. **The exclusive host image.** The pglite guest needs the exclusive-instance wash build,
-       which also carries wash patch 0002 (`--insecure-registry`). The kube CLI's default tenant
-       host image predates 0002, and the platform refuses it together with `insecureRegistries`,
-       so `tenantHostImage` must name the exclusive build explicitly. Pin it by digest:
+       which also carries wash patch 0002 (`--insecure-registry`, which `insecureRegistries`
+       needs). The kube CLI's default tenant host image is not the exclusive build (and before
+       v0.0.5 it predated 0002, which the platform refuses together with `insecureRegistries`),
+       so `tenantHostImage` must name the exclusive build explicitly. Pin it by digest, and check
+       the digest, since a failed fetch leaves `@` or `@null`:
        ```sh
-       HOST_IMAGE="ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@$(oras manifest fetch --descriptor ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive | jq -r .digest)"
+       HOST_DIGEST="$(oras manifest fetch --descriptor ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive | jq -r .digest)"
+       printf '%s\n' "$HOST_DIGEST" | grep -Eqx 'sha256:[0-9a-f]{64}' && echo 'digest ok' || echo "STOP: no digest: $HOST_DIGEST"
+       HOST_IMAGE="ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@$HOST_DIGEST"
        ```
+       The digest is the multi-arch index's, which is what a pod's `imageID` reports when the
+       image is pulled by this reference (so it is also the value for
+       `IDENTITY_EXCLUSIVE_HOST_DIGEST`, below). The builder (item 3) refuses an image without a
+       valid digest too.
        Switching the image restarts **every** tenant host (`acme` and the old guest's
        `identity` too). The user accepted that blip. Item 6 proves the old guest on the new
        image before the freeze, so a rollback restores it onto an image it has run on.
     3. **Build the two config files** from the instance's stack config, carrying every key `up`
-       would otherwise drop, and adding tenant `$NEW`, user `$PUSHER` (a member of `$NEW` only,
-       for the push in step 8), the host image and the plain-HTTP registry:
+       would otherwise drop, and adding tenant `$NEW` (with `coreInstances: 300`, as tenant
+       `identity` declares; nothing here was load-tested with fewer), user `$PUSHER` (a member of
+       `$NEW` only, for the push in step 8), the host image and the plain-HTTP registry. `up`
+       rewrites the whole stack config from the file and its flags and drops every other key, so
+       the builder refuses a stack with any key outside those two sets, whether set by hand
+       under `di-framework-kube:` or in another namespace:
        ```sh
        umask 077
        STATE="$STATE" NEW="$NEW" PUSHER="$PUSHER" HOST_IMAGE="$HOST_IMAGE" OUT="$OUT" bun -e '
        const { STATE, NEW, PUSHER, HOST_IMAGE, OUT } = process.env;
        const stop = (why) => { console.error(`STOP: ${why}`); process.exit(1); };
-       // The keys di-framework-kube passes from --platform-config (kube internal/platform/pulumi.go).
+       // What `up` writes to the stack (kube internal/platform/pulumi.go): the --platform-config allowlist,
+       // and the keys it derives from its flags and the instance. It drops every other key.
        const KEYS = ["tenants", "users", "tenantHostImage", "tenantHostImagePullPolicy", "networkPolicyEngine",
          "storageRoot", "egressAllowedDestinations", "routeAliases", "tenantAuth", "insecureRegistries",
          "backingServiceClasses", "seedDefaultBackingClasses"];
+       const FLAG_KEYS = ["kubeconfig", "context", "namespace", "release", "chart", "chartVersion", "httpNodePort",
+         "timeoutSeconds", "insecureRegistry", "values", "kubernetesEndpoint", "httpEndpoint"];
        const TEXT = new Set(["tenantHostImage", "tenantHostImagePullPolicy", "networkPolicyEngine", "storageRoot"]);
+       if (!/^[^@\s]+@sha256:[0-9a-f]{64}$/.test(HOST_IMAGE ?? "")) stop(`HOST_IMAGE is not pinned by a sha256 digest: ${HOST_IMAGE}`);
        const stack = Bun.YAML.parse(await Bun.file(`${STATE}/platform/Pulumi.dev.yaml`).text()).config ?? {};
+       const PREFIX = "di-framework-kube:";
+       const dropped = Object.keys(stack).filter((k) => !k.startsWith(PREFIX) || ![...KEYS, ...FLAG_KEYS].includes(k.slice(PREFIX.length)));
+       if (dropped.length > 0) stop(`up would delete these stack keys: ${dropped.join(", ")}`);
        const config = {};
        for (const key of KEYS) {
-         let value = stack[`di-framework-kube:${key}`];
+         let value = stack[PREFIX + key];
          if (value === undefined) continue;
          if (value !== null && typeof value === "object" && "secure" in value) stop(`${key} is a Pulumi secret`);
          // A key set by hand with `pulumi config set` (tenantAuth on authproto) is stored as JSON text.
@@ -621,12 +654,15 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
        }
        if (Object.keys(config.routeAliases ?? {}).length > 0) stop("the stack already has routeAliases");
        delete config.routeAliases;
-       if (!config.tenantAuth?.registry) stop("tenantAuth.registry is not set, so tenant " + NEW + " gets no registry");
+       if (!config.tenantAuth?.registry) stop(`tenantAuth.registry is not set, so tenant ${NEW} gets no registry`);
+       // up fills these two for a managed instance when the file lacks them; name them so the file is complete.
+       config.networkPolicyEngine ??= "kube-router";
+       config.storageRoot ??= "/var/lib/kubesolo";
        config.tenants ??= [];
        config.users ??= [];
        if (config.tenants.some((t) => t.name === NEW)) stop(`tenant ${NEW} is already declared`);
        if (config.users.some((u) => u.name === PUSHER)) stop(`user ${PUSHER} is already declared; pick a new name`);
-       config.tenants.push({ name: NEW });
+       config.tenants.push({ name: NEW, runtime: { coreInstances: 300 } });   // as tenant identity
        config.users.push({ name: PUSHER, memberships: [{ tenant: NEW, role: "developer" }] });
        config.tenantHostImage = HOST_IMAGE;
        config.insecureRegistries = [...new Set([...(config.insecureRegistries ?? []),
@@ -634,15 +670,18 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
        const write = (name, value) => Bun.write(`${OUT}/${name}`, JSON.stringify(value, null, 2) + "\n");
        await write("platform.json", config);
        await write("platform-alias.json", { ...config, routeAliases: { "identity.identity": `identity.${NEW}` } });
-       // What `up` derives from its flags rather than from the file: compare with `up --help`.
-       for (const key of ["namespace", "release", "chart", "chartVersion", "httpNodePort", "httpEndpoint", "insecureRegistry", "values"])
-         console.log(`${key}: ${JSON.stringify(stack[`di-framework-kube:${key}`])}`);
+       // What up derives from its flags and the instance: compare with item 1 and `up --help`.
+       for (const key of FLAG_KEYS) console.log(`${key}: ${JSON.stringify(stack[PREFIX + key])}`);
        '
        ```
-       Any `STOP:` line: stop. The printed flag-derived keys must agree with item 1
-       (`httpEndpoint` is `http://127.0.0.1:$HTTP_PORT`, `values` is `{}`; anything else means the
-       instance was brought up with `--values` files, which `up_platform` must then pass with
-       `-f`). Review both files by eye: they hold no secret (`tenantAuth` names its OAuth Secret,
+       Any `STOP:` line: stop. For a key `up` would delete, find out who set it and why before
+       going on; never delete it by hand to get past the check. The builder prints every
+       flag-derived key, which must agree with item 1 and with what `up_platform` passes:
+       `kubeconfig` is `$KC`, `context` is empty or `$CTX`, `kubernetesEndpoint` the API server
+       in `$KC`, `httpEndpoint` `http://127.0.0.1:$HTTP_PORT`, `insecureRegistry` `true` (it
+       becomes `true` in any case), `timeoutSeconds` whatever the last `up` used (it becomes
+       1200), and `values` `{}` (anything else means the instance was brought up with `--values`
+       files, which `up_platform` must then pass with `-f`). Review both files by eye: they hold no secret (`tenantAuth` names its OAuth Secret,
        it does not contain it), but they are the whole platform declaration from now on.
 
        Two rules shape these files. **Tenant `$NEW` is created by declaring it here, never with
@@ -670,37 +709,52 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
        ```
        The second command prints every registry that is neither allowlisted nor known to be TLS
        (GHCR, and the platform's own `tenant-registry.di-runtime-<tenant>.svc` pull listener).
-       For each line, find out how that registry is served. A plain-HTTP one goes into
+       A reference without a registry host (`library/foo`, implicitly Docker Hub) is printed too,
+       under its first path segment, so that it gets a look. For each line, find out how that
+       registry is served. A plain-HTTP one goes into
        `insecureRegistries`, spelled exactly as the reference spells it (wash matches it
        case-sensitively, with no default port), after which you rebuild the files (item 3,
        adding it to the list there). A TLS one needs nothing. If you cannot tell, STOP.
-    5. **Preview on a copy** of the project and its state, never on the instance itself:
+    5. **Preview on a copy** of the project and its state, never on the instance itself. The
+       function rebuilds the copy's stack config the way `up` does: the file's keys, plus the
+       flag-derived keys (as the stack holds them, with `timeoutSeconds` and `insecureRegistry`
+       as `up_platform` sets them), and nothing else:
        ```sh
-       PREVIEW="$OUT/preview"      # holds the stack's state and passphrase: same care as $OUT
-       rm -rf "$PREVIEW" && cp -Rp "$STATE/platform" "$PREVIEW"
-       PREVIEW="$PREVIEW" CONFIG="$OUT/platform.json" PACKAGE="$PLATFORM_PACKAGE" bun -e '
-       const { PREVIEW, CONFIG, PACKAGE } = process.env;
-       const KEYS = ["tenants", "users", "tenantHostImage", "tenantHostImagePullPolicy", "networkPolicyEngine",
-         "storageRoot", "egressAllowedDestinations", "routeAliases", "tenantAuth", "insecureRegistries",
-         "backingServiceClasses", "seedDefaultBackingClasses"];
-       const read = async (name) => Bun.YAML.parse(await Bun.file(`${PREVIEW}/${name}`).text());
-       const project = await read("Pulumi.yaml");
-       project.backend = { url: Bun.pathToFileURL(`${PREVIEW}/state`).href };   // the copy, not the instance
-       const pkg = await read("package.json");
-       pkg.dependencies["@di-framework/platform"] = PACKAGE.replace(/^@di-framework\/platform@/, "");
-       const stack = await read("Pulumi.dev.yaml");
-       for (const key of KEYS) delete stack.config[`di-framework-kube:${key}`];
-       for (const [key, value] of Object.entries(JSON.parse(await Bun.file(CONFIG).text())))
-         stack.config[`di-framework-kube:${key}`] = value;
-       stack.config["di-framework-kube:insecureRegistry"] = true;
-       stack.config["di-framework-kube:timeoutSeconds"] = 1200;
-       for (const [name, value] of [["Pulumi.yaml", project], ["package.json", pkg], ["Pulumi.dev.yaml", stack]])
-         await Bun.write(`${PREVIEW}/${name}`, JSON.stringify(value, null, 2) + "\n");
-       '
-       (cd "$PREVIEW" && npm install --no-audit --no-fund >/dev/null \
-         && PULUMI_CONFIG_PASSPHRASE_FILE="$PREVIEW/.passphrase" PULUMI_BACKEND_URL="$(jq -r .backend.url Pulumi.yaml)" \
-           pulumi preview --stack dev --diff --non-interactive) > "$OUT/preview.txt" 2>&1
-       rm -rf "$PREVIEW"
+       # preview_platform <config file> <report file>: `pulumi preview` of what `up_platform <config file>`
+       # would apply, on a copy of the instance's project and state.
+       preview_platform() {
+         PREVIEW="$OUT/preview"      # holds the stack's state and passphrase: same care as $OUT
+         rm -rf "$PREVIEW" && cp -Rp "$STATE/platform" "$PREVIEW" || return 1
+         PREVIEW="$PREVIEW" CONFIG="$1" PACKAGE="$PLATFORM_PACKAGE" bun -e '
+         const { PREVIEW, CONFIG, PACKAGE } = process.env;
+         // Rebuild the stack config as `up` does: the file, plus the keys up derives from its flags
+         // (the stack holds what the instance was brought up with; P2 item 1 checks they still match).
+         const FLAG_KEYS = ["kubeconfig", "context", "namespace", "release", "chart", "chartVersion", "httpNodePort",
+           "timeoutSeconds", "insecureRegistry", "values", "kubernetesEndpoint", "httpEndpoint"];
+         const read = async (name) => Bun.YAML.parse(await Bun.file(`${PREVIEW}/${name}`).text());
+         const project = await read("Pulumi.yaml");
+         project.backend = { url: Bun.pathToFileURL(`${PREVIEW}/state`).href };   // the copy, not the instance
+         const pkg = await read("package.json");
+         pkg.dependencies["@di-framework/platform"] = PACKAGE.replace(/^@di-framework\/platform@/, "");
+         const stack = await read("Pulumi.dev.yaml");
+         const config = {};
+         for (const key of FLAG_KEYS)
+           if (stack.config[`di-framework-kube:${key}`] !== undefined) config[`di-framework-kube:${key}`] = stack.config[`di-framework-kube:${key}`];
+         config["di-framework-kube:timeoutSeconds"] = 1200;      // --timeout 20m
+         config["di-framework-kube:insecureRegistry"] = true;    // --allow-insecure-registries
+         for (const [key, value] of Object.entries(JSON.parse(await Bun.file(CONFIG).text())))
+           config[`di-framework-kube:${key}`] = value;
+         stack.config = config;
+         for (const [name, value] of [["Pulumi.yaml", project], ["package.json", pkg], ["Pulumi.dev.yaml", stack]])
+           await Bun.write(`${PREVIEW}/${name}`, JSON.stringify(value, null, 2) + "\n");
+         ' && (cd "$PREVIEW" && npm install --no-audit --no-fund >/dev/null \
+           && PULUMI_CONFIG_PASSPHRASE_FILE="$PREVIEW/.passphrase" PULUMI_BACKEND_URL="$(jq -r .backend.url Pulumi.yaml)" \
+             pulumi preview --stack dev --diff --non-interactive) > "$2" 2>&1
+         status=$?   # the copy goes even when a step failed
+         rm -rf "$PREVIEW"
+         return "$status"
+       }
+       preview_platform "$OUT/platform.json" "$OUT/preview.txt" || echo 'STOP: the preview failed'
        ```
        The only changes allowed are:
        - **create:** Namespaces `di-tenant-$NEW` and `di-runtime-$NEW`, Tenant `$NEW`, and
@@ -721,9 +775,25 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
        up_platform "$OUT/platform.json"
        ```
        If it fails, follow the rules above: `up_platform "$OUT/platform.json"` again once the
-       cause is fixed, never a plain `up`. Then wait for the new tenant's auth pair and registry,
-       and for every tenant host to run the new image:
+       cause is fixed, never a plain `up`. Then wait in this order. The image switch restarts the
+       old guest's host, and the tenant-auth pods find the issuer (the old guest, see "The frozen
+       issuer" below) only once it serves again, so the old guest comes first:
        ```sh
+       # a. every tenant host rolled onto the new image
+       for t in $(jq -r '.tenants[].name' "$OUT/platform.json"); do
+         kubectl --kubeconfig "$KC" -n "di-runtime-$t" rollout status "deploy/hostgroup-tenant-$t" --timeout=600s
+         kubectl --kubeconfig "$KC" -n "di-runtime-$t" get deploy "hostgroup-tenant-$t" -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}'
+       done
+       # b. the old guest serves again, with the same issuer and key (the host pulls the component first)
+       served=
+       for i in $(seq 1 60); do   # up to 10 minutes
+         served="$(curl -s -m 10 -H 'Host: identity.identity.localhost' "$GW/.well-known/openid-configuration" | jq -r .issuer 2>/dev/null)"
+         [ "$served" = "$ISSUER" ] && break
+         sleep 10
+       done
+       echo "issuer: $served"
+       curl -s -H 'Host: identity.identity.localhost' "$GW/oauth2/jwks" | jq -r '.keys[].kid'   # must print $OLD_KID
+       # c. tenant $NEW's auth pair and registry
        kubectl --kubeconfig "$KC" wait "tenants.platform.di-framework.dev/$NEW" --for=condition=TenantAuthReady --timeout=600s
        registry=
        for i in $(seq 1 120); do   # up to 10 minutes; `kubectl wait` has exited early on WorkloadDeployments
@@ -732,18 +802,40 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
          sleep 5
        done
        [ "$registry" = True ] && echo 'tenant registry Ready' || echo 'tenant registry NOT Ready: STOP'
-       for t in $(jq -r '.tenants[].name' "$OUT/platform.json"); do
-         kubectl --kubeconfig "$KC" -n "di-runtime-$t" rollout status "deploy/hostgroup-tenant-$t" --timeout=600s
-         kubectl --kubeconfig "$KC" -n "di-runtime-$t" get deploy "hostgroup-tenant-$t" -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}'
-       done
        ```
-       Every host must list `$HOST_IMAGE`. Then prove that the old guest and `acme` run on it:
-       `curl -s -H 'Host: identity.identity.localhost' "$GW/.well-known/openid-configuration" | jq -r .issuer`
-       must print `$ISSUER`, the same JWKS request as in P1 must print `$OLD_KID`, and
-       WorkloadDeployments `identity` in `di-tenant-identity` and `greeter-staging` in
+       Every host must list `$HOST_IMAGE`, the issuer must be `$ISSUER` and the kid `$OLD_KID`,
+       and WorkloadDeployments `identity` in `di-tenant-identity` and `greeter-staging` in
        `di-tenant-acme` must be `Ready`. If anything fails, STOP before the freeze: the old guest
        is still the only guest. Fix the file and `up_platform` again; the project copy in
        `$OUT/platform-before-upgrade` records the previous stack config.
+    7. **Tenant-auth gate.** Every Tenant must be `TenantAuthReady` and every tenant-auth
+       Deployment (`tenant-controller` and `tenant-console` in each `di-runtime-*`) Ready. A pod
+       the upgrade rolled while the old guest was down retries discovery for about 4 minutes,
+       then crash-loops with a growing back-off, so give it time after item 6b:
+       ```sh
+       for i in $(seq 1 40); do   # up to 10 minutes after the old guest serves
+         tenant_auth_state > "$OUT/tenant-auth.now"
+         grep -Ev 'TenantAuthReady=True$| ready=(1/1|/0)$| ready=true restarts=[0-9]+$' "$OUT/tenant-auth.now" || break
+         sleep 15
+       done
+       cat "$OUT/tenant-auth.now"
+       ```
+       The `grep` prints what is not ready yet; the loop ends when it prints nothing. If a pod is
+       still in `CrashLoopBackOff` after that (it exhausted its discovery budget while the old
+       guest was down), restart it once, now that the guest serves:
+       `kubectl --kubeconfig "$KC" -n di-runtime-<tenant> rollout restart deploy/<tenant-controller|tenant-console>`,
+       and run the loop again. If it still fails, STOP. Once the `grep` prints nothing, record
+       the baseline that the frozen window is checked against:
+       `cp "$OUT/tenant-auth.now" "$OUT/tenant-auth.baseline"`.
+    8. **Preview the switch** against the upgraded stack, still before the freeze, so step 10 is
+       known to change only the gateway:
+       ```sh
+       preview_platform "$OUT/platform-alias.json" "$OUT/preview-alias.txt" || echo 'STOP: the preview failed'
+       ```
+       The only changes allowed: the gateway's ConfigMap (replace) and `di-platform-gateway`
+       (its config hash annotation, so it rolls). In particular nothing may touch
+       `di-platform-controller` or any tenant-auth Deployment: they could not start again during
+       the freeze. Anything else is a STOP.
 
     `deploy.sh` (through `runtime-secrets.ts guard`) refuses the cutover unless `$NEW`'s host
     runs the exclusive build, and that check is by **name only**: some image in the Deployment's
@@ -756,11 +848,28 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
     malformed value or no running host pod. Read the digest from a host pod you trust:
     `kubectl --kubeconfig "$KC" -n "di-runtime-$NEW" get pods -o jsonpath='{.items[*].status.containerStatuses[*].imageID}'`.
 
-    `tenantAuth.issuer` on authproto may be `$ISSUER` itself (`jq -r .tenantAuth.issuer "$OUT/platform.json"`).
-    A tenant controller reads the issuer's discovery document when it starts, so between the
-    freeze (step 2) and the switch (step 10) restart no tenant controller and run no `up` but
-    step 10's (and rollback step 2's), which roll only the gateway. The push in step 8 uses an
-    API key, which the controller checks without the issuer.
+    **The frozen issuer.** On authproto `tenantAuth.issuer` is `$ISSUER` itself
+    (`http://identity.identity.localhost:28280`), reached through the platform gateway
+    (`issuerUpstream: di-platform-gateway.wasmcloud.svc.cluster.local:80`), so the alias moves it
+    too. Every tenant controller and console calls `discover(issuer)` when it starts: 20
+    attempts with a growing back-off, about 4 minutes (longer if fetches hang), then it throws,
+    exits, and stays in `CrashLoopBackOff` until discovery answers. Running pods keep their
+    metadata, and API keys are checked against their Secrets only, so the push in step 8 does
+    not need the issuer. But from the freeze (step 2) until the switch (step 10), and from
+    rollback step 1 until rollback step 3, **no tenant-auth pod can start**. `$NEW`'s
+    `tenant-controller` is also the registry front step 8 pushes through. Therefore:
+
+    - Right before step 2, before step 8 and before step 10, run
+      `tenant_auth_state | diff "$OUT/tenant-auth.baseline" -`. It must print nothing: a changed
+      line means a pod is not Ready, restarted, or was replaced (a new pod name).
+    - **If `$NEW`'s controller, or any tenant-auth pod, is not Ready or restarts between the
+      freeze and the switch, roll back at once** (Rollback below). Do not wait for it: it cannot
+      start until the issuer answers again, and the issuer stays frozen until step 10 or the
+      rollback. After rollback step 3 the old guest serves; give the pod its retry time, restart
+      it once if it is still crash-looping, run item 7 again, and start over as described under
+      "Roll forward after a rollback".
+    - Run no `up` between step 2 and step 10 but step 10's, which item 8 showed rolls only the
+      gateway, and restart nothing in the platform or tenant runtime namespaces.
 
 ##### Cutover
 
@@ -768,8 +877,12 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
    `(cd apps/guest && di-framework platform build)`. It must log
    `Composing the PGlite encryption layer into the provider`. With an older plugin installed,
    prefix it with `DI_FRAMEWORK_EXTENSIONS_DIR=<dir with cli-plugin-platform 6.2.0>` (also for
-   step 8).
-2. **Freeze writes on the Postgres guest.** Record its replicas, then stop it:
+   step 8). Prepare step 8's items 1 and 2 (the push key and the `oras` wrapper) now too: only
+   steps 2 to 10 run with the issuer frozen, and nothing that can run before belongs there.
+2. **Freeze writes on the Postgres guest.** First the tenant-auth check:
+   `tenant_auth_state | diff "$OUT/tenant-auth.baseline" -` must print nothing (P2, "The frozen
+   issuer"); otherwise STOP and run P2 item 7 again. Then record the old guest's replicas and
+   stop it:
    `kubectl --kubeconfig "$KC" -n di-tenant-identity get workloaddeployment identity -o jsonpath='{.spec.replicas}'`,
    then
    `kubectl --kubeconfig "$KC" -n di-tenant-identity patch workloaddeployment identity --type merge -p '{"spec":{"replicas":0}}'`,
@@ -848,50 +961,79 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
    Record the target path it prints (`TARGET=...`) for step 12.
 8. **Deploy into `$NEW`'s own registry.** The guest is pushed to tenant `$NEW`'s registry
    (`tenantAuth.registry`, WorkloadDeployment `di-tenant-registry`, Ready since P2) as user
-   `$PUSHER`, and `$NEW`'s host pulls it from the in-cluster pull listener over TLS.
-   1. **An API key for `$PUSHER`.** Console sign-in needs the issuer, which is frozen since
+   `$PUSHER`, and `$NEW`'s host pulls it from the in-cluster pull listener over TLS. Items 1
+   and 2 need neither the export nor the freeze: do them before step 2, to keep the frozen
+   window short. First, right before the push, the tenant-auth check
+   (`tenant_auth_state | diff "$OUT/tenant-auth.baseline" -` prints nothing; otherwise roll
+   back, see "The frozen issuer" in P2).
+   1. **An API key for `$PUSHER`.** Console sign-in needs the issuer, which is frozen from
       step 2, so mint the key with the admin kubeconfig the way the tenant controller stores
-      keys: a Secret `di-apikey-<id>` in `di-runtime-$NEW` holding only the SHA-256 of the
-      secret part, labelled with the tenant and user. The full key goes into a mode 0600 Docker
-      config and is never printed:
+      keys: a Secret `di-apikey-<id>` in `di-runtime-$NEW`, created with its labels (tenant,
+      user, `api-key`), holding only the SHA-256 of the secret part. The full key goes into a
+      mode 0600 Docker config and is never printed or passed as an argument. The timestamps
+      come from Bun, so this works with BSD and GNU `date` alike, and an empty one stops:
       ```sh
-      umask 077
       REG_PORT=28790                  # any free loopback port
-      key_id="$(openssl rand -hex 8)"
-      key_secret="$(openssl rand 32 | base64 | tr '+/' '-_' | tr -d '=\n')"
-      kubectl --kubeconfig "$KC" -n "di-runtime-$NEW" create secret generic "di-apikey-$key_id" \
-        --from-literal=hash="$(printf %s "$key_secret" | shasum -a 256 | awk '{print $1}')" \
-        --from-literal=name=identity-cutover \
-        --from-literal=createdAt="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" \
-        --from-literal=expiresAt="$(date -u -v+1d +%Y-%m-%dT%H:%M:%S.000Z)"
-      kubectl --kubeconfig "$KC" -n "di-runtime-$NEW" label secret "di-apikey-$key_id" \
-        platform.di-framework.dev/api-key=true "platform.di-framework.dev/tenant=$NEW" "platform.di-framework.dev/user=$PUSHER"
-      mkdir -m 700 -p "$OUT/docker" "$OUT/bin"
-      printf '{"auths":{"127.0.0.1:%s":{"auth":"%s"}}}\n' "$REG_PORT" \
-        "$(printf '%s:dik_%s_%s' "$PUSHER" "$key_id" "$key_secret" | base64 | tr -d '\n')" > "$OUT/docker/config.json"
-      unset key_secret
+      # mint_push_key: a key for $PUSHER in tenant $NEW, as the tenant controller stores keys (keys.ts).
+      mint_push_key() (
+        umask 077
+        key_id="$(openssl rand -hex 8)"
+        key_secret="$(openssl rand 32 | base64 | tr '+/' '-_' | tr -d '=\n')"
+        times="$(bun -e 'const now = Date.now(); console.log(new Date(now).toISOString(), new Date(now + 86_400_000).toISOString())')"
+        created_at="${times% *}"
+        expires_at="${times#* }"
+        for t in "$created_at" "$expires_at"; do
+          printf '%s\n' "$t" | grep -Eqx '[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z' \
+            || { echo "STOP: no timestamp: '$t'"; return 1; }
+        done
+        [ "${#key_secret}" = 43 ] || { echo 'STOP: key generation failed'; return 1; }
+        kubectl --kubeconfig "$KC" -n "di-runtime-$NEW" create secret generic "di-apikey-$key_id" --dry-run=client -o json \
+            --from-literal=hash="$(printf %s "$key_secret" | shasum -a 256 | awk '{print $1}')" \
+            --from-literal=name=identity-cutover --from-literal=createdAt="$created_at" --from-literal=expiresAt="$expires_at" \
+          | jq --arg tenant "$NEW" --arg user "$PUSHER" '.metadata.labels = {"platform.di-framework.dev/api-key": "true",
+              "platform.di-framework.dev/tenant": $tenant, "platform.di-framework.dev/user": $user}' \
+          | kubectl --kubeconfig "$KC" -n "di-runtime-$NEW" create -f - || return 1
+        mkdir -m 700 -p "$OUT/docker"
+        printf '{"auths":{"127.0.0.1:%s":{"auth":"%s"}}}\n' "$REG_PORT" \
+          "$(printf '%s:dik_%s_%s' "$PUSHER" "$key_id" "$key_secret" | base64 | tr -d '\n')" > "$OUT/docker/config.json"
+      )
+      # cleanup_push: the port-forward, every key of $PUSHER (found by its labels, so it also works from a
+      # new shell), and the local credentials.
+      cleanup_push() {
+        [ -z "${PF:-}" ] || kill "$PF" 2>/dev/null
+        kubectl --kubeconfig "$KC" -n "di-runtime-$NEW" delete secret \
+          -l "platform.di-framework.dev/api-key=true,platform.di-framework.dev/user=$PUSHER"
+        rm -rf "$OUT/docker" "$OUT/bin"
+      }
+      mint_push_key || echo 'STOP: no key'
       ```
-      The key expires after a day (`expiresAt`); delete it after the deploy (below).
-   2. **The registry front, by port-forward.** Port 8790 of `tenant-controller` is TLS only (it
-      answers plain HTTP with `400`), with a certificate for its in-cluster and public names,
-      not for `127.0.0.1`. The plugin has no CA or TLS-skip option for its `oras` calls, so a
-      wrapper on `PATH` adds `--insecure`, which turns verification off for this loopback
-      port-forward only:
+      The key expires a day after it is minted (`expiresAt`). `cleanup_push` (item 4) deletes
+      it.
+   2. **The `oras` wrapper.** Port 8790 of `tenant-controller` is TLS only (it answers plain
+      HTTP with `400`), with a certificate for its in-cluster and public names, not for
+      `127.0.0.1`. The plugin has no CA or TLS-skip option for its `oras` calls, so a wrapper on
+      `PATH` adds `--insecure`, only to calls that name `127.0.0.1:$REG_PORT`. Every other call,
+      GHCR fetches during the build included, keeps TLS verification:
       ```sh
-      kubectl --kubeconfig "$KC" -n "di-runtime-$NEW" port-forward svc/tenant-controller "$REG_PORT:8790" &
-      PF=$!
+      mkdir -m 700 -p "$OUT/bin"
       ORAS="$(command -v oras)"
       cat > "$OUT/bin/oras" <<EOF
       #!/bin/sh
-      case "\${1:-}" in version|--version|-h|--help|"") exec "$ORAS" "\$@" ;; esac
-      exec "$ORAS" "\$@" --insecure
+      # --insecure only for calls that name the loopback port-forward; GHCR and the rest keep TLS.
+      for arg in "\$@"; do
+        case "\$arg" in *127.0.0.1:$REG_PORT*) exec "$ORAS" "\$@" --insecure ;; esac
+      done
+      exec "$ORAS" "\$@"
       EOF
       chmod 700 "$OUT/bin/oras"
       ```
-   3. **Deploy.** Override `deploy.sh`'s registry defaults with the **schemeless** push URL (an
-      `http://` URL, `deploy.sh`'s default form, makes the push plain HTTP, which the front
-      refuses) and the tenant's pull reference:
+   3. **Deploy**, through a port-forward to the registry front, overriding `deploy.sh`'s
+      registry defaults with the **schemeless** push URL (an `http://` URL, `deploy.sh`'s
+      default form, makes the push plain HTTP, which the front refuses) and the tenant's pull
+      reference:
       ```sh
+      kubectl --kubeconfig "$KC" -n "di-runtime-$NEW" port-forward svc/tenant-controller "$REG_PORT:8790" &
+      PF=$!
       PATH="$OUT/bin:$PATH" DOCKER_CONFIG="$OUT/docker" \
         IDENTITY_REGISTRY_PUSH="127.0.0.1:$REG_PORT/identity" \
         IDENTITY_REGISTRY_PULL="tenant-registry.di-runtime-$NEW.svc/identity" \
@@ -907,10 +1049,14 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
       registry:
       `kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" get workloaddeployment identity -o jsonpath='{.spec.template.spec.components[*].image}'`
       starts with `tenant-registry.di-runtime-$NEW.svc/identity`.
-   4. **Clean up the push credentials:**
-      `kill "$PF"; kubectl --kubeconfig "$KC" -n "di-runtime-$NEW" delete secret "di-apikey-$key_id"; rm -rf "$OUT/docker" "$OUT/bin"`.
-      A later redeploy of `$NEW` mints a new key the same way, or through the console once the
-      issuer serves from `$NEW`.
+   4. **Clean up the push credentials, on every path:** `cleanup_push` after a successful
+      deploy, after a failed one you will not retry at once, and before any rollback. From a
+      new shell, define `KC`, `NEW`, `PUSHER`, `OUT` and the function again: it finds the keys
+      by their labels
+      (`kubectl --kubeconfig "$KC" -n "di-runtime-$NEW" get secret -l "platform.di-framework.dev/api-key=true,platform.di-framework.dev/user=$PUSHER"`),
+      and `pkill -f "port-forward svc/tenant-controller $REG_PORT:8790"` ends a port-forward the
+      old shell left behind. A later redeploy of `$NEW` mints a new key the same way, or
+      through the console once the issuer serves from `$NEW`.
 
    **Why not authproto's `examples-registry`.** Pushing to
    `examples-registry.wasmcloud.svc.cluster.local:5000` (`deploy.sh`'s defaults, with
@@ -942,7 +1088,9 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
          | jq -r '.items[] | select(.metadata.name == "identity") | "\(.metadata.namespace) replicas=\(.spec.replicas)"'
        ```
        Every line but `di-tenant-$NEW` must read `replicas=0`. Scale any other to 0 first, as in
-       step 2.
+       step 2. Then the tenant-auth check: `tenant_auth_state | diff "$OUT/tenant-auth.baseline" -`
+       must print nothing (`$NEW`'s new workload does not show in it); otherwise roll back (P2,
+       "The frozen issuer").
     2. **Switch:**
        ```sh
        up_platform "$OUT/platform-alias.json"
@@ -1091,6 +1239,8 @@ guests run at once: they share the signing key, and their refresh-token state di
 platform upgrade from P2 stays (tenant `$NEW`, the exclusive host image, the allowlist): the
 old guest was proven on it before the freeze.
 
+Before step 1, run `cleanup_push` (step 8, item 4) if the push credentials may still exist.
+
 1. Stop the **new** guest first:
    `kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" patch workloaddeployment identity --type merge -p '{"spec":{"replicas":0}}'`,
    and check that `Host: identity.$NEW.localhost` no longer answers `/health`.
@@ -1102,6 +1252,9 @@ old guest was proven on it before the freeze.
    not continue to step 3 while `$ISSUER` may still reach `$NEW`.
 3. Only then restore the old guest's replicas from step 2 and check that
    `Host: identity.identity.localhost` answers `/health` (and `$ISSUER`, if the route moved).
+   Discovery answers again from here. Run P2 item 7's loop: a tenant-auth pod that restarted
+   while the issuer was frozen recovers on its own within its retry budget, or needs one
+   `rollout restart` if it is still crash-looping.
 4. Remove the new tenant's workload, in `di-tenant-$NEW`:
    ```sh
    kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" delete workloaddeployment identity
@@ -1160,6 +1313,18 @@ found is folded into the runbook:
   an `oras --insecure` wrapper and an API key of a user declared as a member of the new tenant
   (step 8);
 - the first upgrade rolls the controller once, because `tenantAuth`'s stored form changes.
+
+**Not covered by the pgprove run: tenant-auth on the frozen issuer.** pgprove's
+`tenantAuth.issuer` was a static discovery stub in its own namespace
+(`proving-grounds/scripts/kube.sh`), not the identity guest that was cut over. authproto's is
+the guest itself, `http://identity.identity.localhost:28280` through the gateway
+(`issuerUpstream: di-platform-gateway.wasmcloud.svc.cluster.local:80`). So pgprove did not
+exercise what happens to tenant controllers and consoles while that issuer is frozen, or how
+they rediscover it through the alias. P2 items 6 to 8 and "The frozen issuer" cover this from the
+platform source (`discover()` in `platform/tenant-auth/src/oidc.ts`: 20 attempts, about
+4 minutes, then the pod exits): the order of the waits, a baseline checked before the freeze,
+before the push and before the switch, a preview showing the switch rolls only the gateway, and
+an immediate rollback if a tenant-auth pod restarts in the frozen window.
 
 2026-10-12. The live pgprove run was not possible: `kubesolo-pgprove` (stopped with exit 137)
 restarted in a loop because Kubesolo could not pull `rancher/local-path-provisioner` through the
