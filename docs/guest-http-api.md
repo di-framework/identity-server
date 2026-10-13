@@ -523,6 +523,37 @@ tenant_auth_state() {
       || echo "ERROR cannot read the tenant-auth pods of $t"
   done | LC_ALL=C sort
 }
+# tenant_auth_gate (P2 item 7): waits up to 10 minutes for every tenant-auth check to pass, and only
+# then records the baseline. A timeout prints STOP and leaves no baseline, so the later checks refuse.
+tenant_auth_gate() {
+  rm -f "$OUT/tenant-auth.baseline"
+  gate=no
+  for i in $(seq 1 40); do
+    tenant_auth_state > "$OUT/tenant-auth.now"
+    if [ -s "$OUT/tenant-auth.now" ] \
+      && ! grep -Ev 'TenantAuthReady=True$| ready=(1/1|/0)$| ready=true restarts=[0-9]+$' "$OUT/tenant-auth.now" >/dev/null; then
+      gate=yes
+      break
+    fi
+    sleep 15
+  done
+  if [ "$gate" = yes ] && cp "$OUT/tenant-auth.now" "$OUT/tenant-auth.baseline"; then
+    echo 'tenant-auth: ok, baseline recorded'
+  else
+    grep -Ev 'TenantAuthReady=True$| ready=(1/1|/0)$| ready=true restarts=[0-9]+$' "$OUT/tenant-auth.now"
+    echo 'STOP: tenant-auth not ready after 10 minutes; no baseline'
+    return 1
+  fi
+}
+# tenant_auth_unchanged: the state still equals the baseline. A missing or empty baseline refuses.
+tenant_auth_unchanged() {
+  [ -s "$OUT/tenant-auth.baseline" ] || { echo 'STOP: no tenant-auth baseline (P2 item 7)'; return 1; }
+  now="$(tenant_auth_state)"
+  [ -n "$now" ] || { echo 'STOP: no tenant-auth state'; return 1; }
+  printf '%s\n' "$now" | diff "$OUT/tenant-auth.baseline" - \
+    || { echo 'STOP: tenant-auth changed since the baseline'; return 1; }
+  echo 'tenant-auth: unchanged'
+}
 ```
 
 The confirmation the guard wants is literally `IDENTITY_AUTHPROTO_CUTOVER=authproto/<tenant>`:
@@ -836,23 +867,16 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
        the upgrade rolled while the old guest was down retries discovery for about 4 minutes,
        then crash-loops with a growing back-off, so give it time after item 6b:
        ```sh
-       for i in $(seq 1 40); do   # up to 10 minutes after the old guest serves
-         tenant_auth_state > "$OUT/tenant-auth.now"
-         [ -s "$OUT/tenant-auth.now" ] \
-           && ! grep -Ev 'TenantAuthReady=True$| ready=(1/1|/0)$| ready=true restarts=[0-9]+$' "$OUT/tenant-auth.now" \
-           && break
-         sleep 15
-       done
-       cat "$OUT/tenant-auth.now"
+       tenant_auth_gate   # up to 10 minutes after the old guest serves
        ```
-       The `grep` prints what is not ready yet (an `ERROR` line included); the loop ends only
-       when the snapshot is non-empty and it prints nothing. If a pod is
-       still in `CrashLoopBackOff` after that (it exhausted its discovery budget while the old
-       guest was down), restart it once, now that the guest serves:
+       It prints `tenant-auth: ok, baseline recorded` only when a non-empty snapshot shows
+       everything ready (an `ERROR` line never passes), and writes `$OUT/tenant-auth.baseline`
+       only then. Otherwise it prints what is not ready and `STOP`, and leaves no baseline, so
+       steps 2, 8 and 10 refuse. If a pod is still in `CrashLoopBackOff` (it exhausted its
+       discovery budget while the old guest was down), restart it once, now that the guest
+       serves:
        `kubectl --kubeconfig "$KC" -n di-runtime-<tenant> rollout restart deploy/<tenant-controller|tenant-console>`,
-       and run the loop again. If it still fails, STOP. Once the `grep` prints nothing, record
-       the baseline that the frozen window is checked against:
-       `cp "$OUT/tenant-auth.now" "$OUT/tenant-auth.baseline"`.
+       and run `tenant_auth_gate` again, under the same rules. If it prints `STOP` again, STOP.
     8. **Preview the switch** against the upgraded stack, still before the freeze, so step 10 is
        known to change only the gateway:
        ```sh
@@ -886,8 +910,8 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
     `tenant-controller` is also the registry front step 8 pushes through. Therefore:
 
     - Right before step 2, before step 8 and before step 10, run
-      `tenant_auth_state | diff "$OUT/tenant-auth.baseline" -`. It must print nothing: a changed
-      line means a pod is not Ready, restarted, or was replaced (a new pod name).
+      `tenant_auth_unchanged`. It must print `tenant-auth: unchanged`. A missing or empty
+      baseline is a `STOP`, and in the difference it prints, a changed line means a pod is not Ready, restarted, or was replaced (a new pod name).
     - **If `$NEW`'s controller, or any tenant-auth pod, is not Ready or restarts between the
       freeze and the switch, roll back at once** (Rollback below). Do not wait for it: it cannot
       start until the issuer answers again, and the issuer stays frozen until step 10 or the
@@ -905,17 +929,21 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
    prefix it with `DI_FRAMEWORK_EXTENSIONS_DIR=<dir with cli-plugin-platform 6.2.0>` (also for
    step 8). Prepare step 8's items 1 and 2 (the push key and the `oras` wrapper) now too: only
    steps 2 to 10 run with the issuer frozen, and nothing that can run before belongs there.
-2. **Freeze writes on the Postgres guest.** First the tenant-auth check:
-   `tenant_auth_state | diff "$OUT/tenant-auth.baseline" -` must print nothing (P2, "The frozen
-   issuer"); otherwise STOP and run P2 item 7 again. Then record the old guest's replicas (a
-   number, kept in `$OUT/old-replicas` for the rollback) and stop it:
+2. **Freeze writes on the Postgres guest**, only if the tenant-auth check passes
+   (`tenant_auth_unchanged` prints `tenant-auth: unchanged`; P2, "The frozen issuer"). If it
+   does not, the block changes nothing: STOP and run P2 item 7 again. The block records the old
+   guest's replicas (a number, kept in `$OUT/old-replicas` for the rollback) and stops it:
    ```sh
-   OLD_REPLICAS="$(kubectl --kubeconfig "$KC" -n di-tenant-identity get workloaddeployment identity -o jsonpath='{.spec.replicas}')"
-   case "$OLD_REPLICAS" in
-     ''|*[!0-9]*) echo "STOP: could not read the old guest's replicas: '$OLD_REPLICAS'" ;;
-     *) echo "$OLD_REPLICAS" > "$OUT/old-replicas" && echo "recorded replicas: $OLD_REPLICAS" \
-          && kubectl --kubeconfig "$KC" -n di-tenant-identity patch workloaddeployment identity --type merge -p '{"spec":{"replicas":0}}' ;;
-   esac
+   if tenant_auth_unchanged; then
+     OLD_REPLICAS="$(kubectl --kubeconfig "$KC" -n di-tenant-identity get workloaddeployment identity -o jsonpath='{.spec.replicas}')"
+     case "$OLD_REPLICAS" in
+       ''|*[!0-9]*) echo "STOP: could not read the old guest's replicas: '$OLD_REPLICAS'" ;;
+       *) echo "$OLD_REPLICAS" > "$OUT/old-replicas" && echo "recorded replicas: $OLD_REPLICAS" \
+            && kubectl --kubeconfig "$KC" -n di-tenant-identity patch workloaddeployment identity --type merge -p '{"spec":{"replicas":0}}' ;;
+     esac
+   else
+     echo 'STOP: not frozen; the old guest is untouched'
+   fi
    ```
    Then the freeze must hold on all three counts: the workload at `replicas: 0`,
    `Host: identity.identity.localhost` no longer answering `/health` with 200, and nothing else
@@ -1008,7 +1036,7 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
    `$PUSHER`, and `$NEW`'s host pulls it from the in-cluster pull listener over TLS. Items 1
    and 2 need neither the export nor the freeze: do them before step 2, to keep the frozen
    window short. First, right before the push, the tenant-auth check
-   (`tenant_auth_state | diff "$OUT/tenant-auth.baseline" -` prints nothing; otherwise roll
+   (`tenant_auth_unchanged` prints `tenant-auth: unchanged`; otherwise roll
    back, see "The frozen issuer" in P2).
    1. **An API key for `$PUSHER`.** Console sign-in needs the issuer, which is frozen from
       step 2, so mint the key with the admin kubeconfig the way the tenant controller stores
@@ -1077,7 +1105,7 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
       reference:
       ```sh
       if [ -s "$OUT/docker/config.json" ] && [ -x "$OUT/bin/oras" ] \
-        && tenant_auth_state | diff "$OUT/tenant-auth.baseline" -; then
+        && tenant_auth_unchanged; then
         kubectl --kubeconfig "$KC" -n "di-runtime-$NEW" port-forward svc/tenant-controller "$REG_PORT:8790" &
         PF=$!
         PATH="$OUT/bin:$PATH" DOCKER_CONFIG="$OUT/docker" \
@@ -1186,12 +1214,12 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
        Scale a stray signer to 0 first, as in step 2, and run it again. Limitation: a guest that
        keeps its key somewhere other than a `<workload>-control` Secret is found only by its
        workload name. The Postgres-era guest is one (its key is in `directory`), which is why
-       `di-tenant-identity/identity` is checked by name. Then the tenant-auth check: `tenant_auth_state | diff "$OUT/tenant-auth.baseline" -`
+       `di-tenant-identity/identity` is checked by name. Then the tenant-auth check: `tenant_auth_unchanged`
        must print nothing (`$NEW`'s new workload does not show in it); otherwise roll back (P2,
        "The frozen issuer").
     2. **Switch**, only if both checks of item 1 still pass at that moment:
        ```sh
-       if check_signers && tenant_auth_state | diff "$OUT/tenant-auth.baseline" -; then
+       if check_signers && tenant_auth_unchanged; then
          up_platform "$OUT/platform-alias.json" \
            && kubectl --kubeconfig "$KC" -n wasmcloud rollout status deploy/di-platform-gateway --timeout=300s \
            || echo 'STOP: the switch failed (the rules above)'
@@ -1278,12 +1306,21 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
         case "$r" in ''|*[!0-9]*) echo "STOP: could not read the new guest's replicas: '$r'; nothing changed"; exit 1 ;; esac
         printf '%s\n' "$r" > "$OUT/new-replicas" || { echo 'STOP: cannot record the replicas; nothing changed'; exit 1; }
         echo "recorded replicas: $r (in $OUT/new-replicas)"
+        restored=no
+        # restore: idempotent; the second call after a successful one does nothing.
         restore() {
+          [ "$restored" = yes ] && return 0
           saved="$(cat "$OUT/new-replicas")"
           case "$saved" in ''|*[!0-9]*) echo "STOP: $OUT/new-replicas holds '$saved'; restore the replicas by hand"; return 1 ;; esac
           kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" patch workloaddeployment identity --type merge -p "{\"spec\":{\"replicas\":$saved}}" \
-            && echo "replicas restored: $saved" || { echo "STOP: restore the replicas ($saved) by hand"; return 1; }
+            && { restored=yes; echo "replicas restored: $saved"; } || { echo "STOP: restore the replicas ($saved) by hand"; return 1; }
         }
+        delete_pod() {
+          kubectl --kubeconfig "$KC" -n kube-system delete pod identity-cutover-backup --ignore-not-found \
+            || echo 'delete pod kube-system/identity-cutover-backup by hand'
+        }
+        # From the scale-down until the restore, an interrupt or a lost terminal still restores the guest.
+        trap 'echo "interrupted: restoring the new guest"; delete_pod; restore; exit 1' INT TERM HUP
         kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" patch workloaddeployment identity --type merge -p '{"spec":{"replicas":0}}' \
           || { echo 'STOP: could not scale the new guest to 0'; restore; exit 1; }
         stopped=no
@@ -1320,10 +1357,13 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
         [ "$ok" = yes ] && kubectl --kubeconfig "$KC" -n kube-system exec identity-cutover-backup -- sh -c 'cd /data && find . -type f -exec sha256sum {} +' \
           > "$OUT/final-data.node.raw" || ok=no
         [ "$ok" = yes ] && kubectl --kubeconfig "$KC" -n kube-system exec identity-cutover-backup -- tar -C /data -cf - . > "$OUT/final-data.tar" || ok=no
-        kubectl --kubeconfig "$KC" -n kube-system delete pod identity-cutover-backup --ignore-not-found \
-          || echo 'delete pod kube-system/identity-cutover-backup by hand'
-        restore || ok=no
-        [ "$ok" = yes ] || { echo 'STOP: the copy failed; it is not a backup'; exit 1; }
+        delete_pod
+        restore_ok=yes
+        restore || restore_ok=no
+        trap - INT TERM HUP
+        [ "$ok" = yes ] && echo 'copy taken' || echo 'STOP: the copy failed; it is not a backup'
+        [ "$restore_ok" = yes ] || echo "STOP: the new guest is still at 0 replicas: restore $(cat "$OUT/new-replicas") by hand now"
+        [ "$ok" = yes ] && [ "$restore_ok" = yes ] || exit 1
         LC_ALL=C sort "$OUT/final-data.node.raw" > "$OUT/final-data.node.sha256"
         mkdir -m 700 "$OUT/final-data" && tar -C "$OUT/final-data" -xf "$OUT/final-data.tar" || { echo 'STOP: cannot unpack the copy'; exit 1; }
         (cd "$OUT/final-data" && find . -type f -exec shasum -a 256 {} +) | LC_ALL=C sort > "$OUT/final-data.copy.sha256"
@@ -1335,7 +1375,14 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
       The block runs in a subshell, and every `STOP` ends it. It touches the guest only after
       the replicas read as a number, which it records in `$OUT/new-replicas`. After the patch
       to 0, every path, failed or not, deletes the helper pod and restores the replicas from that
-      file under the same number check. Both listings use `LC_ALL=C sort`, since `find` order
+      file under the same number check, and a trap does the same on Ctrl-C, `kill` or a lost
+      terminal (`INT`, `TERM`, `HUP`) until the restore has run; the restore runs at most once.
+      The copy and the restore are reported separately: `copy taken` or `the copy failed`, and
+      a `STOP` if the guest is still at 0. **If the shell itself is gone** (the machine slept, the
+      subshell was killed with `SIGKILL`), restore by hand from the recorded count:
+      `kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" patch workloaddeployment identity --type merge -p "{\"spec\":{\"replicas\":$(cat "$OUT/new-replicas")}}"`
+      (check first that `$OUT/new-replicas` holds a number), and delete
+      `kube-system/identity-cutover-backup` if it is still there. Both listings use `LC_ALL=C sort`, since `find` order
       and the locale's collation differ between the node and the workstation. It must print
       `copy matches the node`, and the KCV it prints last (bytes 8..24 of `.di-encfs`) must
       equal `DI_PGLITE_KEY`'s from step 4
@@ -1401,7 +1448,7 @@ Before step 1, run `cleanup_push` (step 8, item 4) if the push credentials may s
    ```
    Repeat the last two lines until it prints `old guest answers` (the host may pull the
    component first), then check `$ISSUER` the same way if the route moved.
-   Discovery answers again from here. Run P2 item 7's loop: a tenant-auth pod that restarted
+   Discovery answers again from here. Run `tenant_auth_gate` (P2 item 7): a tenant-auth pod that restarted
    while the issuer was frozen recovers on its own within its retry budget, or needs one
    `rollout restart` if it is still crash-looping.
 4. Remove the new tenant's workload, in `di-tenant-$NEW`:
