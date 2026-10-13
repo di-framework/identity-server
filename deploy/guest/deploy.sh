@@ -51,7 +51,10 @@
 #
 # If a step after the build fails, fix the cause and run
 #   bun deploy/guest/runtime-secrets.ts apply --values <file> --kubeconfig <kc> --tenant <tenant>
-# on its own: it rewrites the Secret and rolls the workload.
+# on its own: it rewrites the Secret and rolls the workload. That needs the WorkloadDeployment:
+# when the deploy failed before it existed (on a brand-new tenant, typically a push that 404s
+# while the tenant registry, WorkloadDeployment di-tenant-registry, is not Ready yet), the script
+# says so and the recovery is to re-run this script instead.
 set -eu
 
 instance="${1:-}"
@@ -108,7 +111,24 @@ if [ "$status" -eq 3 ] && grep -q 'did not become ready' "$deploy_log"; then
   done
   echo "$workload is Ready after ${waited}s more" >&2
 elif [ "$status" -ne 0 ]; then
-  echo "deploy of $workload failed (exit $status); once fixed, run: $recovery" >&2
+  # `apply` writes the Secret of an existing workload and rolls it. When the deploy failed before
+  # the WorkloadDeployment existed (e.g. the push 404s on a brand-new tenant whose registry,
+  # WorkloadDeployment di-tenant-registry, is not Ready yet), there is nothing to apply to: the
+  # recovery is to re-run this deploy.
+  redeploy="$0 $instance $tenant $values"
+  if [ -n "${IDENTITY_AUTHPROTO_CUTOVER:-}" ]; then
+    redeploy="IDENTITY_AUTHPROTO_CUTOVER=$IDENTITY_AUTHPROTO_CUTOVER $redeploy"
+  fi
+  if existing="$(kubectl --kubeconfig "$IDENTITY_KUBECONFIG" --context "$IDENTITY_KUBE_CONTEXT" \
+    --namespace "di-tenant-$tenant" get workloaddeployment "$workload" --ignore-not-found -o name 2>/dev/null)"; then
+    if [ -n "$existing" ]; then
+      echo "deploy of $workload failed (exit $status); once fixed, run: $recovery" >&2
+    else
+      echo "deploy of $workload failed (exit $status) before di-tenant-$tenant had a WorkloadDeployment $workload, so there is nothing for runtime-secrets.ts apply to update. On a new tenant, wait until WorkloadDeployment di-tenant-registry in di-tenant-$tenant is Ready. Once fixed, re-run the deploy: $redeploy" >&2
+    fi
+  else
+    echo "deploy of $workload failed (exit $status), and kubectl could not tell whether WorkloadDeployment $workload exists in di-tenant-$tenant. Once fixed: if it exists, run: $recovery; if not, re-run the deploy: $redeploy" >&2
+  fi
   exit 3
 fi
 

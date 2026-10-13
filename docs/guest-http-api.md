@@ -385,8 +385,8 @@ install, deploy) are not proven live yet. Nothing here has run against authproto
 | Export | `deploy/cutover/export.ts` | One read-only statement over `kubectl exec ... psql` reads the schema history, every table's rows (as PostgreSQL's own `json_agg` text) and count, and the `identity_runtime_secret` rows, as one snapshot. Writes a mode 0700 directory: `manifest.json` (version, tables, columns, counts, digests; no values), `tables/<t>.json`, `values.json` (the deploy.sh values file), `state.json`, and `directory.dump` (`pg_dump -Fc` of the whole database, for rollback). Files are 0600 and nothing is printed but names and counts. |
 | Key | `deploy/guest/runtime-secrets.ts pglite-key` | Adds `DI_PGLITE_KEY` to `values.json` (a new data directory needs a new key) and prints its KCV. |
 | Import | `deploy/cutover/import.ts` | Runs the guest's own encrypted provider (`apps/guest/.di-framework/di-framework-pglite.encrypted.wasm`, checked to be byte for byte the provider inside `apps/guest/dist/identity.wasm`) under `wasmtime`, plugged into a small wasip2 runner (`deploy/cutover/pglite-runner`, Rust) that serves `di-framework:pglite/database` to the guest's own adapter over stdin/stdout. Initialises a fresh encrypted directory, migrates it to the source version with the guest's migration code, loads every table and the bootstrap fingerprints in one transaction, checks the counts inside it, then checks every file on disk is encfs ciphertext under the key's KCV and contains no engine string or user login or email. |
-| Rehearse | `deploy/cutover/rehearse.ts` | Boots the guest's request handler in-process on a **copy** of the imported directory, through the same provider: `/ready`, the later migrations, no bootstrap reconcile, issuer and signing key `kid`, owner and viewer sign-in, the three bootstrap clients' secrets, row counts. |
-| Install | `deploy/cutover/install.ts` | Dry run by default. With `--yes`, a helper pod on the node (the platform's storage-init image, root with CHOWN and DAC_OVERRIDE only, with exactly the target directory mounted) copies the directory into `<storageRoot>/di-tenants/<tenant uid>/workloads/identity` (what the platform mounts as the guest's `/data`), directories 0700, files 0600, then owner 65532, and compares every file's SHA-256 and owner. The pod is deleted on success and on failure; a failed delete names it. Refuses a non-empty target (before sending anything), a tenant with `directory`, a tenant that already has the WorkloadDeployment (unless `--allow-existing-workload`), and a directory whose marker KCV is not the values file's. |
+| Rehearse | `deploy/cutover/rehearse.ts` | Boots the guest's request handler in-process on a **copy** of the imported directory, through the same provider: `/ready`, the later migrations, no bootstrap reconcile, the bootstrap organization, issuer and signing key `kid`, owner and viewer sign-in (a password changed since bootstrap is a `note` when the stored hash is proven carried), the three bootstrap clients' secrets, row counts and carried password hashes (`rehearse-core.ts`). |
+| Install | `deploy/cutover/install.ts` | Dry run by default; the dry run lists the target through a read-only helper pod (DAC_READ_SEARCH only, `<storageRoot>/di-tenants` mounted read-only) and refuses a non-empty one. With `--yes`, a helper pod on the node (the platform's storage-init image, root with CHOWN and DAC_OVERRIDE only, with exactly the target directory mounted) copies the directory into `<storageRoot>/di-tenants/<tenant uid>/workloads/identity` (what the platform mounts as the guest's `/data`), directories 0700, files 0600, then owner 65532, and compares every file's SHA-256 and owner. The pod is deleted on success and on failure; a failed delete names it. Refuses a non-empty target (before sending anything), a tenant with `directory`, a tenant that already has the WorkloadDeployment (unless `--allow-existing-workload`), and a directory whose marker KCV is not the values file's. |
 | Deploy | `deploy/guest/deploy.sh` | Unchanged path, with the guard lifted for this case only (below). |
 
 Decisions and what they rest on:
@@ -404,7 +404,13 @@ Decisions and what they rest on:
   as the rollback backup.
 - **Runtime secret rows.** The old guest merged every row over wasi:config, and every setting it
   read is a name of the new guest's environment, so each row goes to `values.json` under its own
-  name. Any other name is refused (it changed the old guest's settings; dropping it silently
+  name. That includes the eight bootstrap identity settings (`AUTH_BOOTSTRAP_ORGANIZATION_*`,
+  `AUTH_BOOTSTRAP_OWNER_*` and `AUTH_BOOTSTRAP_VIEWER_*` but the passwords, which are secrets
+  already): authproto overrides all eight, so the new guest reads them from its environment
+  (`RUNTIME_BOOTSTRAP_IDENTITY_SETTINGS` in `apps/guest/src/settings.ts`, declared in
+  `controlSecretKeys`) over its compiled-in defaults, exactly as the old guest's rows did. They
+  are personal data, not secrets: a separate group (`BOOTSTRAP_IDENTITY_NAMES`), in the same
+  Secret because that is the guest's only environment, and never printed. Any other name is refused (it changed the old guest's settings; dropping it silently
   would change the new guest's). `bootstrap_fingerprint` and `bootstrap_client_fingerprints` go
   to `state.json` and are inserted into the new `identity_runtime_secret`, so V16 deletes nothing
   (the import checks it) and the new guest, given the same settings, finds the same fingerprint
@@ -423,8 +429,10 @@ authproto when the instance argument is `authproto`, when the kubeconfig is auth
 in kube's state directory, or a kubeconfig naming the same API server), or when the cluster has a
 `directory` BackingService in **any** namespace, whatever the instance argument says. Such a
 target is refused except for a tenant other than `identity` with exactly
-`IDENTITY_AUTHPROTO_CUTOVER=authproto/<tenant>` in the environment (no trimming), whose tenant
-host (`hostgroup-tenant-<tenant>` in `di-runtime-<tenant>`) runs the exclusive-instance wash build.
+`IDENTITY_AUTHPROTO_CUTOVER=authproto/<tenant>` in the environment (no trimming; the prefix is
+the literal `authproto` whatever the instance is named, `pgprove` included), whose tenant
+host (`hostgroup-tenant-<tenant>` in `di-runtime-<tenant>`) runs the exclusive-instance wash build
+(matched by image name; `IDENTITY_EXCLUSIVE_HOST_DIGEST` adds a digest pin, see P2).
 Every target still refuses a tenant whose `di-tenant-<tenant>` has the `directory` BackingService,
 and every entry point refuses a tenant name that is not a DNS-1123 label. A tenant developer
 kubeconfig (namespaced Role `di-developer`) may not list BackingServices cluster-wide; when that
@@ -450,11 +458,11 @@ included; so the cutover uses `deploy.sh`, not Pulumi.
 #### Runbook
 
 Run from an identity-server checkout at the commit that adds these tools, on the machine that
-holds authproto's kubeconfig. Needs Bun, kubectl, wasmtime 48, `wac` (`WAC=<path>`, or
+holds authproto's kubeconfig. Needs Bun, kubectl, jq, wasmtime 48, `wac` (`WAC=<path>`, or
 `DF_SQLITE_TOOLS_DIR/bin/wac` as for the build), `wasm-tools`, rustup (the runner builds with the
-toolchain in `deploy/cutover/pglite-runner/rust-toolchain.toml` on first use), and
-cli-plugin-platform 6.2.0 or later. Keep `$OUT` on an encrypted volume; it will hold every
-secret and all user data.
+toolchain in `deploy/cutover/pglite-runner/rust-toolchain.toml` on first use), podman (step 12's
+restore check), and cli-plugin-platform 6.2.0 or later. Keep `$OUT` on an encrypted volume; it
+will hold every secret and all user data.
 
 ```sh
 KC="$HOME/Library/Application Support/di-framework-kube/authproto/kubeconfig"
@@ -464,13 +472,38 @@ OUT=/path/on/encrypted/volume/authproto-cutover
 GW=http://127.0.0.1:<gateway port>  # authproto's platform gateway
 mkdir -m 700 -p "$OUT"
 export WAC=/path/to/wac
+# directory's Postgres pod, for the read-only checks below and step 2.
+POD="$(kubectl --kubeconfig "$KC" -n di-runtime-identity get pods -l app=di-bs-directory -o jsonpath='{.items[0].metadata.name}')"
+psql_directory() { kubectl --kubeconfig "$KC" -n di-runtime-identity exec "$POD" -- psql -X -A -t -U app -d app -c "$1"; }
 ```
+
+The confirmation the guard wants is literally `IDENTITY_AUTHPROTO_CUTOVER=authproto/<tenant>`:
+the word `authproto`, a slash and the new tenant, whatever the instance is called. On a rehearsal
+instance (`pgprove`, with its own `directory`) it is still `authproto/$NEW`, not `pgprove/$NEW`.
 
 ##### Preconditions (before any freeze)
 
-Neither check stops or changes the old guest. If either fails, **STOP**: do not freeze, and
+None of these checks stops or changes the old guest. If one fails, **STOP**: do not freeze, and
 present the options below to the coordinator. Resume only once a decision is recorded.
 
+P0. **The source's runtime rows.** `export.ts` refuses any `identity_runtime_secret` row it has no
+    setting for (step 3), so compare the names now, names only (never `value`):
+    ```sh
+    psql_directory 'SELECT name FROM identity_runtime_secret' | LC_ALL=C sort > "$OUT/source-row-names"
+    bun -e "import {RUNTIME_SETTING_NAMES} from './deploy/platform/components/control-secret.ts';
+      import {STATE_ROW_NAMES, TRANSIENT_ROW_NAMES} from './deploy/cutover/source.ts';
+      console.log([...RUNTIME_SETTING_NAMES, ...STATE_ROW_NAMES, ...TRANSIENT_ROW_NAMES].join('\n'))" \
+      | LC_ALL=C sort > "$OUT/known-row-names"
+    LC_ALL=C comm -23 "$OUT/source-row-names" "$OUT/known-row-names"   # must print nothing
+    ```
+    Any name it prints is a setting the old guest applied that the new guest would silently lose:
+    STOP. The known names include the eight bootstrap identity overrides
+    (`AUTH_BOOTSTRAP_{ORGANIZATION_SLUG,ORGANIZATION_NAME,OWNER_LOGIN,OWNER_EMAIL,OWNER_DISPLAY_NAME,VIEWER_LOGIN,VIEWER_EMAIL,VIEWER_DISPLAY_NAME}`),
+    which authproto sets. They are carried into `values.json` and the `identity-control` Secret
+    and override the guest's compiled-in defaults, as the old guest's rows did; without them the
+    new guest's bootstrap fingerprint would differ and it would bootstrap a second organization,
+    owner and viewer from the defaults. They are personal data, not secrets; the tools print
+    their names only.
 P1. **The issuer host.** While the old guest is still up, read its issuer from its public
     discovery document:
     `ISSUER="$(curl -s -H 'Host: identity.identity.localhost' "$GW/.well-known/openid-configuration" | jq -r .issuer)"`.
@@ -484,6 +517,12 @@ P1. **The issuer host.** While the old guest is still up, read its issuer from i
       everything", so a new sign-off);
     - deploying into tenant `identity` after `directory` is retired: the guard refuses this by
       design, and it would need its own change and its own rollback story.
+
+    Known gap: the gateway keeps idle keep-alive connections to the tenant host it last routed
+    to. After a route change, requests on such a connection still reach the old tenant host
+    until the connection closes. Deleting the old tenant host pod
+    (`hostgroup-tenant-identity-*` in `di-runtime-identity`) closes them; the Deployment starts
+    a new pod.
 P2. **The exclusive tenant host image.** Create the new tenant now (the old guest is untouched).
     With the installation label of the existing tenant
     (`kubectl --kubeconfig "$KC" get tenants.platform.di-framework.dev identity -o jsonpath='{.metadata.labels}'`):
@@ -499,8 +538,18 @@ P2. **The exclusive tenant host image.** Create the new tenant now (the old gues
     kubectl --kubeconfig "$KC" wait tenants.platform.di-framework.dev/$NEW --for=condition=Ready --timeout=300s
     kubectl --kubeconfig "$KC" -n "di-runtime-$NEW" get deploy "hostgroup-tenant-$NEW" -o jsonpath='{.spec.template.spec.containers[*].image}'
     ```
-    The image must be the exclusive-instance build, `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive`
-    (`deploy.sh` refuses the cutover otherwise). If it is not, STOP: switching it is a platform
+    The image must be the exclusive-instance build, `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive`.
+    `deploy.sh` (through `runtime-secrets.ts guard`) refuses the cutover otherwise, but its check
+    is by **name only**: some image in the Deployment's pod template must match
+    `(^|/)wash:<tag>` with `exclusive` in the tag (`/(^|\/)wash:[^\s@]*exclusive/`), with or
+    without an `@sha256:` suffix. It does not compare a digest, so a rebuilt or retagged image
+    under that name passes. To pin the digest too, set
+    `IDENTITY_EXCLUSIVE_HOST_DIGEST=sha256:<64 hex>` for step 8: the guard then also requires
+    every running `hostgroup-tenant-$NEW-*` pod to report that digest in
+    `.status.containerStatuses[*].imageID` (what the node actually pulled), and refuses a
+    malformed value or no running host pod. Read the digest from a host pod you trust:
+    `kubectl --kubeconfig "$KC" -n "di-runtime-$NEW" get pods -o jsonpath='{.items[*].status.containerStatuses[*].imageID}'`.
+    If the image is not the exclusive build, STOP: switching it is a platform
     config change that rolls **every** tenant host, the old guest's included, which a rollback
     would then restore onto an image it was never tested with. Options: switch the image and
     prove the old guest on it before the cutover, or a platform change that gives only `$NEW`'s
@@ -516,18 +565,37 @@ P2. **The exclusive tenant host image.** Create the new tenant now (the old gues
    then
    `kubectl --kubeconfig "$KC" -n di-tenant-identity patch workloaddeployment identity --type merge -p '{"spec":{"replicas":0}}'`,
    and check that `Host: identity.identity.localhost` no longer answers `/health`. Then check that
-   nothing else is connected to `directory`; this must print `0`:
+   nothing else is connected to `directory`. The count must reach `0`, but not at once: after
+   `replicas: 0` the tenant host (`hostgroup-tenant-identity`) keeps the old guest's pooled
+   connection open, idle, until its pool drops it. On pgprove that took 3.5 to 4.5 minutes, so
+   wait for it, with a timeout:
    ```sh
-   POD="$(kubectl --kubeconfig "$KC" -n di-runtime-identity get pods -l app=di-bs-directory -o jsonpath='{.items[0].metadata.name}')"
-   kubectl --kubeconfig "$KC" -n di-runtime-identity exec "$POD" -- psql -X -A -t -U app -d app \
-     -c 'SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid()'
+   others='SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid()'
+   deadline=$(( $(date +%s) + 600 ))
+   until [ "$(psql_directory "$others")" = 0 ]; do
+     if [ "$(date +%s)" -ge "$deadline" ]; then echo 'still connected after 10 minutes'; break; fi
+     sleep 15
+   done
+   psql_directory "$others"   # must print 0
    ```
-   If it is not 0, find the client (`SELECT usename, application_name, client_addr FROM pg_stat_activity ...`)
+   Optional, instead of waiting: end only the old guest's **idle** connections. They come from
+   the tenant host pods' IPs, so list those first and look at what matches:
+   ```sh
+   HOST_IPS="$(kubectl --kubeconfig "$KC" -n di-runtime-identity get pods -o jsonpath='{range .items[*]}{.metadata.name}{" "}{.status.podIP}{"\n"}{end}' \
+     | awk '$1 ~ /^hostgroup-tenant-identity-/ { printf "%s%s", sep, $2; sep = "," }')"
+   old_guest="datname = current_database() AND pid <> pg_backend_pid() AND state = 'idle' AND client_addr = ANY('{$HOST_IPS}'::inet[])"
+   psql_directory "SELECT pid, usename, application_name, client_addr, now() - state_change AS idle_for FROM pg_stat_activity WHERE $old_guest"
+   psql_directory "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE $old_guest"
+   ```
+   Only with `replicas: 0` and `/health` not answering: the filter keeps connections that are
+   running a statement or in a transaction, and connections from any other address. Then run
+   the count again. If it does not reach 0, find the client
+   (`SELECT usename, application_name, client_addr, state FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid()`)
    and stop it before step 3. Anything written after step 3 is lost.
 3. **Export** (read-only on `directory`):
    `bun deploy/cutover/export.ts --kubeconfig "$KC" --context "$CTX" --namespace di-runtime-identity --service directory --out "$OUT/export"`.
-   Expect `source schema V15`. If it refuses unknown runtime rows, review them; do not edit the
-   tool's mapping. A failed export leaves no `$OUT/export` behind. Then repeat both checks of
+   Expect `source schema V15`. If it refuses unknown runtime rows, review them (P0); do not edit
+   the tool's mapping. A failed export leaves no `$OUT/export` behind. Then repeat both checks of
    step 2: the old workload's `replicas` must still be `0` (a controller may have restored it)
    and the `pg_stat_activity` count `0`. Otherwise stop the writer again, delete the old export
    first (`rm -rf "$OUT/export"`: it holds secrets, and `export.ts` refuses a non-empty `--out`),
@@ -543,45 +611,153 @@ P2. **The exclusive tenant host image.** Create the new tenant now (the old gues
    removes `$OUT/data` again, so it can simply be re-run.
 6. **Rehearse:**
    `bun deploy/cutover/rehearse.ts --data "$OUT/data" --values "$OUT/export/values.json" --export "$OUT/export"`.
-   Every line must be `ok`, including `bootstrap not reconciled`.
+   Every line must be `ok` or `note`, including `bootstrap not reconciled` and
+   `bootstrap organization`; any `FAIL` exits 1. The owner and viewer sign in with the bootstrap
+   passwords in `values.json`, which are only what bootstrap first set. A user who changed it
+   since reads
+   `note <who> sign-in: HTTP 303, signed in: false: password changed since bootstrap (expected if the user changed it) ...`,
+   and only when `<who> password hash carried` is `ok` (the stored hash's SHA-256 equals the
+   export's; neither is printed). A rejected sign-in whose hash was not carried, without
+   `--export`, or any other answer (a 5xx) is a `FAIL`. The owner gets the same rule: the three
+   bootstrap clients already prove that carried Argon2id hashes verify, and the owner is the
+   account most likely to have changed its bootstrap password.
 7. **Install** (dry run, then for real), before the guest's WorkloadDeployment exists:
-   `bun deploy/cutover/install.ts --data "$OUT/data" --values "$OUT/export/values.json" --kubeconfig "$KC" --context "$CTX" --tenant "$NEW"`,
-   check the target path and counts, and repeat with `--yes`. Expect
+   `bun deploy/cutover/install.ts --data "$OUT/data" --values "$OUT/export/values.json" --kubeconfig "$KC" --context "$CTX" --tenant "$NEW"`.
+   The dry run starts a read-only helper pod (root with DAC_READ_SEARCH only, the storage root's
+   `di-tenants` mounted read-only; deleted afterwards), lists the target and refuses a non-empty
+   one as `--yes` would; it must print `target is empty or absent`. Check the target path and
+   counts, and repeat with `--yes`. Expect
    `installed: N/N files match, 0 missing, 0 changed, 0 extra; 0 not owned by 65532`.
-8. **Deploy** (registry port-forward as for authproto's earlier deploys):
+   Record the target path it prints (`TARGET=...`) for step 12.
+8. **Deploy.** First wait for the new tenant's registry, WorkloadDeployment `di-tenant-registry`
+   in `di-tenant-$NEW`: on a brand-new tenant the push 404s until it is Ready. Poll it (as
+   `deploy.sh` polls, `kubectl wait` has exited early on WorkloadDeployments):
+   ```sh
+   registry=
+   for i in $(seq 1 60); do   # up to 5 minutes
+     registry="$(kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" get workloaddeployment di-tenant-registry -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}')"
+     [ "$registry" = True ] && break
+     sleep 5
+   done
+   [ "$registry" = True ] && echo 'tenant registry Ready' || echo 'tenant registry not Ready: do not deploy yet'
+   ```
+   Then (registry port-forward as for authproto's earlier deploys):
    `kubectl --kubeconfig "$KC" -n wasmcloud port-forward svc/examples-registry 25001:5000 &`, then
-   `IDENTITY_AUTHPROTO_CUTOVER=authproto/$NEW deploy/guest/deploy.sh authproto "$NEW" "$OUT/export/values.json"`.
+   `IDENTITY_AUTHPROTO_CUTOVER=authproto/$NEW deploy/guest/deploy.sh authproto "$NEW" "$OUT/export/values.json"`
+   (with `IDENTITY_EXCLUSIVE_HOST_DIGEST=sha256:...` too, to pin the host image; see P2).
    It logs `authproto cutover confirmed for the new tenant`, builds, deploys, waits for Ready and
-   writes `identity-control`.
+   writes `identity-control`. If the deploy fails before the WorkloadDeployment exists,
+   `deploy.sh` says so and prints the deploy command to re-run; `runtime-secrets.ts apply` is
+   the recovery only once the WorkloadDeployment exists, and `deploy.sh` prints it only then.
 9. **Verify on the tenant host** (`Host: identity.$NEW.localhost`):
-   `bun apps/guest/scripts/live-check.ts --values "$OUT/export/values.json" --url "$GW" --host identity.$NEW.localhost --slug unused --read-only`,
-   and compare `curl -s -H "Host: identity.$NEW.localhost" "$GW/oauth2/jwks" | jq -r '.keys[].kid'`
+   `bun apps/guest/scripts/live-check.ts --values "$OUT/export/values.json" --url "$GW" --host identity.$NEW.localhost --read-only`.
+   With `--read-only` and no `--slug` it reads the bootstrap organization, which bootstrap
+   always creates (`BootstrapReconciler.ensureOrganization`): the values'
+   `AUTH_BOOTSTRAP_ORGANIZATION_SLUG`, else the compiled-in `platform`
+   (`apps/guest/src/bindings.ts`). It exits 1 unless `/ready` and that read answer 200; its
+   `login` field signs in the bootstrap owner with the bootstrap password, which fails if the
+   owner changed it (see step 6) and does not change the exit code. Then compare
+   `curl -s -H "Host: identity.$NEW.localhost" "$GW/oauth2/jwks" | jq -r '.keys[].kid'`
    with `jq -r '.AUTH_ACTIVE_PRIVATE_JWK | fromjson | .kid' "$OUT/export/values.json"` (a public
    key id). This proves the guest, not the route: relying parties use `$ISSUER`.
-10. **Move the public route** for `$ISSUER`'s host to tenant `$NEW`, as decided in P1. Then verify
-    against the real issuer host, as a relying party sees it:
+10. **Move the public route** for `$ISSUER`'s host to tenant `$NEW`, as decided in P1 (see the
+    known gap there about kept-alive gateway connections). Then verify against the real issuer
+    host, as a relying party sees it:
     `curl -s "$ISSUER/.well-known/openid-configuration" | jq -r .issuer` must equal `$ISSUER`
     and `jq -r .ISSUER_URL "$OUT/export/values.json"`; the `jwks_uri` it names must serve the kid
     from step 9; and `live-check.ts` as in step 9 with `--url` and `--host` taken from `$ISSUER`
     must pass. If any check fails, roll back (below).
 11. **Soak.** Leave the old workload at 0 replicas and `directory` untouched for the soak period
     the coordinator sets, watching sign-ins, token refreshes and the guest's logs. Rollback is
-    still available.
+    still available. Browser sessions expire after 30 minutes without use
+    (`SESSION_IDLE_MS`), so sessions carried from the old guest survive only if the freeze to
+    step 10 took less than that since their last request; refresh tokens keep their own
+    lifetime. Users whose session expired sign in again.
 12. **Final backup, verified.** Before anything is retired, all three of:
     - **`directory`:** either a fresh `pg_dump -Fc` (`umask 077`;
       `kubectl --kubeconfig "$KC" -n di-runtime-identity exec "$POD" -- pg_dump -Fc -U app -d app > "$OUT/final-directory.dump"`),
       or the export's `$OUT/export/directory.dump` with its digest re-checked
       (`shasum -a 256 "$OUT/export/directory.dump"` equals `jq -r .backup.sha256 "$OUT/export/manifest.json"`).
-      Either way, prove it restorable:
-      `kubectl --kubeconfig "$KC" -n di-runtime-identity exec -i "$POD" -- pg_restore --list < <dump> | grep -c 'TABLE DATA'`
-      must succeed and count the exported tables. Record the file and its SHA-256.
-    - **The new guest's encrypted data directory** (`<storageRoot>/di-tenants/<uid>/workloads/identity`,
-      printed by step 7), copied off the node while the new workload is at 0 replicas (a short,
-      announced pause), with a helper pod like `install.ts`'s. Check the copy: its SHA-256 listing
-      equals the one taken on the node in the same pause, and its `.di-encfs` KCV
-      (bytes 8..24: `dd if=<copy>/.di-encfs bs=1 skip=8 count=16 2>/dev/null | xxd -p`) equals `DI_PGLITE_KEY`'s from step 4.
+      Call it `DUMP`. First its table of contents:
+      `kubectl --kubeconfig "$KC" -n di-runtime-identity exec -i "$POD" -- pg_restore --list < "$DUMP" | grep -c 'TABLE DATA'`
+      must succeed and print the exported tables **plus** the tables the export does not copy as
+      data but the dump holds: `identity_runtime_secret` and `identity_schema_migrations` (and
+      `_migrations` and `_migrations_lock`, only if the Bun server ever migrated `directory`).
+      On authproto that is `$(jq '.tables | length' "$OUT/export/manifest.json") + 2`, i.e.
+      15 + 2 = 17. `--list` reads only the archive's table of contents, not the data, so then
+      restore it into a scratch Postgres (local podman, no volume; the restored copy holds
+      every secret, so `--rm` and remove it at once) and compare every exported table's rows:
+      ```sh
+      podman run -d --rm --name directory-restore-check -e POSTGRES_PASSWORD=restore-check --tmpfs /var/lib/postgresql/data postgres:16-alpine
+      until podman logs directory-restore-check 2>&1 | grep -q 'init process complete'; do sleep 1; done
+      until podman exec directory-restore-check pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
+      podman exec directory-restore-check createdb -U postgres restored
+      podman exec -i directory-restore-check pg_restore -U postgres -d restored --no-owner --no-privileges --exit-on-error < "$DUMP"
+      jq -r '.tables[] | "\(.name) \(.count)"' "$OUT/export/manifest.json" | while read -r table count; do
+        got="$(podman exec directory-restore-check psql -X -A -t -U postgres -d restored -c "SELECT count(*) FROM \"$table\"")"
+        [ "$got" = "$count" ] && echo "ok $table $got" || echo "MISMATCH $table restored $got, exported $count"
+      done
+      podman stop directory-restore-check
+      ```
+      Every line must be `ok`: the dump was taken in the same freeze as the export (or, for a
+      fresh dump, from a `directory` nothing has written to since). Use a Postgres image at
+      least as new as `directory`'s server. Record the file and its SHA-256.
+    - **The new guest's encrypted data directory** (`$TARGET` from step 7), copied off the node
+      in a short, announced pause with the new workload at 0 replicas, through a read-only
+      helper pod like `install.ts`'s dry-run pod (root with DAC_READ_SEARCH only, which may read
+      the host uid's 0700 files and change nothing; the target mounted read-only):
+      ```sh
+      kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" patch workloaddeployment identity --type merge -p '{"spec":{"replicas":0}}'
+      # wait until Host: identity.$NEW.localhost no longer answers /health
+      NODE="$(kubectl --kubeconfig "$KC" get nodes -o jsonpath='{.items[0].metadata.name}')"
+      kubectl --kubeconfig "$KC" apply -f - <<EOF
+      apiVersion: v1
+      kind: Pod
+      metadata: { name: identity-cutover-backup, namespace: kube-system }
+      spec:
+        nodeName: $NODE
+        restartPolicy: Never
+        automountServiceAccountToken: false
+        containers:
+          - name: backup
+            image: busybox:1.37.0
+            command: [sleep, "3600"]
+            securityContext:
+              runAsUser: 0
+              allowPrivilegeEscalation: false
+              readOnlyRootFilesystem: true
+              capabilities: { drop: [ALL], add: [DAC_READ_SEARCH] }
+            volumeMounts: [{ name: data, mountPath: /data, readOnly: true }]
+        volumes: [{ name: data, hostPath: { path: $TARGET, type: Directory } }]
+      EOF
+      kubectl --kubeconfig "$KC" -n kube-system wait --for=condition=Ready pod/identity-cutover-backup --timeout=180s
+      umask 077
+      kubectl --kubeconfig "$KC" -n kube-system exec identity-cutover-backup -- sh -c 'cd /data && find . -type f -exec sha256sum {} +' \
+        | LC_ALL=C sort > "$OUT/final-data.node.sha256"
+      kubectl --kubeconfig "$KC" -n kube-system exec identity-cutover-backup -- tar -C /data -cf - . > "$OUT/final-data.tar"
+      kubectl --kubeconfig "$KC" -n kube-system delete pod identity-cutover-backup
+      kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" patch workloaddeployment identity --type merge -p '{"spec":{"replicas":<recorded replicas>}}'
+      mkdir -m 700 "$OUT/final-data" && tar -C "$OUT/final-data" -xf "$OUT/final-data.tar"
+      (cd "$OUT/final-data" && find . -type f -exec shasum -a 256 {} +) | LC_ALL=C sort > "$OUT/final-data.copy.sha256"
+      diff "$OUT/final-data.node.sha256" "$OUT/final-data.copy.sha256" && echo 'copy matches the node'
+      dd if="$OUT/final-data/.di-encfs" bs=1 skip=8 count=16 2>/dev/null | xxd -p
+      ```
+      Both listings use `LC_ALL=C sort`, since `find` order and the locale's collation differ
+      between the node and the workstation. The `diff` must print nothing, and the KCV (bytes
+      8..24 of `.di-encfs`) must equal `DI_PGLITE_KEY`'s from step 4
+      (`bun deploy/guest/runtime-secrets.ts kcv --values "$OUT/export/values.json"`). Delete the
+      pod even if a step fails. Then move `final-data.tar` (or `final-data/`) to the backup
+      location.
     - **`values.json`** (it holds `DI_PGLITE_KEY` and every secret), stored apart from the data
-      copy, so neither alone opens the other.
+      copy: on a different volume or a different host from the copied data directory, so
+      neither copy alone opens the other.
+
+    File counts differ between steps, and that is expected: the import's disk line counts the
+    files `import.ts` wrote (ciphertext files plus empty ones), and `install.ts` reports the same
+    set as `N/N` (the rehearsal runs on a copy and changes nothing). Once the guest runs it
+    applies V16..V20, rewrites tables (new relation files replace old ones), writes WAL and
+    checkpoints, so the node's count drifts from the install's from the first start. Compare the
+    node with its copy in the same pause, never with the install's count.
 
     `directory` is never dropped without a restorable copy verified this way.
 13. **Retire** the old workload, the `directory` BackingService and tenant `identity`. Destroy
@@ -601,11 +777,38 @@ guests run at once: they share the signing key, and their refresh-token state di
 2. If the route moved (step 10), move it back to tenant `identity`.
 3. Only then restore the old guest's replicas from step 2 and check that
    `Host: identity.identity.localhost` answers `/health` (and `$ISSUER`, if the route moved).
-4. Remove the new tenant's workload.
+4. Remove the new tenant's workload, in `di-tenant-$NEW`:
+   ```sh
+   kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" delete workloaddeployment identity
+   kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" delete secret identity-control   # every runtime secret and DI_PGLITE_KEY
+   kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" get services                     # the deploy's Service for the workload
+   kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" delete service identity          # if it is still listed
+   ```
+   This leaves the node data directory (`$TARGET` from step 7) in place: it is the new guest's
+   data, encrypted under step 4's `DI_PGLITE_KEY`, and the only copy of anything written after
+   step 8 (which is not copied back). Because it is not empty, `install.ts` (its dry run and
+   `--yes`) refuses tenant `$NEW` from then on.
 
 Data written to the new guest after step 8 is not copied back.
 
+**Roll forward after a rollback: into a fresh tenant.** Do not reuse `$NEW`. The old guest took
+writes again after rollback step 3, so the cutover starts over: pick another tenant name
+(`NEW=identity-pg2`), and run P0..P2 and steps 1..12 again, with a new export (`rm -rf
+"$OUT/export" "$OUT/data"` first; both hold secrets) and so a new `values.json` and a new
+`DI_PGLITE_KEY`. There is deliberately no `install.ts --wipe-target`: wiping would delete, through
+a root pod, the only copy of what the rolled-back guest wrote, and a fresh tenant needs no new
+destructive tooling and costs only a name. Keep the first attempt's data directory and its
+`values.json` until whatever it holds is reviewed, then retire tenant `$NEW` (its directory goes
+with it, or by hand) and destroy that `values.json`.
+
 #### Proof of the cutover tooling
+
+A later full rehearsal on `pgprove` ran the runbook end to end on a cluster. What it found
+(rehearsal sign-in checks, the step 9 slug, the freeze's idle connection, the confirmation
+value, the image check, rollback and roll-forward, the first push into a new tenant, the step 12
+backup checks) is folded into the runbook and tools above. Separately, authproto's
+`identity_runtime_secret` turned out to override the eight bootstrap identity settings, which
+the export now carries (P0).
 
 2026-10-12. The live pgprove run was not possible: `kubesolo-pgprove` (stopped with exit 137)
 restarted in a loop because Kubesolo could not pull `rancher/local-path-provisioner` through the

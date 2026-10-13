@@ -34,6 +34,36 @@ export const RUNTIME_SECRET_SETTINGS = [
 ] as const;
 
 /**
+ * The bootstrap identity: who the owner and viewer are and which organization they bootstrap.
+ * The compiled-in wasi:config (`IdentityConfig` in bindings.ts) holds the defaults; an
+ * environment value overrides them, as the Postgres-era guest's `identity_runtime_secret` rows
+ * did when it merged that table over wasi:config. authproto set all eight there, so the cutover
+ * carries them through the values file and the `identity-control` Secret; without them the new
+ * guest's bootstrap fingerprint would differ and it would reconcile a second owner, viewer and
+ * organization from the defaults.
+ *
+ * They are personal data (logins, emails, names), not secrets: kept apart from
+ * `RUNTIME_SECRET_SETTINGS` so nothing treats them as credentials, but travelling in the same
+ * Secret, because that is the only channel into the guest's environment, and never logged.
+ */
+export const RUNTIME_BOOTSTRAP_IDENTITY_SETTINGS = [
+  'AUTH_BOOTSTRAP_ORGANIZATION_SLUG',
+  'AUTH_BOOTSTRAP_ORGANIZATION_NAME',
+  'AUTH_BOOTSTRAP_OWNER_LOGIN',
+  'AUTH_BOOTSTRAP_OWNER_EMAIL',
+  'AUTH_BOOTSTRAP_OWNER_DISPLAY_NAME',
+  'AUTH_BOOTSTRAP_VIEWER_LOGIN',
+  'AUTH_BOOTSTRAP_VIEWER_EMAIL',
+  'AUTH_BOOTSTRAP_VIEWER_DISPLAY_NAME',
+] as const;
+
+/** Every name the guest reads from its environment. */
+export const RUNTIME_ENV_SETTINGS = [
+  ...RUNTIME_SECRET_SETTINGS,
+  ...RUNTIME_BOOTSTRAP_IDENTITY_SETTINGS,
+] as const;
+
+/**
  * Without these the guest would sign tokens for the default `http://localhost:4180` issuer, or
  * with no key at all. A deploy that wrote the control Secret without them (a plain
  * `di-framework platform deploy` rewrites it with only its control token) must fail closed.
@@ -56,14 +86,17 @@ export class MissingRuntimeSecretsError extends Error {
   }
 }
 
-/** Merge wasi:config with the runtime secrets from the environment. Environment values win. */
+/**
+ * Merge wasi:config with the runtime settings from the environment (`RUNTIME_ENV_SETTINGS`).
+ * Environment values win, also over the bootstrap identity defaults.
+ */
 export async function loadGuestSettings(
   config: ConfigStore,
   env: GuestEnv,
 ): Promise<IdentitySettings> {
   const merged: Record<string, string> = {};
   for (const [key, value] of await config.getAll()) merged[key] = value;
-  for (const key of RUNTIME_SECRET_SETTINGS) {
+  for (const key of RUNTIME_ENV_SETTINGS) {
     const value = env[key];
     if (value !== undefined) merged[key] = value;
   }

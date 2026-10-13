@@ -11,11 +11,17 @@ import {
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  RUNTIME_BOOTSTRAP_IDENTITY_SETTINGS,
+  RUNTIME_SECRET_SETTINGS,
+} from '../../apps/guest/src/settings.ts';
+import {
+  BOOTSTRAP_IDENTITY_NAMES,
   decodePgliteKey,
   PGLITE_KEY_NAMES,
   parseGuestConfig,
   pgliteKeyCheckValue,
   RUNTIME_SECRET_NAMES,
+  RUNTIME_SETTING_NAMES,
   VALUE_NAMES,
 } from '../platform/components/control-secret.ts';
 
@@ -164,7 +170,13 @@ describe('the committed guest config', () => {
 
   test('declares every runtime value and both data directory keys in controlSecretKeys', () => {
     expect(config.controlSecretKeys).toEqual([...VALUE_NAMES]);
-    expect(VALUE_NAMES).toEqual([...RUNTIME_SECRET_NAMES, ...PGLITE_KEY_NAMES]);
+    expect(VALUE_NAMES).toEqual([...RUNTIME_SETTING_NAMES, ...PGLITE_KEY_NAMES]);
+    // The tooling's names are exactly the names the guest reads from its environment.
+    expect(RUNTIME_SECRET_NAMES).toEqual([...RUNTIME_SECRET_SETTINGS]);
+    expect(BOOTSTRAP_IDENTITY_NAMES).toEqual([...RUNTIME_BOOTSTRAP_IDENTITY_SETTINGS]);
+    // The bootstrap identity overrides the Postgres-era guest read from identity_runtime_secret.
+    expect(config.controlSecretKeys).toContain('AUTH_BOOTSTRAP_OWNER_LOGIN');
+    expect(config.controlSecretKeys).toContain('AUTH_BOOTSTRAP_ORGANIZATION_SLUG');
     expect(config.controlSecretKeys).toContain('DI_PGLITE_KEY');
     expect(config.controlSecretKeys).toContain('DI_PGLITE_KEY_PREVIOUS');
     // The column encryption keys stay alongside.
@@ -192,10 +204,12 @@ describe('deploy.sh', () => {
       'di-framework',
       `case "$*" in "platform deploy"*) if [ -n "\${STUB_DEPLOY_EXIT:-}" ]; then echo "WorkloadDeployment x did not become ready"; exit "$STUB_DEPLOY_EXIT"; fi ;; esac\nexit 0`,
     );
-    // STUB_READY is what the WorkloadDeployment's Ready condition reads (default True).
+    // STUB_READY is what the WorkloadDeployment's Ready condition reads (default True);
+    // STUB_WORKLOAD what an existence check (--ignore-not-found) prints (default: it exists),
+    // STUB_WORKLOAD_EXIT that check's failure.
     record(
       'kubectl',
-      `case "$*" in *" create --raw "*|*" replace --raw "*) cat >"${calls}/$n.stdin" ;; *" get workloaddeployment "*) printf '%s' "\${STUB_READY:-True}" ;; *" --all-namespaces "*) if [ -n "\${STUB_FORBIDDEN:-}" ]; then echo 'Error from server (Forbidden): backingservices.platform.di-framework.dev is forbidden' >&2; exit 1; fi; printf '%s' "\${STUB_BACKINGSERVICES:-}" ;; *" get deployment hostgroup-tenant-"*) printf '%s' "\${STUB_HOST_IMAGE:-ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive}" ;; esac\nexit 0`,
+      `case "$*" in *" create --raw "*|*" replace --raw "*) cat >"${calls}/$n.stdin" ;; *" get workloaddeployment "*"--ignore-not-found"*) if [ -n "\${STUB_WORKLOAD_EXIT:-}" ]; then exit "$STUB_WORKLOAD_EXIT"; fi; printf '%s' "\${STUB_WORKLOAD-workloaddeployment.platform.di-framework.dev/identity}" ;; *" get workloaddeployment "*) printf '%s' "\${STUB_READY:-True}" ;; *" --all-namespaces "*) if [ -n "\${STUB_FORBIDDEN:-}" ]; then echo 'Error from server (Forbidden): backingservices.platform.di-framework.dev is forbidden' >&2; exit 1; fi; printf '%s' "\${STUB_BACKINGSERVICES:-}" ;; *" get deployment hostgroup-tenant-"*) printf '%s' "\${STUB_HOST_IMAGE:-ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive}" ;; esac\nexit 0`,
     );
     return { bin, calls };
   }
@@ -300,7 +314,49 @@ describe('deploy.sh', () => {
     const failed = deployWith(path, broken.bin, { STUB_DEPLOY_EXIT: '2' });
     expect(failed.code).toBe(3);
     expect(failed.stderr).toContain(`deploy of identity failed (exit 2); once fixed, ${recovery}`);
-    expect(argvOf(broken.calls).some((line) => line.includes('workloaddeployment'))).toBe(false);
+    // It only checked that the workload exists; it neither waited nor patched.
+    expect(argvOf(broken.calls).filter((line) => line.includes('workloaddeployment'))).toEqual([
+      'kubectl --kubeconfig ' +
+        join(work, 'kubeconfig') +
+        ' --context test --namespace di-tenant-pgprove get workloaddeployment identity --ignore-not-found -o name',
+    ]);
+  });
+
+  test('a deploy that failed before the workload existed says to re-run the deploy, not apply', () => {
+    const { path } = generate();
+    const redeploy = `${deployScript} pgprove pgprove ${path}`;
+    // The first deploy into a new tenant: the push 404s, no WorkloadDeployment was created.
+    const fresh = stubs();
+    const first = deployWith(path, fresh.bin, { STUB_DEPLOY_EXIT: '1', STUB_WORKLOAD: '' });
+    expect(first.code).toBe(3);
+    expect(first.stderr).toContain(
+      `deploy of identity failed (exit 1) before di-tenant-pgprove had a WorkloadDeployment identity, so there is nothing for runtime-secrets.ts apply to update. On a new tenant, wait until WorkloadDeployment di-tenant-registry in di-tenant-pgprove is Ready. Once fixed, re-run the deploy: ${redeploy}`,
+    );
+    expect(first.stderr).not.toContain(' apply --values');
+    expect(argvOf(fresh.calls).some((line) => line.includes('patch'))).toBe(false);
+
+    // The cutover's confirmation is part of the command to re-run (it names no secret).
+    const cutover = stubs();
+    const confirmed = deployWith(path, cutover.bin, {
+      STUB_DEPLOY_EXIT: '1',
+      STUB_WORKLOAD: '',
+      IDENTITY_AUTHPROTO_CUTOVER: 'authproto/pgprove',
+    });
+    expect(confirmed.stderr).toContain(
+      `re-run the deploy: IDENTITY_AUTHPROTO_CUTOVER=authproto/pgprove ${redeploy}`,
+    );
+
+    // When kubectl cannot tell, both commands, each with its condition.
+    const unknown = stubs();
+    const unsure = deployWith(path, unknown.bin, {
+      STUB_DEPLOY_EXIT: '1',
+      STUB_WORKLOAD_EXIT: '1',
+    });
+    expect(unsure.code).toBe(3);
+    expect(unsure.stderr).toContain(
+      'kubectl could not tell whether WorkloadDeployment identity exists in di-tenant-pgprove. Once fixed: if it exists, run: bun ',
+    );
+    expect(unsure.stderr).toContain(`; if not, re-run the deploy: ${redeploy}`);
   });
 
   test('authproto only as the confirmed cutover into a new tenant, refused before the build', () => {

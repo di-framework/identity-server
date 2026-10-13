@@ -16,6 +16,7 @@ import {
   controlSecretDocument,
   decodePgliteKey,
   defaultKubeStateDir,
+  EXCLUSIVE_HOST_DIGEST_ENV,
   ensurePgliteKey,
   type GuestConfig,
   type Kubectl,
@@ -485,6 +486,90 @@ describe('the Pulumi preflight before any resource', () => {
     await expect(assertDeployTarget(kubectl({}).run, { ...target, tenant: 'Bad' })).rejects.toThrow(
       'is not a DNS-1123 label',
     );
+  });
+
+  test('the exclusive host image is matched by name, and pinned by digest only on request', async () => {
+    const digest = `sha256:${'ab'.repeat(32)}`;
+    const other = `sha256:${'cd'.repeat(32)}`;
+    const image = 'ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive';
+    const responses = (pods: string): Record<string, Partial<KubectlResult>> => ({
+      '--all-namespaces': { stdout: 'di-tenant-identity/directory\n' },
+      'get deployment hostgroup-tenant-identity-pg': { stdout: image },
+      'get pods': { stdout: pods },
+    });
+    const run = (pods: string | Partial<KubectlResult>) => {
+      const map =
+        typeof pods === 'string' ? responses(pods) : { ...responses(''), 'get pods': pods };
+      const calls: string[][] = [];
+      const kubectl: Kubectl = async (args) => {
+        calls.push(args);
+        const key = Object.keys(map).find((part) => args.join(' ').includes(part));
+        return { code: 0, stdout: '', stderr: '', ...(key ? map[key] : {}) };
+      };
+      return { kubectl, calls };
+    };
+    const confirmed = {
+      instance: 'authproto',
+      tenant: 'identity-pg',
+      confirmation: 'authproto/identity-pg',
+      legacyKubeconfig: false,
+    };
+    const pod = (name: string, phase: string, id: string) => `${name}\t${phase}\t${id}\n`;
+    const good = pod(
+      'hostgroup-tenant-identity-pg-7d9-abcde',
+      'Running',
+      `ghcr.io/di-framework/wash@${digest}`,
+    );
+
+    // Without a pin, the name is enough and no pod is read.
+    const unpinned = run('');
+    expect(await assertDeployTarget(unpinned.kubectl, confirmed)).toBe('authproto-cutover');
+    expect(unpinned.calls.some((args) => args.includes('pods'))).toBe(false);
+    expect(await assertDeployTarget(run('').kubectl, { ...confirmed, hostDigest: '' })).toBe(
+      'authproto-cutover',
+    );
+
+    // Pinned: every running host pod must report the digest; other pods are ignored.
+    const pinned = run(
+      good +
+        pod('hostgroup-tenant-identity-pg-7d9-old', 'Succeeded', `x@${other}`) +
+        pod('cache-1', 'Running', `x@${other}`),
+    );
+    expect(await assertDeployTarget(pinned.kubectl, { ...confirmed, hostDigest: digest })).toBe(
+      'authproto-cutover',
+    );
+    expect(pinned.calls.at(-1)?.slice(0, 4)).toEqual([
+      '--namespace',
+      'di-runtime-identity-pg',
+      'get',
+      'pods',
+    ]);
+    await expect(
+      assertDeployTarget(
+        run(good + pod('hostgroup-tenant-identity-pg-7d9-fghij', 'Running', `x@${other}`)).kubectl,
+        { ...confirmed, hostDigest: digest },
+      ),
+    ).rejects.toThrow(
+      'hostgroup-tenant-identity-pg-7d9-fghij does not run the pinned IDENTITY_EXCLUSIVE_HOST_DIGEST image; refusing',
+    );
+    await expect(
+      assertDeployTarget(run(pod('hostgroup-tenant-identity-pg-a-b', 'Running', '')).kubectl, {
+        ...confirmed,
+        hostDigest: digest,
+      }),
+    ).rejects.toThrow('does not run the pinned');
+    await expect(
+      assertDeployTarget(run('').kubectl, { ...confirmed, hostDigest: digest }),
+    ).rejects.toThrow('no running hostgroup-tenant-identity-pg pod to check the image digest of');
+    await expect(
+      assertDeployTarget(run({ code: 1 }).kubectl, { ...confirmed, hostDigest: digest }),
+    ).rejects.toThrow('cannot list the tenant host pods of identity-pg (kubectl exit 1)');
+    for (const bad of ['ab'.repeat(32), 'sha256:abc', `sha256:${'AB'.repeat(32)}`]) {
+      await expect(
+        assertDeployTarget(run(good).kubectl, { ...confirmed, hostDigest: bad }),
+      ).rejects.toThrow('IDENTITY_EXCLUSIVE_HOST_DIGEST must be sha256:<64 lowercase hex>');
+    }
+    expect(EXCLUSIVE_HOST_DIGEST_ENV).toBe('IDENTITY_EXCLUSIVE_HOST_DIGEST');
   });
 
   test('JSON errors name the input, never echo it', () => {

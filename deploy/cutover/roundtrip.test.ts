@@ -9,7 +9,7 @@ import {
   type SqlDatabase,
 } from '../../apps/guest/src/database.ts';
 import { applySchema, embeddedMigrations } from '../../apps/guest/src/migrations.ts';
-import { handle, resetGuest } from '../../apps/guest/src/runtime.ts';
+import { bootstrapFingerprint, handle, resetGuest } from '../../apps/guest/src/runtime.ts';
 import { RUNTIME_SECRET_SETTINGS } from '../../apps/guest/src/settings.ts';
 import { useContainer } from '../../apps/guest/tests/support/container.ts';
 import { pgliteFixture } from '../../apps/guest/tests/support/pglite.ts';
@@ -19,6 +19,7 @@ import { Readiness } from '../../packages/core/src/bootstrap/application/readine
 import { IdentityModule } from '../../packages/core/src/composition.ts';
 import { NotificationWorker } from '../../packages/core/src/notifications/application/security-notifications.ts';
 import { PasswordHasher } from '../../packages/core/src/shared/infrastructure/crypto/passwords.ts';
+import { loadIdentitySettings } from '../../packages/core/src/shared/infrastructure/identity-settings.ts';
 import { withContainer } from '../../packages/core/tests/support/container-lock.ts';
 import {
   useTestDatabase,
@@ -27,6 +28,7 @@ import {
 import { rsaPrivateJwk } from '../../packages/core/tests/support/keys.ts';
 import { readSource, type SourceSession, writeExport } from './export-core.ts';
 import { importExport, type LoadedExport, loadExport } from './import-core.ts';
+import { rehearseChecks } from './rehearse-core.ts';
 
 /**
  * The cutover end to end on real engines: a Postgres-era source at V13, V14 and V15 (migrated by
@@ -58,8 +60,18 @@ const values = {
   SMTP_PASSWORD: 'smtp-legacy',
 };
 
-/** The Postgres-era schema at `version`, as the Postgres guest applied it, with synthetic rows. */
-async function seed(source: SqlDatabase, version: number): Promise<void> {
+/**
+ * The Postgres-era schema at `version`, as the Postgres guest applied it, with synthetic rows.
+ * `runtime` are the setting rows of identity_runtime_secret, `fingerprint` its bootstrap
+ * fingerprint row, and `extra` adds rows before the runtime rows.
+ */
+async function seed(
+  source: SqlDatabase,
+  version: number,
+  runtime: Record<string, string> = values,
+  fingerprint = 'stale-fingerprint',
+  extra?: (source: SqlDatabase) => Promise<void>,
+): Promise<void> {
   await applySchema(
     source,
     embeddedMigrations.filter((migration) => Number(migration.version) <= version),
@@ -103,9 +115,10 @@ async function seed(source: SqlDatabase, version: number): Promise<void> {
     `INSERT INTO auth_audit_records (id, action, target) VALUES ('00000000-0000-4000-8000-000000000004', 'admin.user_created', ?)`,
     [user],
   );
+  await extra?.(source);
   const rows: Array<[string, string]> = [
-    ...Object.entries(values),
-    ['bootstrap_fingerprint', 'stale-fingerprint'],
+    ...Object.entries(runtime),
+    ['bootstrap_fingerprint', fingerprint],
     ['bootstrap_client_fingerprints', '{}'],
     ['bootstrap_lease', '2026-10-01T00:00:00.000Z'],
   ];
@@ -125,10 +138,18 @@ const sessionOf =
     return String(Object.values(row ?? {})[0]);
   };
 
-async function exportAt(version: number): Promise<{ dir: string; loaded: LoadedExport }> {
+async function exportAt(
+  version: number,
+  scenario: {
+    runtime?: Record<string, string>;
+    fingerprint?: string;
+    extra?: (source: SqlDatabase) => Promise<void>;
+  } = {},
+): Promise<{ dir: string; loaded: LoadedExport }> {
+  const runtime = scenario.runtime ?? values;
   const dir = join(work, `${dirs++}-export-v${version}`);
   await withThrowawayDatabase(`identity_cutover_v${version}`, async (source) => {
-    await seed(source, version);
+    await seed(source, version, runtime, scenario.fingerprint, scenario.extra);
     const snapshot = await readSource(sessionOf(source));
     expect(snapshot.version).toBe(version);
     const manifest = await writeExport(dir, snapshot, {
@@ -139,7 +160,7 @@ async function exportAt(version: number): Promise<{ dir: string; loaded: LoadedE
       },
     });
     expect(manifest.runtimeRows).toEqual({
-      values: Object.keys(values).sort(),
+      values: Object.keys(runtime).sort(),
       state: ['bootstrap_client_fingerprints', 'bootstrap_fingerprint'],
       dropped: ['bootstrap_lease'],
     });
@@ -393,3 +414,168 @@ test('the import refuses exports that do not match, and leaves nothing behind', 
   writeFileSync(join(other, 'state.json'), '{"SMTP_HOST":"x"}');
   expect(() => loadExport(other)).toThrow('state.json holds rows that are not bootstrap state');
 }, 120_000);
+
+/**
+ * authproto's identity_runtime_secret also overrides the eight bootstrap identity settings
+ * (organization, owner and viewer), all to non-default values. The Postgres-era guest merged
+ * those rows over wasi:config, bootstrapped that organization and those people, and stored the
+ * fingerprint of those settings. The cutover must carry them so the new guest computes the same
+ * fingerprint and does not reconcile a second organization, owner and viewer from the defaults.
+ */
+test('non-default bootstrap identity rows are carried and the new guest does not reconcile bootstrap', async () => {
+  const identity = {
+    AUTH_BOOTSTRAP_ORGANIZATION_SLUG: 'acme',
+    AUTH_BOOTSTRAP_ORGANIZATION_NAME: 'Acme Corp',
+    AUTH_BOOTSTRAP_OWNER_LOGIN: 'root-admin',
+    AUTH_BOOTSTRAP_OWNER_EMAIL: 'root@acme.test',
+    AUTH_BOOTSTRAP_OWNER_DISPLAY_NAME: 'Root Admin',
+    AUTH_BOOTSTRAP_VIEWER_LOGIN: 'auditor',
+    AUTH_BOOTSTRAP_VIEWER_EMAIL: 'auditor@acme.test',
+    AUTH_BOOTSTRAP_VIEWER_DISPLAY_NAME: 'Auditor',
+  };
+  const runtime = { ...values, ...identity };
+  const defaults = guestConfig();
+  for (const [name, value] of Object.entries(identity)) expect(defaults[name]).not.toBe(value);
+  // The old guest's settings: every identity_runtime_secret row over wasi:config. Its
+  // bootstrapFingerprint is the current one (unchanged since 23be792).
+  const stored = bootstrapFingerprint(loadIdentitySettings({ ...defaults, ...runtime }));
+  // Without the eight rows the new guest would see the defaults, and another fingerprint.
+  expect(bootstrapFingerprint(loadIdentitySettings({ ...defaults, ...values }))).not.toBe(stored);
+
+  const ids = {
+    owner: '00000000-0000-4000-8000-0000000000a1',
+    viewer: '00000000-0000-4000-8000-0000000000a2',
+    org: '00000000-0000-4000-8000-0000000000a3',
+  };
+  // The viewer changed their password after bootstrap.
+  const VIEWER_CHANGED = 'viewer-changed-it';
+  const bootstrapRows = async (source: SqlDatabase) => {
+    const passwords = new PasswordHasher();
+    const person = `INSERT INTO users (id, login, normalized_login, email, normalized_email, password_hash, display_name, email_verified, status, system_role)
+       VALUES (?, ?, ?, ?, ?, ?, ?, true, 'active', ?)`;
+    await source.run(person, [
+      ids.owner,
+      identity.AUTH_BOOTSTRAP_OWNER_LOGIN,
+      identity.AUTH_BOOTSTRAP_OWNER_LOGIN,
+      identity.AUTH_BOOTSTRAP_OWNER_EMAIL,
+      identity.AUTH_BOOTSTRAP_OWNER_EMAIL,
+      await passwords.hash(values.AUTH_BOOTSTRAP_OWNER_PASSWORD),
+      identity.AUTH_BOOTSTRAP_OWNER_DISPLAY_NAME,
+      'platform_admin',
+    ]);
+    await source.run(person, [
+      ids.viewer,
+      identity.AUTH_BOOTSTRAP_VIEWER_LOGIN,
+      identity.AUTH_BOOTSTRAP_VIEWER_LOGIN,
+      identity.AUTH_BOOTSTRAP_VIEWER_EMAIL,
+      identity.AUTH_BOOTSTRAP_VIEWER_EMAIL,
+      await passwords.hash(VIEWER_CHANGED),
+      identity.AUTH_BOOTSTRAP_VIEWER_DISPLAY_NAME,
+      'user',
+    ]);
+    await source.run('INSERT INTO organizations (id, slug, name) VALUES (?, ?, ?)', [
+      ids.org,
+      identity.AUTH_BOOTSTRAP_ORGANIZATION_SLUG,
+      identity.AUTH_BOOTSTRAP_ORGANIZATION_NAME,
+    ]);
+    for (const [user, role] of [
+      [ids.owner, 'owner'],
+      [ids.viewer, 'member'],
+    ]) {
+      await source.run(
+        'INSERT INTO organization_memberships (organization_id, user_id, role) VALUES (?, ?, ?)',
+        [ids.org, user, role],
+      );
+    }
+    const clients = [
+      ['access', values.AUTH_ACCESS_CLIENT_SECRET, 'b1'],
+      ['directory', values.AUTH_DIRECTORY_CLIENT_SECRET, 'b2'],
+      ['provisioner', values.AUTH_PROVISIONER_CLIENT_SECRET, 'b3'],
+    ] as const;
+    for (const [client, secret, suffix] of clients) {
+      await source.run(
+        `INSERT INTO oauth2_registered_client (id, client_id, client_secret, client_name, client_authentication_methods, authorization_grant_types, redirect_uris, scopes, client_settings, token_settings)
+         VALUES (?, ?, ?, ?, 'client_secret_basic', 'client_credentials', '', 'directory:read',
+           '{"requireProofKey":false,"requireAuthorizationConsent":false}',
+           '{"authorizationCodeTtlSeconds":60,"accessTokenTtlSeconds":600,"refreshTokenTtlSeconds":2592000,"reuseRefreshTokens":false,"accessTokenFormat":"reference"}')`,
+        [
+          `00000000-0000-4000-8000-0000000000${suffix}`,
+          client,
+          await passwords.hash(secret),
+          client,
+        ],
+      );
+      await source.run('INSERT INTO oauth_client_lifecycle (client_id) VALUES (?)', [client]);
+    }
+  };
+  const { dir, loaded } = await exportAt(15, {
+    runtime,
+    fingerprint: stored,
+    extra: bootstrapRows,
+  });
+  // The export carries the eight rows into values.json, name for name.
+  expect(JSON.parse(readFileSync(join(dir, 'values.json'), 'utf8'))).toEqual(runtime);
+  expect(loaded.state.bootstrap_fingerprint).toBe(stored);
+
+  const fixture = pgliteFixture();
+  const root = '/data/identity-overrides';
+  const database = pgliteDatabase(fixture.module, () => ({ [DATABASE_ROOT_ENV]: root }));
+  try {
+    const db = await database();
+    await importExport(db, loaded, embeddedMigrations);
+    const count = async (sql: string, params: unknown[] = []) =>
+      Number((await db.first<{ n: unknown }>(sql, params as never))?.n);
+    const usersBefore = await count('SELECT count(*)::int AS n FROM users');
+    const organizationsBefore = await count('SELECT count(*)::int AS n FROM organizations');
+
+    const results = await withContainer(async () => {
+      try {
+        resetGuest();
+        useContainer().register(BootstrapReconciler);
+        useContainer().register(Readiness);
+        // The rehearsal itself, as rehearse.ts runs it on the import (values from the export).
+        return await rehearseChecks(db, runtime, loaded, { databaseRoot: root });
+      } finally {
+        await restoreContainer();
+      }
+    });
+    const byName = Object.fromEntries(results.map((result) => [result.name, result]));
+    expect(results.filter((result) => result.status === 'fail')).toEqual([]);
+    expect(byName['bootstrap not reconciled']).toMatchObject({
+      status: 'ok',
+      detail: 'fingerprint unchanged',
+    });
+    expect(byName['bootstrap organization']?.status).toBe('ok');
+    // The owner signs in with the source's login; the viewer's changed password is a note,
+    // with its carried hash proven.
+    expect(byName['owner sign-in']?.status).toBe('ok');
+    expect(byName['owner password hash carried']?.status).toBe('ok');
+    expect(byName['viewer password hash carried']?.status).toBe('ok');
+    expect(byName['viewer sign-in']).toMatchObject({
+      status: 'note',
+      detail: expect.stringContaining('password changed since bootstrap'),
+    });
+    // No new organization, owner or viewer from the defaults; the fingerprint is the source's.
+    expect(await count('SELECT count(*)::int AS n FROM organizations')).toBe(organizationsBefore);
+    expect(
+      await count("SELECT count(*)::int AS n FROM organizations WHERE slug = 'platform'"),
+    ).toBe(0);
+    expect(
+      await count(
+        "SELECT count(*)::int AS n FROM users WHERE normalized_login IN ('owner', 'viewer')",
+      ),
+    ).toBe(0);
+    expect(await count('SELECT count(*)::int AS n FROM users')).toBe(usersBefore);
+    const fingerprint = await db.first<{ value: string }>(
+      "SELECT value FROM identity_runtime_secret WHERE name = 'bootstrap_fingerprint'",
+    );
+    expect(fingerprint?.value).toBe(stored);
+    // Nothing the rehearsal reports holds a login, an email or a secret.
+    const printed = JSON.stringify(results);
+    for (const value of [...Object.values(identity), ...Object.values(values)]) {
+      if (value.length > 4) expect(printed).not.toContain(value);
+    }
+  } finally {
+    await fixture.shutdown();
+  }
+}, 180_000);

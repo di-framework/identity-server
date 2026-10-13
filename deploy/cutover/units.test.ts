@@ -13,7 +13,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { WasmPgValue } from '../../apps/guest/src/database.ts';
 import { pgliteFixture } from '../../apps/guest/tests/support/pglite.ts';
-import type { KubectlResult } from '../platform/components/control-secret.ts';
+import {
+  BOOTSTRAP_IDENTITY_NAMES,
+  type KubectlResult,
+  parseRuntimeValues,
+} from '../platform/components/control-secret.ts';
 import { bridgeModule, type Channel, fromWire, replyLine, toWire } from './bridge.ts';
 import {
   type Inventory,
@@ -35,6 +39,14 @@ import {
   tenantUid,
   workloadStoragePath,
 } from './install-core.ts';
+import {
+  bootstrapSetting,
+  classifySignIn,
+  compareHashes,
+  exportedPasswordHashDigest,
+  formatResult,
+  passwordHashDigest,
+} from './rehearse-core.ts';
 import {
   identifier,
   parseManifest,
@@ -69,6 +81,35 @@ describe('runtime secret rows', () => {
       state: { bootstrap_fingerprint: 'f', bootstrap_client_fingerprints: '{}' },
       dropped: ['bootstrap_lease'],
     });
+  });
+
+  test('the bootstrap identity rows authproto holds are carried name for name', () => {
+    // authproto's identity_runtime_secret overrides all eight compiled-in bootstrap defaults.
+    const identity = {
+      AUTH_BOOTSTRAP_ORGANIZATION_NAME: 'Org',
+      AUTH_BOOTSTRAP_ORGANIZATION_SLUG: 'org',
+      AUTH_BOOTSTRAP_OWNER_DISPLAY_NAME: 'Owner Person',
+      AUTH_BOOTSTRAP_OWNER_EMAIL: 'owner@org.test',
+      AUTH_BOOTSTRAP_OWNER_LOGIN: 'owner-person',
+      AUTH_BOOTSTRAP_VIEWER_DISPLAY_NAME: 'Viewer Person',
+      AUTH_BOOTSTRAP_VIEWER_EMAIL: 'viewer@org.test',
+      AUTH_BOOTSTRAP_VIEWER_LOGIN: 'viewer-person',
+    };
+    const split = splitRuntimeRows([
+      { name: 'ISSUER_URL', value: 'https://issuer.test' },
+      ...Object.entries(identity).map(([name, value]) => ({ name, value })),
+      { name: 'bootstrap_fingerprint', value: 'f' },
+    ]);
+    expect(split.values).toEqual({ ISSUER_URL: 'https://issuer.test', ...identity });
+    expect(split.state).toEqual({ bootstrap_fingerprint: 'f' });
+    expect(Object.keys(identity).sort()).toEqual([...BOOTSTRAP_IDENTITY_NAMES].sort());
+    // And the values file the export writes takes them.
+    expect(() =>
+      parseRuntimeValues(
+        JSON.stringify({ ...split.values, AUTH_PUBLIC_ORIGIN: 'x', AUTH_ACTIVE_PRIVATE_JWK: '{}' }),
+        'values.json',
+      ),
+    ).not.toThrow();
   });
 
   test('unknown names are refused, named but never with their values', () => {
@@ -561,4 +602,91 @@ test("the runner's WIT is the provider package's `types` and `database` interfac
   expect(vendored).toStartWith('package di-framework:pglite@0.2.0;');
   expect(strip(vendored)).toEqual(strip(published));
   expect(strip(vendored)[1]).toContain('resource connection');
+});
+
+describe('the rehearsal sign-in checks', () => {
+  const HASH = '$argon2id$v=19$m=19456,t=2,p=1$c2FsdHNhbHQ$aGFzaGhhc2hoYXNoaGFzaA';
+  const loaded = {
+    manifest: {} as never,
+    state: {},
+    rows: new Map([
+      [
+        'users',
+        JSON.stringify([
+          { login: 'Root-Admin', password_hash: HASH },
+          { login: 'no-password', password_hash: null },
+        ]),
+      ],
+    ]),
+  };
+
+  test('password hashes are compared as digests, never shown', () => {
+    expect(passwordHashDigest(HASH)).toBe(createHash('sha256').update(HASH).digest('hex'));
+    expect(passwordHashDigest(null)).toBeUndefined();
+    expect(passwordHashDigest('')).toBeUndefined();
+    // Logins match as the directory normalises them.
+    const exported = exportedPasswordHashDigest(loaded, ' root-admin ');
+    expect(exported).toEqual({ found: true, digest: passwordHashDigest(HASH) });
+    expect(exportedPasswordHashDigest(loaded, 'ghost')).toEqual({
+      found: false,
+      digest: undefined,
+    });
+    const same = { found: true, digest: passwordHashDigest(HASH) };
+    expect(compareHashes(exported, same)).toBe('same');
+    expect(compareHashes(exported, { found: true, digest: passwordHashDigest('other') })).toBe(
+      'differs',
+    );
+    // A user without a hash never counts as carried.
+    const none = exportedPasswordHashDigest(loaded, 'no-password');
+    expect(compareHashes(none, { found: true, digest: undefined })).toBe('differs');
+    expect(compareHashes(exported, { found: false, digest: undefined })).toBe('missing');
+    expect(compareHashes(undefined, same)).toBe('no-export');
+  });
+
+  test('a changed password is a note only when the hash was carried; other failures stay fatal', () => {
+    const signedIn = { status: 303, signedIn: true };
+    const rejected = { status: 303, signedIn: false };
+    expect(classifySignIn('owner', signedIn, 'no-export')).toEqual({
+      name: 'owner sign-in',
+      status: 'ok',
+      detail: 'HTTP 303, signed in: true with the bootstrap password',
+    });
+    const changed = classifySignIn('viewer', rejected, 'same');
+    expect(changed.status).toBe('note');
+    expect(changed.detail).toBe(
+      "HTTP 303, signed in: false: password changed since bootstrap (expected if the user changed it); the stored hash was carried unchanged (digest equals the export's)",
+    );
+    expect(formatResult(changed)).toStartWith('note viewer sign-in: HTTP 303');
+    // The owner gets the same rule.
+    expect(classifySignIn('owner', rejected, 'same').status).toBe('note');
+    // Not provable, or not carried: fatal.
+    expect(classifySignIn('viewer', rejected, 'no-export')).toMatchObject({
+      status: 'fail',
+      detail: expect.stringContaining('pass --export'),
+    });
+    expect(classifySignIn('viewer', rejected, 'differs')).toMatchObject({
+      status: 'fail',
+      detail: expect.stringContaining("differs from the export's"),
+    });
+    expect(classifySignIn('viewer', rejected, 'missing').status).toBe('fail');
+    // Anything but the login page's redirect is fatal, whatever the hash says.
+    for (const status of [200, 400, 500, 503]) {
+      expect(classifySignIn('owner', { status, signedIn: false }, 'same').status).toBe('fail');
+    }
+    expect(
+      formatResult(classifySignIn('owner', { status: 500, signedIn: false }, 'same')),
+    ).toStartWith('FAIL owner sign-in: HTTP 500');
+  });
+
+  test('bootstrap settings come from the values before wasi:config', () => {
+    const config = { AUTH_BOOTSTRAP_OWNER_LOGIN: 'owner' };
+    expect(bootstrapSetting('AUTH_BOOTSTRAP_OWNER_LOGIN', {}, config)).toBe('owner');
+    expect(
+      bootstrapSetting(
+        'AUTH_BOOTSTRAP_OWNER_LOGIN',
+        { AUTH_BOOTSTRAP_OWNER_LOGIN: 'root' },
+        config,
+      ),
+    ).toBe('root');
+  });
 });

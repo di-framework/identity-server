@@ -647,14 +647,49 @@ describe('installCommand', () => {
       (call) => call.args === '--namespace kube-system delete pod helper --wait=false',
     );
 
-  test('a dry run reads the cluster and changes nothing', async () => {
+  test('a dry run checks the target through a read-only pod and changes nothing', async () => {
     const stand = cluster();
     const sink = { logs: [] as string[], warnings: [] as string[] };
     const legacy: string[] = [];
     expect(await run(stand, { yes: false }, sink, legacy)).toBe('dry-run');
     expect(legacy).toEqual(['di-tenant-identity-pg']);
     expect(sink.logs).toContain(`target ${target} (the guest's /data)`);
-    expect(stand.calls.some((call) => /create|exec|delete/.test(call.args))).toBe(false);
+    expect(sink.logs).toContain('target is empty or absent (checked read-only on node-1)');
+    // The only pod: read-only, DAC_READ_SEARCH only, the existing di-tenants directory mounted.
+    const created = stand.calls.filter((call) => call.args === 'create -f -');
+    expect(created).toHaveLength(1);
+    const pod = JSON.parse(String(created[0]?.input));
+    expect(pod.spec.volumes).toEqual([
+      { name: 'tenants', hostPath: { path: '/var/lib/kubesolo/di-tenants', type: 'Directory' } },
+    ]);
+    const container = pod.spec.containers[0];
+    expect(container.volumeMounts).toEqual([
+      { name: 'tenants', mountPath: '/tenants', readOnly: true },
+    ]);
+    expect(container.securityContext.capabilities).toEqual({
+      drop: ['ALL'],
+      add: ['DAC_READ_SEARCH'],
+    });
+    expect(container.securityContext.readOnlyRootFilesystem).toBe(true);
+    const exec = stand.calls.filter((call) => call.args.includes(' exec '));
+    expect(exec.map((call) => call.args.split(' -- sh -c ')[1])).toEqual([
+      `if [ -d /tenants/${uid}/workloads/identity ]; then ls -A /tenants/${uid}/workloads/identity; fi`,
+    ]);
+    expect(exec.some((call) => call.input !== undefined)).toBe(false);
+    expect(deleted(stand)).toBe(true);
+  });
+
+  test('a dry run reports a non-empty target (a rolled-back cutover) and still deletes the pod', async () => {
+    const stand = cluster({ 'then ls -A': { stdout: '.di-encfs\npglite\n' } });
+    await expect(run(stand, { yes: false })).rejects.toThrow(
+      `${target} is not empty (2 entries); refusing to install. A rolled-back cutover leaves its data here: roll forward into a fresh tenant`,
+    );
+    expect(deleted(stand)).toBe(true);
+    // A pod that cannot be deleted is named, with what it mounts.
+    const stuck = cluster({ 'delete pod helper': { code: 1 } });
+    await expect(run(stuck, { yes: false })).rejects.toThrow(
+      'could not delete the helper pod kube-system/helper (kubectl exit 1); it mounts /var/lib/kubesolo/di-tenants read-only',
+    );
   });
 
   test('installs: empty check, archive, modes before owner, digests, and the pod is deleted', async () => {

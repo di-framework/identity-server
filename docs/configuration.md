@@ -321,8 +321,12 @@ places and never from its database:
   `AUTH_ACCESS_CLIENT_SECRET`, `AUTH_DIRECTORY_CLIENT_SECRET`, `AUTH_PROVISIONER_CLIENT_SECRET`,
   `AUTH_CLI_CLIENT_ID`, `AUTH_CLI_REDIRECT_URIS`, and for [column encryption](#column-encryption)
   `IDENTITY_COLUMN_ENCRYPTION`, `IDENTITY_COLUMN_KEY`, `IDENTITY_BIDX_KEY`
-  (`RUNTIME_SECRET_SETTINGS` in `apps/guest/src/settings.ts`). An environment value wins over
-  wasi:config. The same Secret carries `DI_PGLITE_KEY` (and, during a rotation,
+  (`RUNTIME_SECRET_SETTINGS` in `apps/guest/src/settings.ts`). Optionally also the bootstrap
+  identity, which overrides the compiled-in defaults: `AUTH_BOOTSTRAP_ORGANIZATION_SLUG`,
+  `AUTH_BOOTSTRAP_ORGANIZATION_NAME`, and `AUTH_BOOTSTRAP_{OWNER,VIEWER}_{LOGIN,EMAIL,DISPLAY_NAME}`
+  (`RUNTIME_BOOTSTRAP_IDENTITY_SETTINGS`; personal data, not secrets, never logged; the authproto
+  cutover carries them from the Postgres-era `identity_runtime_secret`). An environment value
+  wins over wasi:config. The same Secret carries `DI_PGLITE_KEY` (and, during a rotation,
   `DI_PGLITE_KEY_PREVIOUS`) for the [data directory encryption](#data-directory-encryption) layer;
   the guest code never reads them.
 

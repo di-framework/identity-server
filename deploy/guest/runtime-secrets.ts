@@ -39,7 +39,9 @@
  *     state directory, or the cluster has a `directory` BackingService in any namespace), it also
  *     fails unless the tenant is not `identity`, IDENTITY_AUTHPROTO_CUTOVER is exactly
  *     `authproto/<tenant>` and the tenant host runs the exclusive-instance wash build (the
- *     signed-off cutover, docs/guest-http-api.md#authproto-cutover). `apply` runs it first.
+ *     signed-off cutover, docs/guest-http-api.md#authproto-cutover). That image check matches
+ *     the name only (`wash:*exclusive`); with IDENTITY_EXCLUSIVE_HOST_DIGEST=sha256:<hex> every
+ *     running tenant host pod must also report that digest in its imageID. `apply` runs it first.
  *
  *   bun deploy/guest/runtime-secrets.ts apply --values <file> --kubeconfig <path> --tenant <name>
  *       [--context <name>] [--config <file>]
@@ -67,6 +69,7 @@ import {
   COLUMN_KEY_NAMES,
   CUTOVER_CONFIRM_ENV,
   defaultKubeStateDir,
+  EXCLUSIVE_HOST_DIGEST_ENV,
   ensurePgliteKey,
   type Kubectl,
   kubeconfigIsLegacy,
@@ -203,6 +206,7 @@ async function guard(tenant: string): Promise<void> {
     confirmation: process.env[CUTOVER_CONFIRM_ENV],
     legacyKubeconfig,
     warn: (line) => console.error(`warning: ${line}`),
+    hostDigest: process.env[EXCLUSIVE_HOST_DIGEST_ENV]?.trim(),
   });
   if (allowed === 'authproto-cutover') {
     console.log(`authproto cutover confirmed for the new tenant ${tenant}`);

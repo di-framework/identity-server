@@ -10,8 +10,10 @@
  *       [--namespace kube-system] [--allow-existing-workload] [--yes]
  *
  * Without --yes it is a dry run: it reads the tenant's uid, the node's storage root (from the
- * host paths the platform already mounts, or --storage-root), the node, and checks the tenant,
- * then prints the plan and changes nothing. With --yes it also:
+ * host paths the platform already mounts, or --storage-root), the node, and checks the tenant;
+ * then it lists the target through a read-only helper pod (root with DAC_READ_SEARCH only,
+ * `<root>/di-tenants` mounted read-only, deleted afterwards) and refuses a non-empty target, as
+ * --yes would; then it prints the plan. It changes nothing on the node. With --yes it also:
  *
  *   1. starts a helper pod on the node (the image the platform's storage init uses, root with
  *      CHOWN and DAC_OVERRIDE only) with exactly `<root>/di-tenants/<uid>/workloads/<workload>`
@@ -25,7 +27,9 @@
  *   6. deletes the helper pod, also on failure; a failed delete is an error naming the pod.
  *
  * Refuses: a tenant with the Postgres `directory` BackingService; a data directory whose
- * `.di-encfs` KCV is not the values file's DI_PGLITE_KEY KCV; a non-empty target; a tenant that
+ * `.di-encfs` KCV is not the values file's DI_PGLITE_KEY KCV; a non-empty target (in the dry run
+ * too; a rolled-back cutover leaves one, and the runbook rolls forward into a fresh tenant
+ * rather than wiping it); a tenant that
  * already has the WorkloadDeployment (its host could initialise the directory first) unless
  * --allow-existing-workload. Prints paths, counts and KCVs only. Deploy the guest with
  * deploy/guest/deploy.sh afterwards.

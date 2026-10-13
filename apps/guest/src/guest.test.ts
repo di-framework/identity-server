@@ -27,6 +27,8 @@ import {
   loadGuestSettings,
   MissingRuntimeSecretsError,
   REQUIRED_RUNTIME_SECRETS,
+  RUNTIME_BOOTSTRAP_IDENTITY_SETTINGS,
+  RUNTIME_ENV_SETTINGS,
   RUNTIME_SECRET_SETTINGS,
 } from './settings.ts';
 
@@ -191,6 +193,65 @@ test('runtime secrets come from the environment and override wasi config', async
   expect(RUNTIME_SECRET_SETTINGS).toContain('AUTH_DIRECTORY_CLIENT_SECRET');
   expect(getBindingMetadata(IdentityConfig)?.options.config?.SMTP_HOST).toBeUndefined();
   expect(getBindingMetadata(IdentityConfig)?.options.secretFrom).toBeUndefined();
+});
+
+test('the bootstrap identity defaults to wasi config and the environment overrides it', async () => {
+  const config = {
+    getAll: () =>
+      Object.entries(getBindingMetadata(IdentityConfig)?.options.config ?? {}) as Array<
+        [string, string]
+      >,
+  };
+  const required = {
+    ISSUER_URL: 'http://issuer',
+    AUTH_PUBLIC_ORIGIN: 'http://issuer',
+    AUTH_ACTIVE_PRIVATE_JWK: '{"kty":"RSA"}',
+  };
+  // Without the overrides: the compiled-in defaults, as before.
+  const defaults = (await loadGuestSettings(config, required)).bootstrap;
+  expect(defaults).toEqual({
+    owner: expect.objectContaining({
+      login: 'owner',
+      email: 'owner@identity.local',
+      displayName: 'Owner',
+    }),
+    viewer: expect.objectContaining({
+      login: 'viewer',
+      email: 'viewer@identity.local',
+      displayName: 'Viewer',
+    }),
+    organization: { slug: 'platform', name: 'Platform' },
+  });
+  // With them (the Postgres-era identity_runtime_secret rows, carried by the cutover): theirs.
+  const overrides = {
+    AUTH_BOOTSTRAP_ORGANIZATION_SLUG: 'acme',
+    AUTH_BOOTSTRAP_ORGANIZATION_NAME: 'Acme',
+    AUTH_BOOTSTRAP_OWNER_LOGIN: 'root-admin',
+    AUTH_BOOTSTRAP_OWNER_EMAIL: 'root@acme.test',
+    AUTH_BOOTSTRAP_OWNER_DISPLAY_NAME: 'Root Admin',
+    AUTH_BOOTSTRAP_VIEWER_LOGIN: 'auditor',
+    AUTH_BOOTSTRAP_VIEWER_EMAIL: 'auditor@acme.test',
+    AUTH_BOOTSTRAP_VIEWER_DISPLAY_NAME: 'Auditor',
+  };
+  expect(Object.keys(overrides)).toEqual([...RUNTIME_BOOTSTRAP_IDENTITY_SETTINGS]);
+  expect(RUNTIME_ENV_SETTINGS).toEqual([
+    ...RUNTIME_SECRET_SETTINGS,
+    ...RUNTIME_BOOTSTRAP_IDENTITY_SETTINGS,
+  ]);
+  const overridden = (await loadGuestSettings(config, { ...required, ...overrides })).bootstrap;
+  expect(overridden).toEqual({
+    owner: expect.objectContaining({
+      login: 'root-admin',
+      email: 'root@acme.test',
+      displayName: 'Root Admin',
+    }),
+    viewer: expect.objectContaining({
+      login: 'auditor',
+      email: 'auditor@acme.test',
+      displayName: 'Auditor',
+    }),
+    organization: { slug: 'acme', name: 'Acme' },
+  });
 });
 
 test('a control Secret without the runtime settings fails closed and names only the keys', async () => {
