@@ -12,7 +12,7 @@
  * Without --yes it is a dry run: it reads the tenant's uid, the node's storage root (from the
  * host paths the platform already mounts, or --storage-root), the node, and checks the tenant;
  * then it lists the target through a read-only helper pod (root with DAC_READ_SEARCH only,
- * `<root>/di-tenants` mounted read-only, deleted afterwards) and refuses a non-empty target, as
+ * only `<root>/di-tenants/<uid>` mounted read-only, never created; deleted afterwards) and refuses a non-empty target, as
  * --yes would; then it prints the plan. It changes nothing on the node. With --yes it also:
  *
  *   1. starts a helper pod on the node (the image the platform's storage init uses, root with

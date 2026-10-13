@@ -10,7 +10,7 @@ import {
 } from '../../apps/guest/src/database.ts';
 import { applySchema, embeddedMigrations } from '../../apps/guest/src/migrations.ts';
 import { bootstrapFingerprint, handle, resetGuest } from '../../apps/guest/src/runtime.ts';
-import { RUNTIME_SECRET_SETTINGS } from '../../apps/guest/src/settings.ts';
+import { RUNTIME_ENV_SETTINGS } from '../../apps/guest/src/settings.ts';
 import { useContainer } from '../../apps/guest/tests/support/container.ts';
 import { pgliteFixture } from '../../apps/guest/tests/support/pglite.ts';
 import { Browser } from '../../apps/server/tests/support/browser.ts';
@@ -226,7 +226,7 @@ test('a V15 export imports into pglite and the current guest boots on it with th
         });
         const env = {
           ...Object.fromEntries(
-            RUNTIME_SECRET_SETTINGS.flatMap((name) =>
+            RUNTIME_ENV_SETTINGS.flatMap((name) =>
               name in values ? [[name, values[name as keyof typeof values]]] : [],
             ),
           ),
@@ -551,6 +551,8 @@ test('non-default bootstrap identity rows are carried and the new guest does not
     expect(byName['owner sign-in']?.status).toBe('ok');
     expect(byName['owner password hash carried']?.status).toBe('ok');
     expect(byName['viewer password hash carried']?.status).toBe('ok');
+    expect(byName['owner password hash format']?.status).toBe('ok');
+    expect(byName['viewer password hash format']?.status).toBe('ok');
     expect(byName['viewer sign-in']).toMatchObject({
       status: 'note',
       detail: expect.stringContaining('password changed since bootstrap'),

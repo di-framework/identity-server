@@ -73,6 +73,75 @@ export async function importedPasswordHashDigest(
   return { found: row !== undefined, digest: passwordHashDigest(row?.password_hash) };
 }
 
+/**
+ * The non-secret head of an Argon2 PHC string, `$argon2id$v=19$m=…,t=…,p=…`: algorithm, version
+ * and parameters, without the salt and the hash. Undefined for anything PasswordHasher does not
+ * verify (it accepts only `$argon2…` PHC strings).
+ */
+export function hashFormat(hash: unknown): string | undefined {
+  if (typeof hash !== 'string' || !hash.startsWith('$argon2')) return undefined;
+  const parts = hash.split('$');
+  if (parts.length !== 6 || parts.some((part, index) => index > 0 && part === '')) return undefined;
+  return parts.slice(0, 4).join('$');
+}
+
+/**
+ * Whether a bootstrap user's stored password hash has the format of the bootstrap clients'
+ * secret hashes, which the clients' introspection checks prove PasswordHasher verifies. This
+ * closes what a `note` for a changed password would otherwise leave open: a user hash in a format
+ * the new guest cannot verify. The same head (algorithm, version, parameters) is `ok`; the same
+ * algorithm and version with other parameters is a `note` (verification reads the parameters from
+ * the hash); anything else fails. The detail names the algorithm only, never the hash.
+ */
+export function classifyHashFormat(
+  who: string,
+  user: string | undefined,
+  clients: ReadonlyArray<string | undefined>,
+): CheckResult {
+  const name = `${who} password hash format`;
+  const algorithm = (head: string) => head.split('$').slice(1, 3).join('$');
+  const known = [...new Set(clients.filter((head): head is string => head !== undefined))];
+  if (user === undefined) {
+    return {
+      name,
+      status: 'fail',
+      detail: 'the stored hash is not an Argon2 PHC string; PasswordHasher cannot verify it',
+    };
+  }
+  if (known.length === 0) {
+    return { name, status: 'fail', detail: 'no bootstrap client hash to compare with' };
+  }
+  const label = user.split('$')[1] ?? '';
+  if (known.length === 1 && known[0] === user) {
+    return {
+      name,
+      status: 'ok',
+      detail: `${label}, same version and parameters as the bootstrap clients' hashes`,
+    };
+  }
+  if (known.every((head) => algorithm(head) === algorithm(user))) {
+    return {
+      name,
+      status: 'note',
+      detail: `${label} and version like the bootstrap clients' hashes, other parameters (verification reads them from the hash)`,
+    };
+  }
+  return {
+    name,
+    status: 'fail',
+    detail: `${label || 'unknown'} differs from the bootstrap clients' algorithm or version`,
+  };
+}
+
+/** The format heads (`hashFormat`) of `login`'s stored password hash. */
+async function importedHashFormat(database: SqlDatabase, login: string) {
+  const row = await database.first<{ password_hash: unknown }>(
+    'SELECT password_hash FROM users WHERE normalized_login = ?',
+    [normalizeLogin(login)],
+  );
+  return hashFormat(row?.password_hash);
+}
+
 /** Whether the import kept a user's password hash exactly as exported. */
 export type HashCarried = 'same' | 'differs' | 'missing' | 'no-export';
 
@@ -183,6 +252,8 @@ const basic = (id: string, secret: string) =>
  *   - with the export: every table still has the exported row count, and each bootstrap user's
  *     stored password hash equals the export's (digests compared);
  *   - discovery's issuer is ISSUER_URL and the JWKS serves the kid of AUTH_ACTIVE_PRIVATE_JWK;
+ *   - each bootstrap user's stored hash has the bootstrap clients' hash format
+ *     (`classifyHashFormat`: algorithm, version and parameters; never the hash);
  *   - the bootstrap owner and viewer sign in with the values' passwords (`classifySignIn`);
  *   - the access, directory and provisioner clients authenticate with the values' secrets.
  */
@@ -304,6 +375,22 @@ export async function rehearseChecks(
         }[state],
       );
     }
+  }
+
+  const clientFormats: Array<string | undefined> = [];
+  for (const client of [
+    named.AUTH_ACCESS_CLIENT_ID,
+    named.AUTH_DIRECTORY_CLIENT_ID,
+    named.AUTH_PROVISIONER_CLIENT_ID,
+  ]) {
+    const row = await database.first<{ client_secret: unknown }>(
+      'SELECT client_secret FROM oauth2_registered_client WHERE client_id = ?',
+      [client ?? ''],
+    );
+    clientFormats.push(hashFormat(row?.client_secret));
+  }
+  for (const { who, login } of people) {
+    results.push(classifyHashFormat(who, await importedHashFormat(database, login), clientFormats));
   }
 
   const discovery = (await (

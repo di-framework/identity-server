@@ -41,10 +41,12 @@ import {
 } from './install-core.ts';
 import {
   bootstrapSetting,
+  classifyHashFormat,
   classifySignIn,
   compareHashes,
   exportedPasswordHashDigest,
   formatResult,
+  hashFormat,
   passwordHashDigest,
 } from './rehearse-core.ts';
 import {
@@ -676,6 +678,44 @@ describe('the rehearsal sign-in checks', () => {
     expect(
       formatResult(classifySignIn('owner', { status: 500, signedIn: false }, 'same')),
     ).toStartWith('FAIL owner sign-in: HTTP 500');
+  });
+
+  test('the hash format is compared with the bootstrap clients, never showing the hash', () => {
+    const head = '$argon2id$v=19$m=19456,t=2,p=1';
+    expect(hashFormat(HASH)).toBe(head);
+    for (const bad of [
+      null,
+      '',
+      'plain',
+      '$2b$10$abc',
+      '$argon2id$v=19$m=1',
+      '$argon2id$v=19$m=1$$h',
+    ]) {
+      expect(hashFormat(bad)).toBeUndefined();
+    }
+    const same = classifyHashFormat('owner', head, [head, head, head]);
+    expect(same).toEqual({
+      name: 'owner password hash format',
+      status: 'ok',
+      detail: "argon2id, same version and parameters as the bootstrap clients' hashes",
+    });
+    expect(
+      classifyHashFormat('viewer', '$argon2id$v=19$m=65536,t=3,p=4', [head, undefined]).status,
+    ).toBe('note');
+    expect(classifyHashFormat('viewer', '$argon2i$v=19$m=19456,t=2,p=1', [head]).status).toBe(
+      'fail',
+    );
+    expect(classifyHashFormat('viewer', '$argon2id$v=16$m=19456,t=2,p=1', [head]).status).toBe(
+      'fail',
+    );
+    expect(classifyHashFormat('viewer', undefined, [head])).toMatchObject({
+      status: 'fail',
+      detail: expect.stringContaining('not an Argon2 PHC string'),
+    });
+    expect(classifyHashFormat('viewer', head, [undefined]).status).toBe('fail');
+    const printed = JSON.stringify([same, classifyHashFormat('viewer', head, [head])]);
+    expect(printed).not.toContain('c2FsdHNhbHQ');
+    expect(printed).not.toContain('aGFzaGhhc2hoYXNoaGFzaA');
   });
 
   test('bootstrap settings come from the values before wasi:config', () => {

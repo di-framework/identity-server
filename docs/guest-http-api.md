@@ -386,7 +386,7 @@ install, deploy) are not proven live yet. Nothing here has run against authproto
 | Key | `deploy/guest/runtime-secrets.ts pglite-key` | Adds `DI_PGLITE_KEY` to `values.json` (a new data directory needs a new key) and prints its KCV. |
 | Import | `deploy/cutover/import.ts` | Runs the guest's own encrypted provider (`apps/guest/.di-framework/di-framework-pglite.encrypted.wasm`, checked to be byte for byte the provider inside `apps/guest/dist/identity.wasm`) under `wasmtime`, plugged into a small wasip2 runner (`deploy/cutover/pglite-runner`, Rust) that serves `di-framework:pglite/database` to the guest's own adapter over stdin/stdout. Initialises a fresh encrypted directory, migrates it to the source version with the guest's migration code, loads every table and the bootstrap fingerprints in one transaction, checks the counts inside it, then checks every file on disk is encfs ciphertext under the key's KCV and contains no engine string or user login or email. |
 | Rehearse | `deploy/cutover/rehearse.ts` | Boots the guest's request handler in-process on a **copy** of the imported directory, through the same provider: `/ready`, the later migrations, no bootstrap reconcile, the bootstrap organization, issuer and signing key `kid`, owner and viewer sign-in (a password changed since bootstrap is a `note` when the stored hash is proven carried), the three bootstrap clients' secrets, row counts and carried password hashes (`rehearse-core.ts`). |
-| Install | `deploy/cutover/install.ts` | Dry run by default; the dry run lists the target through a read-only helper pod (DAC_READ_SEARCH only, `<storageRoot>/di-tenants` mounted read-only) and refuses a non-empty one. With `--yes`, a helper pod on the node (the platform's storage-init image, root with CHOWN and DAC_OVERRIDE only, with exactly the target directory mounted) copies the directory into `<storageRoot>/di-tenants/<tenant uid>/workloads/identity` (what the platform mounts as the guest's `/data`), directories 0700, files 0600, then owner 65532, and compares every file's SHA-256 and owner. The pod is deleted on success and on failure; a failed delete names it. Refuses a non-empty target (before sending anything), a tenant with `directory`, a tenant that already has the WorkloadDeployment (unless `--allow-existing-workload`), and a directory whose marker KCV is not the values file's. |
+| Install | `deploy/cutover/install.ts` | Dry run by default; the dry run lists the target through a read-only helper pod (DAC_READ_SEARCH only, only `<storageRoot>/di-tenants/<tenant uid>` mounted read-only, never created) and refuses a non-empty one. With `--yes`, a helper pod on the node (the platform's storage-init image, root with CHOWN and DAC_OVERRIDE only, with exactly the target directory mounted) copies the directory into `<storageRoot>/di-tenants/<tenant uid>/workloads/identity` (what the platform mounts as the guest's `/data`), directories 0700, files 0600, then owner 65532, and compares every file's SHA-256 and owner. The pod is deleted on success and on failure; a failed delete names it. Refuses a non-empty target (before sending anything), a tenant with `directory`, a tenant that already has the WorkloadDeployment (unless `--allow-existing-workload`), and a directory whose marker KCV is not the values file's. |
 | Deploy | `deploy/guest/deploy.sh` | Unchanged path, with the guard lifted for this case only (below). |
 
 Decisions and what they rest on:
@@ -620,12 +620,20 @@ P2. **The exclusive tenant host image.** Create the new tenant now (the old gues
    export's; neither is printed). A rejected sign-in whose hash was not carried, without
    `--export`, or any other answer (a 5xx) is a `FAIL`. The owner gets the same rule: the three
    bootstrap clients already prove that carried Argon2id hashes verify, and the owner is the
-   account most likely to have changed its bootstrap password.
+   account most likely to have changed its bootstrap password. `<who> password hash format`
+   closes the rest: the user's stored hash must have the bootstrap clients' head (algorithm,
+   version and parameters, `$argon2id$v=19$m=…,t=…,p=…`; never the salt or hash, and only the
+   algorithm name is printed). The same head is `ok`, the same algorithm and version with other
+   parameters a `note`, anything else a `FAIL`, so a `note` for a changed password cannot hide
+   a hash the new guest cannot verify.
 7. **Install** (dry run, then for real), before the guest's WorkloadDeployment exists:
    `bun deploy/cutover/install.ts --data "$OUT/data" --values "$OUT/export/values.json" --kubeconfig "$KC" --context "$CTX" --tenant "$NEW"`.
-   The dry run starts a read-only helper pod (root with DAC_READ_SEARCH only, the storage root's
-   `di-tenants` mounted read-only; deleted afterwards), lists the target and refuses a non-empty
-   one as `--yes` would; it must print `target is empty or absent`. Check the target path and
+   The dry run starts a read-only helper pod (root with DAC_READ_SEARCH only; only the tenant's
+   own `<storageRoot>/di-tenants/<uid>` mounted, read-only and as type `Directory`, which kubelet
+   never creates; deleted afterwards), lists the target and refuses a non-empty one as `--yes`
+   would; it must print `target is empty or absent`, or `target is absent: ... does not exist
+   yet` when the tenant has no directory on the node yet (kubelet then refuses the mount, and the
+   dry run reads that event instead of waiting). Check the target path and
    counts, and repeat with `--yes`. Expect
    `installed: N/N files match, 0 missing, 0 changed, 0 extra; 0 not owned by 65532`.
    Record the target path it prints (`TARGET=...`) for step 12.
@@ -689,8 +697,12 @@ P2. **The exclusive tenant host image.** Create the new tenant now (the old gues
       every secret, so `--rm` and remove it at once) and compare every exported table's rows:
       ```sh
       podman run -d --rm --name directory-restore-check -e POSTGRES_PASSWORD=restore-check --tmpfs /var/lib/postgresql/data postgres:16-alpine
-      until podman logs directory-restore-check 2>&1 | grep -q 'init process complete'; do sleep 1; done
-      until podman exec directory-restore-check pg_isready -U postgres >/dev/null 2>&1; do sleep 1; done
+      deadline=$(( $(date +%s) + 120 ))
+      until podman logs directory-restore-check 2>&1 | grep -q 'init process complete' \
+        && podman exec directory-restore-check pg_isready -U postgres >/dev/null 2>&1; do
+        if [ "$(date +%s)" -ge "$deadline" ]; then echo 'scratch Postgres not ready after 2 minutes'; podman stop directory-restore-check; break; fi
+        sleep 1
+      done
       podman exec directory-restore-check createdb -U postgres restored
       podman exec -i directory-restore-check pg_restore -U postgres -d restored --no-owner --no-privileges --exit-on-error < "$DUMP"
       jq -r '.tables[] | "\(.name) \(.count)"' "$OUT/export/manifest.json" | while read -r table count; do
@@ -707,6 +719,8 @@ P2. **The exclusive tenant host image.** Create the new tenant now (the old gues
       helper pod like `install.ts`'s dry-run pod (root with DAC_READ_SEARCH only, which may read
       the host uid's 0700 files and change nothing; the target mounted read-only):
       ```sh
+      NEW_REPLICAS="$(kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" get workloaddeployment identity -o jsonpath='{.spec.replicas}')"
+      echo "recorded replicas: $NEW_REPLICAS"   # keep this; it is restored below
       kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" patch workloaddeployment identity --type merge -p '{"spec":{"replicas":0}}'
       # wait until Host: identity.$NEW.localhost no longer answers /health
       NODE="$(kubectl --kubeconfig "$KC" get nodes -o jsonpath='{.items[0].metadata.name}')"
@@ -736,7 +750,7 @@ P2. **The exclusive tenant host image.** Create the new tenant now (the old gues
         | LC_ALL=C sort > "$OUT/final-data.node.sha256"
       kubectl --kubeconfig "$KC" -n kube-system exec identity-cutover-backup -- tar -C /data -cf - . > "$OUT/final-data.tar"
       kubectl --kubeconfig "$KC" -n kube-system delete pod identity-cutover-backup
-      kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" patch workloaddeployment identity --type merge -p '{"spec":{"replicas":<recorded replicas>}}'
+      kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" patch workloaddeployment identity --type merge -p "{\"spec\":{\"replicas\":$NEW_REPLICAS}}"
       mkdir -m 700 "$OUT/final-data" && tar -C "$OUT/final-data" -xf "$OUT/final-data.tar"
       (cd "$OUT/final-data" && find . -type f -exec shasum -a 256 {} +) | LC_ALL=C sort > "$OUT/final-data.copy.sha256"
       diff "$OUT/final-data.node.sha256" "$OUT/final-data.copy.sha256" && echo 'copy matches the node'

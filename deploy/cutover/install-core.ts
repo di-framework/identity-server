@@ -229,18 +229,20 @@ export function helperPod(options: {
 
 /**
  * The dry run's read-only helper pod: same image and node as `helperPod`, root with only
- * DAC_READ_SEARCH (it may list the host uid's 0700 directories, and change nothing), with the
- * storage root's `di-tenants` directory mounted read-only at `/tenants` (`Directory`: it must
- * already exist, so the dry run never creates anything on the node). It mounts that directory
- * and not the target because the target may not exist yet, and a hostPath that must exist would
- * keep the pod from starting while one that may be created would write to the node.
+ * DAC_READ_SEARCH (it may list the host uid's 0700 directories, and change nothing), with only
+ * this tenant's directory `<root>/di-tenants/<uid>` mounted read-only at `/tenant`. The type is
+ * `Directory`, which kubelet checks and never creates: if the tenant's directory does not exist
+ * yet, the pod does not start ("hostPath type check failed"), and the dry run reads that as an
+ * absent, so empty, target (`installCommand`). Nothing is created on the node either way, and
+ * no other tenant's data or backing-service volume is mounted.
  */
 export function readOnlyHelperPod(options: {
   name: string;
   namespace: string;
   node: string;
   image: string;
-  tenants: string;
+  /** `<root>/di-tenants/<uid>`. */
+  tenant: string;
 }): Record<string, unknown> {
   return {
     apiVersion: 'v1',
@@ -268,10 +270,10 @@ export function readOnlyHelperPod(options: {
             readOnlyRootFilesystem: true,
             capabilities: { drop: ['ALL'], add: ['DAC_READ_SEARCH'] },
           },
-          volumeMounts: [{ name: 'tenants', mountPath: '/tenants', readOnly: true }],
+          volumeMounts: [{ name: 'tenant', mountPath: '/tenant', readOnly: true }],
         },
       ],
-      volumes: [{ name: 'tenants', hostPath: { path: options.tenants, type: 'Directory' } }],
+      volumes: [{ name: 'tenant', hostPath: { path: options.tenant, type: 'Directory' } }],
     },
   };
 }
@@ -346,6 +348,8 @@ export async function installCommand(
     refuseLegacyTenant: (namespace: string) => Promise<void>;
     log: (line: string) => void;
     warn: (line: string) => void;
+    /** Waits between the dry run's pod status polls (default: real time). */
+    sleep?: (ms: number) => Promise<void>;
   },
 ): Promise<'dry-run' | 'installed'> {
   const tree = localTree(options.data);
@@ -392,10 +396,24 @@ export async function installCommand(
    * Runs `fn` with the helper pod `manifest` started, and always deletes the pod: a failed
    * delete is an error naming the pod (a warning when `fn` already failed).
    */
+  const waitReady = async () => {
+    const ready = await kubectl([
+      '--namespace',
+      namespace,
+      'wait',
+      '--for=condition=Ready',
+      `pod/${pod}`,
+      '--timeout=180s',
+    ]);
+    if (ready.code !== 0) throw new Error(`the helper pod did not start: ${ready.stderr.trim()}`);
+    return true;
+  };
   const withPod = async (
     manifest: Record<string, unknown>,
     mounts: string,
     fn: (exec: (script: string, input?: Uint8Array) => Promise<string>) => Promise<void>,
+    /** Resolves true once the pod is Ready, false when it will never start for a known reason. */
+    start: () => Promise<boolean> = waitReady,
   ) => {
     const created = await kubectl(['create', '-f', '-'], JSON.stringify(manifest));
     if (created.code !== 0) {
@@ -415,16 +433,7 @@ export async function installCommand(
     };
     let failed: unknown;
     try {
-      const ready = await kubectl([
-        '--namespace',
-        namespace,
-        'wait',
-        '--for=condition=Ready',
-        `pod/${pod}`,
-        '--timeout=180s',
-      ]);
-      if (ready.code !== 0) throw new Error(`the helper pod did not start: ${ready.stderr.trim()}`);
-      await fn(exec);
+      if (await start()) await fn(exec);
     } catch (error) {
       failed = error;
     }
@@ -442,22 +451,66 @@ export async function installCommand(
     );
 
   if (!options.yes) {
-    // Read-only: list the target (if it exists) through a pod that can change nothing.
-    const tenants = `${root.replace(/\/+$/, '')}/di-tenants`;
+    // Read-only: list the target (if it exists) through a pod that can change nothing and sees
+    // only this tenant's directory. If that directory does not exist, neither does the target.
+    const tenantDir = `${root.replace(/\/+$/, '')}/di-tenants/${uid}`;
     const manifest = readOnlyHelperPod({
       name: pod,
       namespace,
       node,
       image: options.image,
-      tenants,
+      tenant: tenantDir,
     });
+    const sleep = deps.sleep ?? ((ms: number) => Bun.sleep(ms));
+    let absent = false;
+    // kubelet reports a missing `Directory` hostPath as an event on the pod, and the pod stays
+    // Pending, so poll both instead of waiting out a timeout.
+    const startOrAbsent = async () => {
+      for (let attempt = 0; attempt < 90; attempt += 1) {
+        const status = await kubectl([
+          '--namespace',
+          namespace,
+          'get',
+          'pod',
+          pod,
+          '-o',
+          'jsonpath={.status.conditions[?(@.type=="Ready")].status}',
+        ]);
+        if (status.code === 0 && status.stdout.trim() === 'True') return true;
+        const events = await kubectl([
+          '--namespace',
+          namespace,
+          'get',
+          'events',
+          '--field-selector',
+          `involvedObject.name=${pod}`,
+          '-o',
+          'jsonpath={range .items[*]}{.message}{"\\n"}{end}',
+        ]);
+        if (/hostPath type check failed/.test(events.stdout)) {
+          absent = true;
+          return false;
+        }
+        await sleep(2000);
+      }
+      throw new Error('the read-only helper pod did not start within 180s');
+    };
     let present: string[] = [];
-    await withPod(manifest, `${tenants} read-only`, async (exec) => {
-      const inside = `/tenants/${uid}/workloads/${options.workload}`;
-      present = entries(await exec(`if [ -d ${inside} ]; then ls -A ${inside}; fi`));
-    });
+    await withPod(
+      manifest,
+      `${tenantDir} read-only`,
+      async (exec) => {
+        const inside = `/tenant/workloads/${options.workload}`;
+        present = entries(await exec(`if [ -d ${inside} ]; then ls -A ${inside}; fi`));
+      },
+      startOrAbsent,
+    );
     if (present.length > 0) throw notEmpty(present.length);
-    deps.log(`target is empty or absent (checked read-only on ${node})`);
+    deps.log(
+      absent
+        ? `target is absent: ${tenantDir} does not exist yet (checked read-only on ${node})`
+        : `target is empty or absent (checked read-only on ${node})`,
+    );
     deps.log('dry run: nothing changed. Re-run with --yes to install.');
     return 'dry-run';
   }

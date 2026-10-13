@@ -306,7 +306,7 @@ describe('deploy.sh', () => {
       IDENTITY_READY_TIMEOUT: '0',
     });
     expect(late.code).toBe(3);
-    const recovery = `run: bun ${script} apply --values ${path} --kubeconfig ${join(work, 'kubeconfig')} --context test --tenant pgprove`;
+    const recovery = `run: bun '${script}' apply --values '${path}' --kubeconfig '${join(work, 'kubeconfig')}' --context 'test' --tenant 'pgprove'`;
     expect(late.stderr).toContain(`identity is not Ready after 0s; once it is, ${recovery}`);
     expect(argvOf(notReady.calls).some((line) => line.includes('patch'))).toBe(false);
 
@@ -324,7 +324,7 @@ describe('deploy.sh', () => {
 
   test('a deploy that failed before the workload existed says to re-run the deploy, not apply', () => {
     const { path } = generate();
-    const redeploy = `${deployScript} pgprove pgprove ${path}`;
+    const redeploy = `'${deployScript}' 'pgprove' 'pgprove' '${path}'`;
     // The first deploy into a new tenant: the push 404s, no WorkloadDeployment was created.
     const fresh = stubs();
     const first = deployWith(path, fresh.bin, { STUB_DEPLOY_EXIT: '1', STUB_WORKLOAD: '' });
@@ -343,7 +343,7 @@ describe('deploy.sh', () => {
       IDENTITY_AUTHPROTO_CUTOVER: 'authproto/pgprove',
     });
     expect(confirmed.stderr).toContain(
-      `re-run the deploy: IDENTITY_AUTHPROTO_CUTOVER=authproto/pgprove ${redeploy}`,
+      `re-run the deploy: IDENTITY_AUTHPROTO_CUTOVER='authproto/pgprove' ${redeploy}`,
     );
 
     // When kubectl cannot tell, both commands, each with its condition.
@@ -357,6 +357,95 @@ describe('deploy.sh', () => {
       'kubectl could not tell whether WorkloadDeployment identity exists in di-tenant-pgprove. Once fixed: if it exists, run: bun ',
     );
     expect(unsure.stderr).toContain(`; if not, re-run the deploy: ${redeploy}`);
+  });
+
+  test('printed commands are quoted for copy-paste and carry the guard environment', () => {
+    const { path } = generate();
+    const { bin } = stubs();
+    // The default kubeconfig lives under "Application Support".
+    const spaced = join(work, `Application Support ${files++}`, "it's", 'kubeconfig');
+    const digest = `sha256:${'ab'.repeat(32)}`;
+    const guardEnv = {
+      IDENTITY_AUTHPROTO_CUTOVER: 'authproto/pgprove',
+      IDENTITY_EXCLUSIVE_HOST_DIGEST: digest,
+    };
+    const lines = (stderr: string, marker: string) =>
+      stderr
+        .split('\n')
+        .map((line) => line.split(marker)[1])
+        .filter((line): line is string => line !== undefined);
+    // Each printed command, run through sh -c with `printf '%s\n'` in front, gives back
+    // exactly the intended words: quoting survives spaces and quotes in paths.
+    const words = (command: string) => {
+      const [assignments, rest] = (() => {
+        const env: string[] = [];
+        let tail = command;
+        for (const name of Object.keys(guardEnv)) {
+          const match = new RegExp(`^${name}=('[^']*') `).exec(tail);
+          if (match?.[1]) {
+            env.push(`${name}=${match[1].slice(1, -1)}`);
+            tail = tail.slice(match[0].length);
+          }
+        }
+        return [env, tail];
+      })();
+      const out = Bun.spawnSync(['sh', '-c', `printf '%s\\n' ${rest}`]).stdout.toString();
+      return { env: assignments, argv: out.split('\n').slice(0, -1) };
+    };
+
+    const late = deployWith(path, bin, {
+      STUB_DEPLOY_EXIT: '3',
+      STUB_READY: 'False',
+      IDENTITY_READY_TIMEOUT: '0',
+      IDENTITY_KUBECONFIG: spaced,
+      ...guardEnv,
+    });
+    expect(late.code).toBe(3);
+    const [apply] = lines(late.stderr, 'once it is, run: ');
+    expect(words(apply as string)).toEqual({
+      env: [
+        `IDENTITY_AUTHPROTO_CUTOVER=authproto/pgprove`,
+        `IDENTITY_EXCLUSIVE_HOST_DIGEST=${digest}`,
+      ],
+      argv: [
+        'bun',
+        script,
+        'apply',
+        '--values',
+        path,
+        '--kubeconfig',
+        spaced,
+        '--context',
+        'test',
+        '--tenant',
+        'pgprove',
+      ],
+    });
+
+    const unknown = stubs();
+    const unsure = deployWith(path, unknown.bin, {
+      STUB_DEPLOY_EXIT: '1',
+      STUB_WORKLOAD_EXIT: '1',
+      IDENTITY_KUBECONFIG: spaced,
+      ...guardEnv,
+    });
+    const [both] = lines(unsure.stderr, 'if it exists, run: ');
+    const [applyHint, redeployHint] = (both as string).split('; if not, re-run the deploy: ');
+    expect(words(applyHint as string).env).toHaveLength(2);
+    expect(words(applyHint as string).argv).toContain(spaced);
+    expect(words(redeployHint as string)).toEqual({
+      env: [
+        `IDENTITY_AUTHPROTO_CUTOVER=authproto/pgprove`,
+        `IDENTITY_EXCLUSIVE_HOST_DIGEST=${digest}`,
+      ],
+      argv: [deployScript, 'pgprove', 'pgprove', path],
+    });
+
+    // Without the guard environment, no assignments are printed.
+    const plain = stubs();
+    const bare = deployWith(path, plain.bin, { STUB_DEPLOY_EXIT: '2' });
+    expect(bare.stderr).not.toContain('IDENTITY_AUTHPROTO_CUTOVER=');
+    expect(bare.stderr).not.toContain('IDENTITY_EXCLUSIVE_HOST_DIGEST=');
   });
 
   test('authproto only as the confirmed cutover into a new tenant, refused before the build', () => {

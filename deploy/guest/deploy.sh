@@ -86,7 +86,17 @@ bun "$secrets" guard --instance "$instance" --kubeconfig "$IDENTITY_KUBECONFIG" 
 # Build before touching the cluster, so a build failure leaves the running guest and its Secret.
 (cd "$root/apps/guest" && di-framework platform build)
 
-recovery="bun $secrets apply --values $values --kubeconfig $IDENTITY_KUBECONFIG --context $IDENTITY_KUBE_CONTEXT --tenant $tenant"
+# The recovery commands this script prints, ready to copy: every argument single-quoted (the
+# default kubeconfig path contains "Application Support"), and the guard's environment carried,
+# since `apply` runs the same guard: the cutover confirmation and the host image digest pin.
+quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+guard_env=
+for name in IDENTITY_AUTHPROTO_CUTOVER IDENTITY_EXCLUSIVE_HOST_DIGEST; do
+  eval "value=\${$name:-}"
+  if [ -n "$value" ]; then guard_env="$guard_env$name=$(quote "$value") "; fi
+done
+recovery="${guard_env}bun $(quote "$secrets") apply --values $(quote "$values") --kubeconfig $(quote "$IDENTITY_KUBECONFIG") --context $(quote "$IDENTITY_KUBE_CONTEXT") --tenant $(quote "$tenant")"
+redeploy="${guard_env}$(quote "$0") $(quote "$instance") $(quote "$tenant") $(quote "$values")"
 deploy_log="$(mktemp "${TMPDIR:-/tmp}/identity-deploy.XXXXXX")"
 trap 'rm -f "$deploy_log"' EXIT
 if (cd "$root/apps/guest" && di-framework platform deploy "$workload" --target identity --yes) >"$deploy_log" 2>&1; then
@@ -115,10 +125,6 @@ elif [ "$status" -ne 0 ]; then
   # the WorkloadDeployment existed (e.g. the push 404s on a brand-new tenant whose registry,
   # WorkloadDeployment di-tenant-registry, is not Ready yet), there is nothing to apply to: the
   # recovery is to re-run this deploy.
-  redeploy="$0 $instance $tenant $values"
-  if [ -n "${IDENTITY_AUTHPROTO_CUTOVER:-}" ]; then
-    redeploy="IDENTITY_AUTHPROTO_CUTOVER=$IDENTITY_AUTHPROTO_CUTOVER $redeploy"
-  fi
   if existing="$(kubectl --kubeconfig "$IDENTITY_KUBECONFIG" --context "$IDENTITY_KUBE_CONTEXT" \
     --namespace "di-tenant-$tenant" get workloaddeployment "$workload" --ignore-not-found -o name 2>/dev/null)"; then
     if [ -n "$existing" ]; then
