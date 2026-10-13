@@ -7,7 +7,7 @@
  * Nothing here logs, prints or puts a value in an error message: errors name tables, columns
  * and row names only.
  */
-import { parseJsonQuietly, RUNTIME_SECRET_NAMES } from '../platform/components/control-secret.ts';
+import { parseJsonQuietly, RUNTIME_SETTING_NAMES } from '../platform/components/control-secret.ts';
 
 /**
  * Source schema versions the tools accept. V13 created `identity_runtime_secret`, which the
@@ -73,8 +73,8 @@ export interface SplitRuntimeRows {
 /**
  * Splits `identity_runtime_secret` rows. The Postgres-era guest read every row as a setting
  * (`loadGuestSettings` merged the table over wasi:config), and each setting it could hold is a
- * name of the new guest's environment (`RUNTIME_SECRET_NAMES`), so the mapping is the identity
- * on names. Any other name is refused rather than dropped: it changed the old guest's settings,
+ * name of the new guest's environment (`RUNTIME_SETTING_NAMES`: the secrets and the bootstrap
+ * identity overrides), so the mapping is the identity on names. Any other name is refused rather than dropped: it changed the old guest's settings,
  * and the new guest would silently run without it.
  */
 export function splitRuntimeRows(rows: readonly RuntimeRow[]): SplitRuntimeRows {
@@ -86,7 +86,7 @@ export function splitRuntimeRows(rows: readonly RuntimeRow[]): SplitRuntimeRows 
   for (const { name, value } of rows) {
     if (seen.has(name)) throw new Error(`${RUNTIME_SECRET_TABLE} has the row ${name} twice`);
     seen.add(name);
-    if (RUNTIME_SECRET_NAMES.includes(name)) values[name] = value;
+    if (RUNTIME_SETTING_NAMES.includes(name)) values[name] = value;
     else if (STATE_ROW_NAMES.includes(name)) state[name] = value;
     else if (TRANSIENT_ROW_NAMES.includes(name)) dropped.push(name);
     else unknown.push(name);

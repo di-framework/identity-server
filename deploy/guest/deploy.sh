@@ -51,7 +51,10 @@
 #
 # If a step after the build fails, fix the cause and run
 #   bun deploy/guest/runtime-secrets.ts apply --values <file> --kubeconfig <kc> --tenant <tenant>
-# on its own: it rewrites the Secret and rolls the workload.
+# on its own: it rewrites the Secret and rolls the workload. That needs the WorkloadDeployment:
+# when the deploy failed before it existed (on a brand-new tenant, typically a push that 404s
+# while the tenant registry, WorkloadDeployment di-tenant-registry, is not Ready yet), the script
+# says so and the recovery is to re-run this script instead.
 set -eu
 
 instance="${1:-}"
@@ -83,7 +86,17 @@ bun "$secrets" guard --instance "$instance" --kubeconfig "$IDENTITY_KUBECONFIG" 
 # Build before touching the cluster, so a build failure leaves the running guest and its Secret.
 (cd "$root/apps/guest" && di-framework platform build)
 
-recovery="bun $secrets apply --values $values --kubeconfig $IDENTITY_KUBECONFIG --context $IDENTITY_KUBE_CONTEXT --tenant $tenant"
+# The recovery commands this script prints, ready to copy: every argument single-quoted (the
+# default kubeconfig path contains "Application Support"), and the guard's environment carried,
+# since `apply` runs the same guard: the cutover confirmation and the host image digest pin.
+quote() { printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"; }
+guard_env=
+for name in IDENTITY_AUTHPROTO_CUTOVER IDENTITY_EXCLUSIVE_HOST_DIGEST; do
+  eval "value=\${$name:-}"
+  if [ -n "$value" ]; then guard_env="$guard_env$name=$(quote "$value") "; fi
+done
+recovery="${guard_env}bun $(quote "$secrets") apply --values $(quote "$values") --kubeconfig $(quote "$IDENTITY_KUBECONFIG") --context $(quote "$IDENTITY_KUBE_CONTEXT") --tenant $(quote "$tenant")"
+redeploy="${guard_env}$(quote "$0") $(quote "$instance") $(quote "$tenant") $(quote "$values")"
 deploy_log="$(mktemp "${TMPDIR:-/tmp}/identity-deploy.XXXXXX")"
 trap 'rm -f "$deploy_log"' EXIT
 if (cd "$root/apps/guest" && di-framework platform deploy "$workload" --target identity --yes) >"$deploy_log" 2>&1; then
@@ -108,7 +121,20 @@ if [ "$status" -eq 3 ] && grep -q 'did not become ready' "$deploy_log"; then
   done
   echo "$workload is Ready after ${waited}s more" >&2
 elif [ "$status" -ne 0 ]; then
-  echo "deploy of $workload failed (exit $status); once fixed, run: $recovery" >&2
+  # `apply` writes the Secret of an existing workload and rolls it. When the deploy failed before
+  # the WorkloadDeployment existed (e.g. the push 404s on a brand-new tenant whose registry,
+  # WorkloadDeployment di-tenant-registry, is not Ready yet), there is nothing to apply to: the
+  # recovery is to re-run this deploy.
+  if existing="$(kubectl --kubeconfig "$IDENTITY_KUBECONFIG" --context "$IDENTITY_KUBE_CONTEXT" \
+    --namespace "di-tenant-$tenant" get workloaddeployment "$workload" --ignore-not-found -o name 2>/dev/null)"; then
+    if [ -n "$existing" ]; then
+      echo "deploy of $workload failed (exit $status); once fixed, run: $recovery" >&2
+    else
+      echo "deploy of $workload failed (exit $status) before di-tenant-$tenant had a WorkloadDeployment $workload, so there is nothing for runtime-secrets.ts apply to update. On a new tenant, wait until WorkloadDeployment di-tenant-registry in di-tenant-$tenant is Ready. Once fixed, re-run the deploy: $redeploy" >&2
+    fi
+  else
+    echo "deploy of $workload failed (exit $status), and kubectl could not tell whether WorkloadDeployment $workload exists in di-tenant-$tenant. Once fixed: if it exists, run: $recovery; if not, re-run the deploy: $redeploy" >&2
+  fi
   exit 3
 fi
 

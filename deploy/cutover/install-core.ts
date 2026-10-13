@@ -227,6 +227,57 @@ export function helperPod(options: {
   };
 }
 
+/**
+ * The dry run's read-only helper pod: same image and node as `helperPod`, root with only
+ * DAC_READ_SEARCH (it may list the host uid's 0700 directories, and change nothing), with only
+ * this tenant's directory `<root>/di-tenants/<uid>` mounted read-only at `/tenant`. The type is
+ * `Directory`, which kubelet checks and never creates: if the tenant's directory does not exist
+ * yet, the pod does not start ("hostPath type check failed"), and the dry run reads that as an
+ * absent, so empty, target (`installCommand`). Nothing is created on the node either way, and
+ * no other tenant's data or backing-service volume is mounted.
+ */
+export function readOnlyHelperPod(options: {
+  name: string;
+  namespace: string;
+  node: string;
+  image: string;
+  /** `<root>/di-tenants/<uid>`. */
+  tenant: string;
+}): Record<string, unknown> {
+  return {
+    apiVersion: 'v1',
+    kind: 'Pod',
+    metadata: {
+      name: options.name,
+      namespace: options.namespace,
+      labels: { 'app.kubernetes.io/name': 'identity-cutover-install' },
+    },
+    spec: {
+      nodeName: options.node,
+      restartPolicy: 'Never',
+      automountServiceAccountToken: false,
+      containers: [
+        {
+          name: 'check',
+          image: options.image,
+          imagePullPolicy: 'IfNotPresent',
+          command: ['sleep', '3600'],
+          securityContext: {
+            runAsUser: 0,
+            runAsGroup: 0,
+            runAsNonRoot: false,
+            allowPrivilegeEscalation: false,
+            readOnlyRootFilesystem: true,
+            capabilities: { drop: ['ALL'], add: ['DAC_READ_SEARCH'] },
+          },
+          volumeMounts: [{ name: 'tenant', mountPath: '/tenant', readOnly: true }],
+        },
+      ],
+      volumes: [{ name: 'tenant', hostPath: { path: options.tenant, type: 'Directory' } }],
+    },
+  };
+}
+
 /** `sha256sum` lines (`<hex>  ./<path>`) from the node, against the local tree. */
 export function compareDigests(
   tree: LocalTree,
@@ -283,7 +334,9 @@ export interface InstallOptions {
 /**
  * The install (install.ts). Reads and checks everything first (marker KCV against the values,
  * the tenant's `directory`, the tenant uid, the storage root, the node, no WorkloadDeployment
- * yet); without `yes` it stops there. With `yes` it runs the helper pod, refuses a non-empty
+ * yet). Without `yes` it then lists the target through a read-only helper pod
+ * (`readOnlyHelperPod`), refuses a non-empty one as `yes` would, and stops. With `yes` it runs the
+ * helper pod, refuses a non-empty
  * target before sending anything, extracts the archive, sets the modes below the target (and the
  * target's own 0700 only when root owns it, i.e. kubelet just created it) then owner, compares every
  * digest and owner, and always deletes the pod: a failed delete is an error that names the pod.
@@ -295,6 +348,8 @@ export async function installCommand(
     refuseLegacyTenant: (namespace: string) => Promise<void>;
     log: (line: string) => void;
     warn: (line: string) => void;
+    /** Waits between the dry run's pod status polls (default: real time). */
+    sleep?: (ms: number) => Promise<void>;
   },
 ): Promise<'dry-run' | 'installed'> {
   const tree = localTree(options.data);
@@ -335,30 +390,13 @@ export async function installCommand(
   deps.log(
     `source ${options.data}: ${tree.files.length} files, ${tree.directories.length} directories, ${tree.bytes} bytes; .di-encfs KCV ${tree.markerKcv} = values KCV`,
   );
-  if (!options.yes) {
-    deps.log('dry run: nothing changed. Re-run with --yes to install.');
-    return 'dry-run';
-  }
-
-  const pod = options.podName;
   const namespace = options.namespace;
-  const manifest = helperPod({ name: pod, namespace, node, image: options.image, target });
-  const created = await kubectl(['create', '-f', '-'], JSON.stringify(manifest));
-  if (created.code !== 0) throw new Error(`cannot create the helper pod: ${created.stderr.trim()}`);
-  const exec = async (script: string, input?: Uint8Array) => {
-    const result = await deps.kubectl(
-      ['--namespace', namespace, 'exec', ...(input ? ['-i'] : []), pod, '--', 'sh', '-c', script],
-      input,
-    );
-    if (result.code !== 0) {
-      throw new Error(
-        `helper step failed (exit ${result.code}): ${result.stderr.trim().slice(0, 300)}`,
-      );
-    }
-    return result.stdout;
-  };
-  let failed: unknown;
-  try {
+  const pod = options.podName;
+  /**
+   * Runs `fn` with the helper pod `manifest` started, and always deletes the pod: a failed
+   * delete is an error naming the pod (a warning when `fn` already failed).
+   */
+  const waitReady = async () => {
     const ready = await kubectl([
       '--namespace',
       namespace,
@@ -368,10 +406,119 @@ export async function installCommand(
       '--timeout=180s',
     ]);
     if (ready.code !== 0) throw new Error(`the helper pod did not start: ${ready.stderr.trim()}`);
-    const present = entries(await exec('ls -A /target'));
-    if (present.length > 0) {
-      throw new Error(`${target} is not empty (${present.length} entries); refusing to install`);
+    return true;
+  };
+  const withPod = async (
+    manifest: Record<string, unknown>,
+    mounts: string,
+    fn: (exec: (script: string, input?: Uint8Array) => Promise<string>) => Promise<void>,
+    /** Resolves true once the pod is Ready, false when it will never start for a known reason. */
+    start: () => Promise<boolean> = waitReady,
+  ) => {
+    const created = await kubectl(['create', '-f', '-'], JSON.stringify(manifest));
+    if (created.code !== 0) {
+      throw new Error(`cannot create the helper pod: ${created.stderr.trim()}`);
     }
+    const exec = async (script: string, input?: Uint8Array) => {
+      const result = await deps.kubectl(
+        ['--namespace', namespace, 'exec', ...(input ? ['-i'] : []), pod, '--', 'sh', '-c', script],
+        input,
+      );
+      if (result.code !== 0) {
+        throw new Error(
+          `helper step failed (exit ${result.code}): ${result.stderr.trim().slice(0, 300)}`,
+        );
+      }
+      return result.stdout;
+    };
+    let failed: unknown;
+    try {
+      if (await start()) await fn(exec);
+    } catch (error) {
+      failed = error;
+    }
+    const removed = await kubectl(['--namespace', namespace, 'delete', 'pod', pod, '--wait=false']);
+    if (removed.code !== 0) {
+      const message = `could not delete the helper pod ${namespace}/${pod} (kubectl exit ${removed.code}); it mounts ${mounts}. Delete it by hand: kubectl --namespace ${namespace} delete pod ${pod}`;
+      if (failed) deps.warn(message);
+      else throw new Error(message);
+    }
+    if (failed) throw failed;
+  };
+  const notEmpty = (count: number) =>
+    new Error(
+      `${target} is not empty (${count} entries); refusing to install. A rolled-back cutover leaves its data here: roll forward into a fresh tenant (docs/guest-http-api.md#authproto-cutover, Rollback)`,
+    );
+
+  if (!options.yes) {
+    // Read-only: list the target (if it exists) through a pod that can change nothing and sees
+    // only this tenant's directory. If that directory does not exist, neither does the target.
+    const tenantDir = `${root.replace(/\/+$/, '')}/di-tenants/${uid}`;
+    const manifest = readOnlyHelperPod({
+      name: pod,
+      namespace,
+      node,
+      image: options.image,
+      tenant: tenantDir,
+    });
+    const sleep = deps.sleep ?? ((ms: number) => Bun.sleep(ms));
+    let absent = false;
+    // kubelet reports a missing `Directory` hostPath as an event on the pod, and the pod stays
+    // Pending, so poll both instead of waiting out a timeout.
+    const startOrAbsent = async () => {
+      for (let attempt = 0; attempt < 90; attempt += 1) {
+        const status = await kubectl([
+          '--namespace',
+          namespace,
+          'get',
+          'pod',
+          pod,
+          '-o',
+          'jsonpath={.status.conditions[?(@.type=="Ready")].status}',
+        ]);
+        if (status.code === 0 && status.stdout.trim() === 'True') return true;
+        const events = await kubectl([
+          '--namespace',
+          namespace,
+          'get',
+          'events',
+          '--field-selector',
+          `involvedObject.name=${pod}`,
+          '-o',
+          'jsonpath={range .items[*]}{.message}{"\\n"}{end}',
+        ]);
+        if (/hostPath type check failed/.test(events.stdout)) {
+          absent = true;
+          return false;
+        }
+        await sleep(2000);
+      }
+      throw new Error('the read-only helper pod did not start within 180s');
+    };
+    let present: string[] = [];
+    await withPod(
+      manifest,
+      `${tenantDir} read-only`,
+      async (exec) => {
+        const inside = `/tenant/workloads/${options.workload}`;
+        present = entries(await exec(`if [ -d ${inside} ]; then ls -A ${inside}; fi`));
+      },
+      startOrAbsent,
+    );
+    if (present.length > 0) throw notEmpty(present.length);
+    deps.log(
+      absent
+        ? `target is absent: ${tenantDir} does not exist yet (checked read-only on ${node})`
+        : `target is empty or absent (checked read-only on ${node})`,
+    );
+    deps.log('dry run: nothing changed. Re-run with --yes to install.');
+    return 'dry-run';
+  }
+
+  const manifest = helperPod({ name: pod, namespace, node, image: options.image, target });
+  await withPod(manifest, `${target} as root`, async (exec) => {
+    const present = entries(await exec('ls -A /target'));
+    if (present.length > 0) throw notEmpty(present.length);
     // Who owns the target itself: root when kubelet just created it, the host uid when the
     // platform's storage init already handed it over. Without FOWNER root cannot chmod a
     // directory it does not own, so the target's own mode is set only in the first case.
@@ -406,15 +553,6 @@ export async function installCommand(
     ) {
       throw new Error('the installed directory does not match; do not start the guest on it');
     }
-  } catch (error) {
-    failed = error;
-  }
-  const removed = await kubectl(['--namespace', namespace, 'delete', 'pod', pod, '--wait=false']);
-  if (removed.code !== 0) {
-    const message = `could not delete the helper pod ${namespace}/${pod} (kubectl exit ${removed.code}); it mounts ${target} as root. Delete it by hand: kubectl --namespace ${namespace} delete pod ${pod}`;
-    if (failed) deps.warn(message);
-    else throw new Error(message);
-  }
-  if (failed) throw failed;
+  });
   return 'installed';
 }

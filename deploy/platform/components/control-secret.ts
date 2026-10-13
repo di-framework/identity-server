@@ -28,7 +28,7 @@ export interface KubectlResult {
 /** Runs kubectl (already bound to a kubeconfig and context) with `args`; `input` is its stdin. */
 export type Kubectl = (args: string[], input?: string) => Promise<KubectlResult>;
 
-/** Every name the guest reads from its environment (apps/guest/src/settings.ts). */
+/** The secrets the guest reads from its environment (apps/guest/src/settings.ts). */
 export const RUNTIME_SECRET_NAMES: readonly string[] = [
   'ISSUER_URL',
   'AUTH_PUBLIC_ORIGIN',
@@ -50,6 +50,26 @@ export const RUNTIME_SECRET_NAMES: readonly string[] = [
   'IDENTITY_BIDX_KEY',
 ];
 /**
+ * The bootstrap identity overrides (apps/guest/src/settings.ts
+ * `RUNTIME_BOOTSTRAP_IDENTITY_SETTINGS`): personal data, not secrets, but read from the same
+ * environment and so kept in the same Secret. Tools print their names only, never their values.
+ */
+export const BOOTSTRAP_IDENTITY_NAMES: readonly string[] = [
+  'AUTH_BOOTSTRAP_ORGANIZATION_SLUG',
+  'AUTH_BOOTSTRAP_ORGANIZATION_NAME',
+  'AUTH_BOOTSTRAP_OWNER_LOGIN',
+  'AUTH_BOOTSTRAP_OWNER_EMAIL',
+  'AUTH_BOOTSTRAP_OWNER_DISPLAY_NAME',
+  'AUTH_BOOTSTRAP_VIEWER_LOGIN',
+  'AUTH_BOOTSTRAP_VIEWER_EMAIL',
+  'AUTH_BOOTSTRAP_VIEWER_DISPLAY_NAME',
+];
+/** Every runtime setting the guest reads from its environment: secrets and bootstrap identity. */
+export const RUNTIME_SETTING_NAMES: readonly string[] = [
+  ...RUNTIME_SECRET_NAMES,
+  ...BOOTSTRAP_IDENTITY_NAMES,
+];
+/**
  * The pglite-encfs master key and, during a rotation, the key it replaces (di-framework/platform
  * `platform/pglite-encfs`). The layer reads them from the guest's environment, which the platform
  * fills from the same control Secret; the guest itself never reads them.
@@ -58,7 +78,7 @@ export const PGLITE_KEY = 'DI_PGLITE_KEY';
 export const PGLITE_PREVIOUS_KEY = 'DI_PGLITE_KEY_PREVIOUS';
 export const PGLITE_KEY_NAMES: readonly string[] = [PGLITE_KEY, PGLITE_PREVIOUS_KEY];
 /** Every name a values file and the control Secret may hold besides the CLI's `DI_CONTROL_*`. */
-export const VALUE_NAMES: readonly string[] = [...RUNTIME_SECRET_NAMES, ...PGLITE_KEY_NAMES];
+export const VALUE_NAMES: readonly string[] = [...RUNTIME_SETTING_NAMES, ...PGLITE_KEY_NAMES];
 /** Column encryption keys: 32 random bytes each, base64; separate from each other. */
 export const COLUMN_KEY_NAMES: readonly string[] = ['IDENTITY_COLUMN_KEY', 'IDENTITY_BIDX_KEY'];
 export const REQUIRED_RUNTIME_SECRETS: readonly string[] = [
@@ -622,8 +642,64 @@ export function kubeconfigIsLegacy(
   return legacyServer !== undefined && server === legacyServer;
 }
 
-/** The exclusive-instance tenant host build the pglite guest needs. */
+/**
+ * The exclusive-instance tenant host build the pglite guest needs, matched on the image NAME in
+ * the tenant host Deployment's pod template: a `wash` repository (any registry) whose tag
+ * contains `exclusive`, e.g. `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive`, with or
+ * without an `@sha256:` suffix. It does not check a digest: a retagged or rebuilt image under
+ * that name passes. `EXCLUSIVE_HOST_DIGEST_ENV` adds a digest pin.
+ */
 const EXCLUSIVE_HOST_IMAGE = /(^|\/)wash:[^\s@]*exclusive/;
+/**
+ * Optional pin: `sha256:<64 hex>`. When set, every running tenant host pod must report that
+ * digest in its container `imageID` (what the node actually pulled), not only the right name.
+ */
+export const EXCLUSIVE_HOST_DIGEST_ENV = 'IDENTITY_EXCLUSIVE_HOST_DIGEST';
+const DIGEST = /^sha256:[0-9a-f]{64}$/;
+
+/**
+ * Checks that every running pod of `hostgroup-tenant-<tenant>` runs the image `digest`
+ * (`sha256:<hex>`), read from `.status.containerStatuses[*].imageID`. Refuses a malformed pin,
+ * no running host pod, and any pod whose image ids do not include the digest.
+ */
+export async function assertHostDigest(
+  kubectl: Kubectl,
+  tenant: string,
+  digest: string,
+): Promise<void> {
+  if (!DIGEST.test(digest)) {
+    throw new Error(`${EXCLUSIVE_HOST_DIGEST_ENV} must be sha256:<64 lowercase hex>; refusing`);
+  }
+  const host = `hostgroup-tenant-${tenant}`;
+  const listed = await kubectl([
+    '--namespace',
+    `di-runtime-${tenant}`,
+    'get',
+    'pods',
+    '-o',
+    'jsonpath={range .items[*]}{.metadata.name}{"\\t"}{.status.phase}{"\\t"}{.status.containerStatuses[*].imageID}{"\\n"}{end}',
+  ]);
+  if (listed.code !== 0) {
+    throw new Error(
+      `cannot list the tenant host pods of ${tenant} (kubectl exit ${listed.code}); refusing`,
+    );
+  }
+  const pods = listed.stdout
+    .split('\n')
+    .map((line) => line.trim().split('\t'))
+    .filter(([name, phase]) => name?.startsWith(`${host}-`) && phase === 'Running');
+  if (pods.length === 0) {
+    throw new Error(`no running ${host} pod to check the image digest of; refusing`);
+  }
+  const wrong = pods.filter(
+    ([, , ids = '']) => !ids.split(/\s+/).some((id) => id.endsWith(`@${digest}`)),
+  );
+  if (wrong.length > 0) {
+    throw new Error(
+      `${wrong.map(([name]) => name).join(', ')} ${wrong.length === 1 ? 'does' : 'do'} not run the pinned ${EXCLUSIVE_HOST_DIGEST_ENV} image; refusing`,
+    );
+  }
+}
 
 /**
  * deploy.sh's and runtime-secrets.ts's check of the target, before anything changes:
@@ -632,7 +708,8 @@ const EXCLUSIVE_HOST_IMAGE = /(^|\/)wash:[^\s@]*exclusive/;
  * - the target is treated as authproto when the instance is named `authproto`, when the
  *   kubeconfig is authproto's (`legacyKubeconfig`), or when the cluster has a `directory`
  *   BackingService in any namespace, as the Pulumi preflight does. Then the cutover must be
- *   confirmed for this tenant, and the tenant's host must run the exclusive-instance wash build;
+ *   confirmed for this tenant, and the tenant's host must run the exclusive-instance wash build
+ *   (by image name; with `hostDigest`, also by the digest its running pods report);
  * - a tenant developer kubeconfig may not list BackingServices cluster-wide. When that list is
  *   Forbidden and neither the instance nor the kubeconfig names authproto, the cluster-wide check
  *   is skipped (and `warn` says so); a Forbidden list on a target named authproto, and any other
@@ -650,6 +727,8 @@ export async function assertDeployTarget(
     legacyKubeconfig: boolean;
     /** Told when the cluster-wide check is skipped (a forbidden list, see below). */
     warn?: (line: string) => void;
+    /** `EXCLUSIVE_HOST_DIGEST_ENV`: also pin the cutover's tenant host image by digest. */
+    hostDigest?: string;
   },
 ): Promise<'other-target' | 'authproto-cutover'> {
   assertTenantName(target.tenant);
@@ -709,6 +788,9 @@ export async function assertDeployTarget(
     throw new Error(
       `the tenant host of ${target.tenant} does not run the exclusive-instance wash build (${images.join(', ') || `kubectl exit ${image.code}`}); the pglite guest needs it. Refusing`,
     );
+  }
+  if (target.hostDigest !== undefined && target.hostDigest !== '') {
+    await assertHostDigest(kubectl, target.tenant, target.hostDigest);
   }
   return 'authproto-cutover';
 }

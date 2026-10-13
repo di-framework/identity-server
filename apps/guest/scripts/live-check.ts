@@ -3,14 +3,21 @@
  * Runs the guest's database-backed flows against a deployed identity workload.
  *
  *   bun apps/guest/scripts/live-check.ts --values <file> --url <gateway> --host <workload host> \
- *     --slug <new organization slug> [--read-only]
+ *     --slug <new organization slug>
+ *   bun apps/guest/scripts/live-check.ts --values <file> --url <gateway> --host <workload host> \
+ *     --read-only [--slug <existing organization slug>]
  *
  * `--values` is the runtime secrets file deploy/guest/deploy.sh applied (mode 0600, checked) (bootstrap owner password
  * and client secrets come from it). Requests go to `--url` with `Host: <--host>`, for example
  * `--url http://127.0.0.1:28380 --host identity.pgprove.localhost`. Without `--read-only` it
  * creates the organization `--slug` and runs the authorization-code checks (tests/support/flows.ts:
  * the HTTP-only assertions of apps/server/tests/authorization-code.test.ts); with it, it checks
- * that the organization exists and the owner can sign in, which is the check after a restart. Prints status codes and names only, never a secret.
+ * that the organization exists and the owner can sign in, which is the check after a restart.
+ * With `--read-only`, `--slug` defaults to the bootstrap organization, which bootstrap always
+ * creates (BootstrapReconciler.ensureOrganization): the values' AUTH_BOOTSTRAP_ORGANIZATION_SLUG,
+ * else the guest's compiled-in default (`platform`). The owner's login is the values'
+ * AUTH_BOOTSTRAP_OWNER_LOGIN, else the default (`owner`). Prints status codes and names only,
+ * never a secret.
  */
 import { readFileSync, statSync } from 'node:fs';
 import { parseArgs } from 'node:util';
@@ -24,6 +31,7 @@ import {
   loginFlow,
   readiness,
 } from '../tests/support/flows.ts';
+import { guestConfig } from './guest-config.ts';
 
 const { values: args } = parseArgs({
   options: {
@@ -34,14 +42,22 @@ const { values: args } = parseArgs({
     'read-only': { type: 'boolean', default: false },
   },
 });
-for (const name of ['values', 'url', 'host', 'slug'] as const) {
+for (const name of ['values', 'url', 'host'] as const) {
   if (!args[name]) throw new Error(`--${name} is required`);
+}
+if (!args.slug && !args['read-only']) {
+  throw new Error(
+    '--slug is required: the full check creates that organization, so pass a new slug (or --read-only, which reads the bootstrap organization)',
+  );
 }
 assertPrivateMode(statSync(args.values as string).mode, args.values as string);
 const secrets = parseRuntimeValues(
   readFileSync(args.values as string, 'utf8'),
   args.values as string,
 );
+/** A bootstrap setting as the guest resolves it: the values (its environment) over wasi:config. */
+const compiled = guestConfig();
+const bootstrap = (name: string) => secrets[name] ?? compiled[name] ?? '';
 const base = new URL(args.url as string);
 const host = args.host as string;
 
@@ -58,7 +74,7 @@ async function send(request: Request): Promise<Response> {
 
 const inputs = {
   fetch: send,
-  ownerLogin: 'owner',
+  ownerLogin: bootstrap('AUTH_BOOTSTRAP_OWNER_LOGIN'),
   ownerPassword: secrets.AUTH_BOOTSTRAP_OWNER_PASSWORD ?? '',
   accessClient: {
     id: 'access',
@@ -66,7 +82,8 @@ const inputs = {
     redirectUri: (secrets.AUTH_ACCESS_REDIRECT_URIS ?? '').split(',')[0] ?? '',
   },
   provisionerClient: { id: 'provisioner', secret: secrets.AUTH_PROVISIONER_CLIENT_SECRET ?? '' },
-  organizationSlug: args.slug as string,
+  organizationSlug:
+    (args.slug as string | undefined) || bootstrap('AUTH_BOOTSTRAP_ORGANIZATION_SLUG'),
 };
 
 const started = performance.now();

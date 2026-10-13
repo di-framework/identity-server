@@ -602,6 +602,7 @@ describe('installCommand', () => {
         'get deployments --all-namespaces': `/var/lib/kubesolo/di-tenants/${uid}/workloads/other\n`,
         'get nodes': 'node-1',
         "stat -c '%u %a' /target": '0 755',
+        'get pod helper -o jsonpath': 'True',
         'stat -c %a /target': '700',
         sha256sum: digests,
       };
@@ -638,6 +639,7 @@ describe('installCommand', () => {
       refuseLegacyTenant: async (namespace) => {
         legacy.push(namespace);
       },
+      sleep: async () => {},
       log: (line) => sink.logs.push(line),
       warn: (line) => sink.warnings.push(line),
     });
@@ -647,14 +649,81 @@ describe('installCommand', () => {
       (call) => call.args === '--namespace kube-system delete pod helper --wait=false',
     );
 
-  test('a dry run reads the cluster and changes nothing', async () => {
+  test('a dry run checks the target through a read-only pod and changes nothing', async () => {
     const stand = cluster();
     const sink = { logs: [] as string[], warnings: [] as string[] };
     const legacy: string[] = [];
     expect(await run(stand, { yes: false }, sink, legacy)).toBe('dry-run');
     expect(legacy).toEqual(['di-tenant-identity-pg']);
     expect(sink.logs).toContain(`target ${target} (the guest's /data)`);
-    expect(stand.calls.some((call) => /create|exec|delete/.test(call.args))).toBe(false);
+    expect(sink.logs).toContain('target is empty or absent (checked read-only on node-1)');
+    // The only pod: read-only, DAC_READ_SEARCH only, only this tenant's directory mounted.
+    const created = stand.calls.filter((call) => call.args === 'create -f -');
+    expect(created).toHaveLength(1);
+    const pod = JSON.parse(String(created[0]?.input));
+    expect(pod.spec.volumes).toEqual([
+      {
+        name: 'tenant',
+        hostPath: { path: `/var/lib/kubesolo/di-tenants/${uid}`, type: 'Directory' },
+      },
+    ]);
+    const container = pod.spec.containers[0];
+    expect(container.volumeMounts).toEqual([
+      { name: 'tenant', mountPath: '/tenant', readOnly: true },
+    ]);
+    expect(container.securityContext.capabilities).toEqual({
+      drop: ['ALL'],
+      add: ['DAC_READ_SEARCH'],
+    });
+    expect(container.securityContext.readOnlyRootFilesystem).toBe(true);
+    const exec = stand.calls.filter((call) => call.args.includes(' exec '));
+    expect(exec.map((call) => call.args.split(' -- sh -c ')[1])).toEqual([
+      'if [ -d /tenant/workloads/identity ]; then ls -A /tenant/workloads/identity; fi',
+    ]);
+    expect(exec.some((call) => call.input !== undefined)).toBe(false);
+    expect(deleted(stand)).toBe(true);
+  });
+
+  test('a dry run reports a non-empty target (a rolled-back cutover) and still deletes the pod', async () => {
+    const stand = cluster({ 'then ls -A': { stdout: '.di-encfs\npglite\n' } });
+    await expect(run(stand, { yes: false })).rejects.toThrow(
+      `${target} is not empty (2 entries); refusing to install. A rolled-back cutover leaves its data here: roll forward into a fresh tenant`,
+    );
+    expect(deleted(stand)).toBe(true);
+    // A pod that cannot be deleted is named, with what it mounts.
+    const stuck = cluster({ 'delete pod helper': { code: 1 } });
+    await expect(run(stuck, { yes: false })).rejects.toThrow(
+      `could not delete the helper pod kube-system/helper (kubectl exit 1); it mounts /var/lib/kubesolo/di-tenants/${uid} read-only`,
+    );
+  });
+
+  test('a dry run on a tenant whose directory does not exist yet creates nothing and reports it', async () => {
+    // kubelet refuses the `Directory` hostPath; the pod stays Pending with that event.
+    const stand = cluster({
+      'get pod helper -o jsonpath': { stdout: 'False' },
+      'get events': {
+        stdout: `MountVolume.SetUp failed for volume "tenant" : hostPath type check failed: /var/lib/kubesolo/di-tenants/${uid} is not a directory\n`,
+      },
+    });
+    const sink = { logs: [] as string[], warnings: [] as string[] };
+    expect(await run(stand, { yes: false }, sink)).toBe('dry-run');
+    expect(sink.logs).toContain(
+      `target is absent: /var/lib/kubesolo/di-tenants/${uid} does not exist yet (checked read-only on node-1)`,
+    );
+    expect(stand.calls.some((call) => call.args.includes(' exec '))).toBe(false);
+    expect(deleted(stand)).toBe(true);
+    const pod = JSON.parse(String(stand.calls.find((call) => call.args === 'create -f -')?.input));
+    expect(pod.spec.volumes[0].hostPath.type).toBe('Directory');
+
+    // A pod that is still pending for another reason is polled, then given up on, and deleted.
+    const pending = cluster({ 'get pod helper -o jsonpath': { stdout: 'False' } });
+    await expect(run(pending, { yes: false })).rejects.toThrow(
+      'the read-only helper pod did not start within 180s',
+    );
+    expect(
+      pending.calls.filter((call) => call.args.includes('get pod helper -o jsonpath')),
+    ).toHaveLength(90);
+    expect(deleted(pending)).toBe(true);
   });
 
   test('installs: empty check, archive, modes before owner, digests, and the pod is deleted', async () => {
