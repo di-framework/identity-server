@@ -494,8 +494,12 @@ HTTP_PORT="$(jq -r .httpPort "$STATE/state.json")"   # 28280 on authproto
 GW="http://127.0.0.1:$HTTP_PORT"    # authproto's platform gateway
 KUBE=/path/to/di-framework-kube     # v0.0.5 or later
 PLATFORM_PACKAGE=@di-framework/platform@6.0.13
-export PATH="/dir/containing/wac:$PATH"
-# Every platform `up` in this runbook goes through this, with a whole config file (see "Rules").
+# rustup's cargo first: the import runner's rust-toolchain.toml needs it (P0); a standalone cargo ignores it.
+export PATH="$HOME/.cargo/bin:/dir/containing/wac:$PATH"
+# The engine that runs kubesolo-authproto (P0). `up` uses it, not whatever Docker context is active.
+export DOCKER_HOST=unix:///path/to/engine.sock   # e.g. a podman machine's API socket
+# Every platform `up` in this runbook goes through this, with a whole config file (see "Rules"),
+# against $DOCKER_HOST.
 up_platform() {
   "$KUBE" up --name authproto --http-port "$HTTP_PORT" --allow-insecure-registries \
     --platform-package "$PLATFORM_PACKAGE" --platform-config "$1" --timeout 20m
@@ -607,6 +611,26 @@ P0. **The source's runtime rows.** `export.ts` refuses any `identity_runtime_sec
     new guest's bootstrap fingerprint would differ and it would bootstrap a second organization,
     owner and viewer from the defaults. They are personal data, not secrets; the tools print
     their names only.
+
+    **The engine.** `di-framework-kube up` (every `up_platform`) uses the active Docker context.
+    If authproto's Kubesolo container runs in a podman machine while Docker Desktop is the active
+    context, `up` does not see it, creates a second Kubesolo container and fails on the HTTP
+    port. `DOCKER_HOST` (the env block) must name the engine that runs it:
+    ```sh
+    docker ps --filter status=running --format '{{.Names}}' | grep -qx kubesolo-authproto \
+      && echo 'engine: ok' || echo "STOP: kubesolo-authproto is not running on '$DOCKER_HOST'"
+    ```
+    Without `engine: ok`, STOP.
+
+    **The import runner.** Step 5's `import.ts` builds `deploy/cutover/pglite-runner` with
+    `cargo` on first use, which would be inside the freeze. It needs rustup's `cargo`, which
+    honours the runner's `rust-toolchain.toml`; a standalone `cargo` (`/usr/local/bin/cargo`)
+    ignores it and fails with `can't find crate for core` for wasm32-wasip2. With `~/.cargo/bin`
+    first on `PATH` (the env block), build it now:
+    ```sh
+    (cd deploy/cutover/pglite-runner && cargo build --locked --release --target wasm32-wasip2) \
+      && echo 'runner: ok' || echo 'STOP: the runner did not build'
+    ```
 P1. **The issuer host and the route alias.** While the old guest is still up, read its issuer
     and signing key id from its public documents:
     ```sh
@@ -631,6 +655,27 @@ P1. **The issuer host and the route alias.** While the old guest is still up, re
     relying-party configuration, so it is not "migrate everything" and needs a new sign-off), or
     deploying into tenant `identity` after `directory` is retired (the guard refuses this by
     design).
+
+    **SMTP** (identity-server#69). The new guest's `/ready` requires `SMTP_HOST` and `SMTP_FROM`
+    (it makes no connection; `SMTP_FROM` and `SMTP_PORT` are compiled in,
+    `apps/guest/src/bindings.ts`). A source without an `SMTP_HOST` row passes the export and
+    then fails step 6's rehearsal (`/ready` 503, `smtp: false`) during the freeze. Check the
+    names P0 read:
+    ```sh
+    grep -qx SMTP_HOST "$OUT/source-row-names" && echo 'smtp: ok' \
+      || echo 'STOP: no SMTP_HOST row; record the relay decision before the freeze'
+    ```
+    Without one, STOP: choose the relay before the freeze, record it as a deviation, and set
+    it for step 6, which adds `SMTP_HOST` to the values:
+    ```sh
+    SMTP_RELAY_HOST=10.43.250.25   # authproto: Mailpit, recorded deviation
+    ```
+    authproto's choice was Mailpit (`deploy/platform/components/mailpit.ts`, port 1025, matching
+    the guest's compiled-in `SMTP_PORT`) at the ClusterIP `deploy/platform/index.ts` defaults
+    `mailpitClusterIP` to (`10.43.250.25`), which needs `10.43.250.25:1025` in the platform's
+    `egressAllowedDestinations`. Mailpit and its
+    egress grant can follow the switch (step 10); until then mail from the new guest fails,
+    which `/ready` does not check.
 P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the exclusive image, and
     allowlist the plain-HTTP registry.** One `up` does all three, before the freeze, while the old
     guest still serves.
@@ -733,6 +778,31 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
        Tenant that `kubectl` already created fails the `up` with "already exists" (and the alias
        target must be a declared tenant anyway). **The push user is declared here too**, with a
        membership in `$NEW` only, rather than by editing User objects with `kubectl`.
+
+       A stack without `tenantAuth.registry` stops the builder (authproto's had none). Setting
+       it in the builder, immediately before the `tenantAuth.registry` check
+       (`config.tenantAuth.registry ??= { component: "<oci-registry image>" };` authproto used
+       `ghcr.io/di-framework/oci-registry@sha256:a92bf0b24662149bf3a6256723dd7eb59533090d9385a62b71c2ed2b89e9361a`),
+       is a recorded deviation. It gives **every** tenant a registry (`identity` and `acme` too),
+       and item 6 then restarts their `tenant-controller`s.
+
+       **The tenant-auth image.** Step 8 pushes through `$NEW`'s `tenant-controller`, which must
+       serve the registry front (`TENANT_CONTROLLER_REGISTRY_FRONT_PORT`, 8790). Images without
+       the front do not, e.g. authproto's `tenant-auth@sha256:48a431cc…`; item 6d is the test.
+       Such an image cannot be upgraded during the freeze: `Controller.start` awaits
+       `discover(issuer)` before it opens any listener (platform#225), so with the issuer frozen
+       a restarted controller serves neither pushes nor pulls. Set `@di-framework/platform`
+       6.0.13's pin in both files now (a no-op where it is already set):
+       ```sh
+       TENANT_AUTH_IMAGE=ghcr.io/di-framework/tenant-auth@sha256:5b8c89887ef5bb91603bdd74148e76a1982e1c9d09413c4cc529756908ef149b   # platform 6.0.13
+       for f in platform.json platform-alias.json; do
+         [ "$(jq -r '.tenantAuth.image' "$OUT/$f")" = "$TENANT_AUTH_IMAGE" ] && { echo "$f: tenant-auth pin ok"; continue; }
+         (umask 077 && jq --arg image "$TENANT_AUTH_IMAGE" '.tenantAuth.image = $image' "$OUT/$f" > "$OUT/$f.new" \
+           && mv "$OUT/$f.new" "$OUT/$f") && echo "$f: tenant-auth set to the pin" || echo "STOP: cannot update $f"
+       done
+       ```
+       The upgrade (item 6) then restarts every tenant's `tenant-controller` and
+       `tenant-console` while the old guest still serves, and item 6d checks the front.
     4. **Every plain-HTTP registry is allowlisted.** authproto's old identity guest and
        `acme/greeter-staging` pull from plain-HTTP
        `examples-registry.wasmcloud.svc.cluster.local:5000`. Since 6.0.11 tenant hosts pull over
@@ -811,6 +881,10 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
        - **rolls (pod template updates):** `di-platform-gateway`, `di-platform-controller` and the
          runtime operator. The controller rolls once on this first upgrade only, because
          `tenantAuth`'s stored form changes from JSON text to an object.
+       - **from an older platform** (e.g. 6.0.9 → 6.0.13), also expected for that jump: the
+         workload admission policy (update), the new reserved-workloads policy (create), the
+         controller's RBAC gaining WorkloadDeployment create and delete, the gateway's egress
+         to 8790, and the controller code ConfigMap (replace).
 
        Anything else is a STOP, in particular any delete, a change to Tenant `identity` or
        `acme`, or to an existing User. The tenant hosts' new image does not show here: the
@@ -857,6 +931,17 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
          sleep 5
        done
        [ "$registry" = True ] && echo 'tenant registry Ready' || echo 'tenant registry NOT Ready: STOP'
+       # d. tenant $NEW's registry front (step 8 pushes through it): a TLS listener on 8790
+       kubectl --kubeconfig "$KC" -n "di-runtime-$NEW" port-forward svc/tenant-controller 28791:8790 >/dev/null 2>&1 &
+       pf=$!
+       front=000
+       for i in $(seq 1 10); do   # up to about a minute; any HTTP status means the front answered
+         front="$(curl -sk -o /dev/null -m 5 -w '%{http_code}' https://127.0.0.1:28791/v2/)"
+         [ "$front" != 000 ] && break
+         sleep 2
+       done
+       kill "$pf" 2>/dev/null
+       [ "$front" != 000 ] && echo "registry front: ok ($front)" || echo 'STOP: no registry front on 8790'
        ```
        Each check prints `ok`/`Ready` or a `STOP` line; a missing or empty answer is a `STOP`,
        never a pass. If anything fails, STOP before the freeze: the old guest
@@ -1002,8 +1087,13 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
    `bun deploy/cutover/import.ts --export "$OUT/export" --values "$OUT/export/values.json" --out "$OUT/data"`.
    Every table must read `n/n rows`, `rows V16 would delete: 0`, and the disk line
    `0 without a header; .di-encfs KCV matches: true; plaintext needles found: 0`. A failed import
-   removes `$OUT/data` again, so it can simply be re-run.
-6. **Rehearse:**
+   removes `$OUT/data` again, so it can simply be re-run. The runner was built in P0; if it is
+   missing, the import builds it with the first `cargo` on `PATH`, which must be rustup's (P0).
+6. **Rehearse.** If P1 found no `SMTP_HOST` row, first add the relay recorded there
+   (`$SMTP_RELAY_HOST`) to the values (a recorded deviation; the import does not read SMTP
+   settings, so no re-import):
+   `(umask 077 && [ -n "$SMTP_RELAY_HOST" ] && jq --arg host "$SMTP_RELAY_HOST" '.SMTP_HOST = $host' "$OUT/export/values.json" > "$OUT/values.new" && mv "$OUT/values.new" "$OUT/export/values.json") || echo 'STOP: cannot add SMTP_HOST'`.
+   Then
    `bun deploy/cutover/rehearse.ts --data "$OUT/data" --values "$OUT/export/values.json" --export "$OUT/export"`.
    Every line must be `ok` or `note`, including `bootstrap not reconciled` and
    `bootstrap organization`; any `FAIL` exits 1. The owner and viewer sign in with the bootstrap
@@ -1021,8 +1111,12 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
    parameters a `note`, anything else a `FAIL`, so a `note` for a changed password cannot hide
    a hash the new guest cannot verify.
 7. **Install** (dry run, then for real), before the guest's WorkloadDeployment exists:
-   `bun deploy/cutover/install.ts --data "$OUT/data" --values "$OUT/export/values.json" --kubeconfig "$KC" --context "$CTX" --tenant "$NEW"`.
-   The dry run starts a read-only helper pod (root with DAC_READ_SEARCH only; only the tenant's
+   `bun deploy/cutover/install.ts --data "$OUT/data" --values "$OUT/export/values.json" --kubeconfig "$KC" --context "$CTX" --tenant "$NEW" --storage-root "$(jq -r .storageRoot "$OUT/platform.json")"`.
+   Pass `--storage-root`, the platform config's `storageRoot`, on both runs (the dry run and
+   `--yes`): otherwise the tool discovers the root from every Deployment's
+   `<root>/di-tenants/<uid>` hostPath, and a stray one under another root (on authproto, a
+   leftover BackingService under `/var/lib/k0s`) makes it refuse with `found several platform
+   storage roots` (platform#226). The dry run starts a read-only helper pod (root with DAC_READ_SEARCH only; only the tenant's
    own `<storageRoot>/di-tenants/<uid>` mounted, read-only and as type `Directory`, which kubelet
    never creates; deleted afterwards), lists the target and refuses a non-empty one as `--yes`
    would; it must print `target is empty or absent`, or `target is absent: ... does not exist
@@ -1124,10 +1218,11 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
       `deploy.sh` says so and prints the deploy command to re-run (add the variables above
       again); `runtime-secrets.ts apply` is the recovery only once the WorkloadDeployment
       exists, and `deploy.sh` prints it only then. The workload must reference the tenant
-      registry:
+      registry. Both registry values are prefixes: the CLI appends the project's repository
+      name (`identity`), so the image is `tenant-registry.di-runtime-$NEW.svc/identity/identity:sha256-…`:
       ```sh
       image="$(kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" get workloaddeployment identity -o jsonpath='{.spec.template.spec.components[*].image}')"
-      case "$image" in "tenant-registry.di-runtime-$NEW.svc/identity"[:@]*) echo "image ok: $image" ;; *) echo "STOP: image '$image'" ;; esac
+      case "$image" in "tenant-registry.di-runtime-$NEW.svc/identity/identity"[:@]*) echo "image ok: $image" ;; *) echo "STOP: image '$image'" ;; esac
       ```
    4. **Clean up the push credentials, on every path:** `cleanup_push` after a successful
       deploy, after a failed one you will not retry at once, and before any rollback. From a
@@ -1146,7 +1241,20 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
    reaches it in the cluster could replace the identity provider's component. It would also
    tie the new guest to an allowlist entry that exists only for the old guest and `acme`, and
    it is not the path proven on pgprove. Use it only as a recorded decision if `$NEW`'s
-   registry cannot be made Ready.
+   registry cannot be made Ready or cannot take the push, decided by the coordinator at that
+   moment. authproto is the precedent: its 6.0.13 tenant hosts pulled from it because
+   `insecureRegistries` lists it. On this path item 3 runs with `deploy.sh`'s registry defaults
+   and no push key or wrapper, and item 3's image check is replaced by this one:
+   ```sh
+   kubectl --kubeconfig "$KC" -n wasmcloud port-forward svc/examples-registry 25001:5000 &
+   PF=$!
+   IDENTITY_AUTHPROTO_CUTOVER="authproto/$NEW" deploy/guest/deploy.sh authproto "$NEW" "$OUT/export/values.json" \
+     || echo 'STOP: the deploy failed'
+   image="$(kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" get workloaddeployment identity -o jsonpath='{.spec.template.spec.components[*].image}')"
+   case "$image" in "examples-registry.wasmcloud.svc.cluster.local:5000/identity"[:@]*) echo "image ok: $image" ;; *) echo "STOP: image '$image'" ;; esac
+   ```
+   Afterwards, once the issuer serves again, fix what stopped the push (on authproto, the
+   tenant-auth image), re-push into `$NEW`'s registry and redeploy.
 9. **Verify on the tenant host** (`Host: identity.$NEW.localhost`):
    `bun apps/guest/scripts/live-check.ts --values "$OUT/export/values.json" --url "$GW" --host identity.$NEW.localhost --read-only`.
    With `--read-only` and no `--slug` it reads the bootstrap organization, which bootstrap
@@ -1215,7 +1323,7 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
        keeps its key somewhere other than a `<workload>-control` Secret is found only by its
        workload name. The Postgres-era guest is one (its key is in `directory`), which is why
        `di-tenant-identity/identity` is checked by name. Then the tenant-auth check: `tenant_auth_unchanged`
-       must print nothing (`$NEW`'s new workload does not show in it); otherwise roll back (P2,
+       must print `tenant-auth: unchanged` (`$NEW`'s new workload does not show in it); otherwise roll back (P2,
        "The frozen issuer").
     2. **Switch**, only if both checks of item 1 still pass at that moment:
        ```sh
@@ -1237,9 +1345,14 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
        roll back.
     3. **Verify against the real issuer host**, as a relying party sees it:
        ```sh
-       discovery="$(curl -s -m 10 "$ISSUER/.well-known/openid-configuration")"
+       discovery=
+       for i in $(seq 1 6); do   # up to about a minute; -f shows a failed discovery instead of hiding it
+         discovery="$(curl -fsS -m 10 "$ISSUER/.well-known/openid-configuration")" && break
+         discovery=
+         sleep 5
+       done
        iss="$(printf '%s' "$discovery" | jq -r .issuer)"
-       jwks_kid="$(curl -s -m 10 "$(printf '%s' "$discovery" | jq -r .jwks_uri)" | jq -r '.keys[].kid')"
+       jwks_kid="$(curl -fsS -m 10 "$(printf '%s' "$discovery" | jq -r .jwks_uri)" | jq -r '.keys[].kid')"
        [ -n "$ISSUER" ] && [ "$iss" = "$ISSUER" ] && [ "$iss" = "$(jq -r .ISSUER_URL "$OUT/export/values.json")" ] \
          && [ -n "$NEW_KID" ] && [ "$jwks_kid" = "$NEW_KID" ] \
          && echo 'issuer ok' || echo "STOP: issuer '$iss', kid '$jwks_kid'"
