@@ -1209,10 +1209,11 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
       `deploy.sh` says so and prints the deploy command to re-run (add the variables above
       again); `runtime-secrets.ts apply` is the recovery only once the WorkloadDeployment
       exists, and `deploy.sh` prints it only then. The workload must reference the tenant
-      registry:
+      registry. Both registry values are prefixes: the CLI appends the project's repository
+      name (`identity`), so the image is `tenant-registry.di-runtime-$NEW.svc/identity/identity:sha256-…`:
       ```sh
       image="$(kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" get workloaddeployment identity -o jsonpath='{.spec.template.spec.components[*].image}')"
-      case "$image" in "tenant-registry.di-runtime-$NEW.svc/identity"[:@]*) echo "image ok: $image" ;; *) echo "STOP: image '$image'" ;; esac
+      case "$image" in "tenant-registry.di-runtime-$NEW.svc/identity/identity"[:@]*) echo "image ok: $image" ;; *) echo "STOP: image '$image'" ;; esac
       ```
    4. **Clean up the push credentials, on every path:** `cleanup_push` after a successful
       deploy, after a failed one you will not retry at once, and before any rollback. From a
