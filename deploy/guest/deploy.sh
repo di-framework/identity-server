@@ -11,7 +11,9 @@
 #
 # The variables di-framework.deploy.toml interpolates for target `identity` default to the
 # instance's admin kubeconfig and the in-cluster `examples-registry` behind a port-forward on
-# REGISTRY_FORWARD_PORT; override any of them through the environment. A tenant developer
+# REGISTRY_FORWARD_PORT; override any of them through the environment (the authproto cutover
+# points IDENTITY_REGISTRY_PUSH and IDENTITY_REGISTRY_PULL at the new tenant's own registry; see
+# its runbook, step 8). A tenant developer
 # kubeconfig works too: the Secret steps only create and replace, and since its namespaced Role
 # may not list BackingServices in every namespace, the guard then skips the cluster-wide
 # `directory` check with a warning and checks di-tenant-<tenant> only. It does not skip it for a

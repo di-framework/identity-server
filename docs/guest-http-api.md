@@ -374,9 +374,12 @@ on the fresh instance. Neither can be pointed at a deployed guest as written:
 
 Signed off on 2026-10-12: **migrate everything**, the data and the runtime secrets (issuer, public
 origin, signing key, bootstrap passwords, client secrets, SMTP), into a pglite guest in a **new
-tenant** on authproto. The tools below are built and proven offline against a synthetic
-Postgres-era database (see [Proof](#proof-of-the-cutover-tooling)); the cluster steps (tenant,
-install, deploy) are not proven live yet. Nothing here has run against authproto.
+tenant** on authproto, and keep the issuer by moving its host to the new tenant with a platform
+**gateway route alias** (decided 2026-10-13). The tools below are proven offline against a
+synthetic Postgres-era database, and the whole runbook, platform upgrade, route switch and
+rollback included, ran end to end on the `pgprove` rehearsal instance (see
+[Proof](#proof-of-the-cutover-tooling)). Nothing here has run against authproto yet. It needs
+`@di-framework/platform` 6.0.13 and `di-framework-kube` v0.0.5 or later ([Runbook](#runbook)).
 
 #### What moves, and how
 
@@ -387,7 +390,8 @@ install, deploy) are not proven live yet. Nothing here has run against authproto
 | Import | `deploy/cutover/import.ts` | Runs the guest's own encrypted provider (`apps/guest/.di-framework/di-framework-pglite.encrypted.wasm`, checked to be byte for byte the provider inside `apps/guest/dist/identity.wasm`) under `wasmtime`, plugged into a small wasip2 runner (`deploy/cutover/pglite-runner`, Rust) that serves `di-framework:pglite/database` to the guest's own adapter over stdin/stdout. Initialises a fresh encrypted directory, migrates it to the source version with the guest's migration code, loads every table and the bootstrap fingerprints in one transaction, checks the counts inside it, then checks every file on disk is encfs ciphertext under the key's KCV and contains no engine string or user login or email. |
 | Rehearse | `deploy/cutover/rehearse.ts` | Boots the guest's request handler in-process on a **copy** of the imported directory, through the same provider: `/ready`, the later migrations, no bootstrap reconcile, the bootstrap organization, issuer and signing key `kid`, owner and viewer sign-in (a password changed since bootstrap is a `note` when the stored hash is proven carried), the three bootstrap clients' secrets, row counts and carried password hashes (`rehearse-core.ts`). |
 | Install | `deploy/cutover/install.ts` | Dry run by default; the dry run lists the target through a read-only helper pod (DAC_READ_SEARCH only, only `<storageRoot>/di-tenants/<tenant uid>` mounted read-only, never created) and refuses a non-empty one. With `--yes`, a helper pod on the node (the platform's storage-init image, root with CHOWN and DAC_OVERRIDE only, with exactly the target directory mounted) copies the directory into `<storageRoot>/di-tenants/<tenant uid>/workloads/identity` (what the platform mounts as the guest's `/data`), directories 0700, files 0600, then owner 65532, and compares every file's SHA-256 and owner. The pod is deleted on success and on failure; a failed delete names it. Refuses a non-empty target (before sending anything), a tenant with `directory`, a tenant that already has the WorkloadDeployment (unless `--allow-existing-workload`), and a directory whose marker KCV is not the values file's. |
-| Deploy | `deploy/guest/deploy.sh` | Unchanged path, with the guard lifted for this case only (below). |
+| Deploy | `deploy/guest/deploy.sh` | Unchanged path, with the guard lifted for this case only (below), pushing into the new tenant's own registry. |
+| Route | `di-framework-kube up --platform-config` | Adds the gateway route alias `identity.identity` → `identity.<new tenant>`, so the issuer's host reaches the new tenant; removing it is the route rollback. |
 
 Decisions and what they rest on:
 
@@ -458,20 +462,42 @@ included; so the cutover uses `deploy.sh`, not Pulumi.
 #### Runbook
 
 Run from an identity-server checkout at the commit that adds these tools, on the machine that
-holds authproto's kubeconfig. Needs Bun, kubectl, jq, wasmtime 48, `wac` (`WAC=<path>`, or
-`DF_SQLITE_TOOLS_DIR/bin/wac` as for the build), `wasm-tools`, rustup (the runner builds with the
-toolchain in `deploy/cutover/pglite-runner/rust-toolchain.toml` on first use), podman (step 12's
-restore check), and cli-plugin-platform 6.2.0 or later. Keep `$OUT` on an encrypted volume; it
-will hold every secret and all user data.
+holds authproto's kubeconfig and its di-framework-kube state. Keep `$OUT` on an encrypted volume,
+in a path without spaces; it will hold every secret, all user data and a copy of the platform
+stack's state and passphrase.
+
+**Versions.** The route move needs releases that are new with this runbook:
+
+| Tool | Minimum | Why |
+| --- | --- | --- |
+| `@di-framework/platform` | **6.0.13** | gateway route aliases (`routeAliases`, platform #218/#219); since 6.0.11 tenant hosts get only the `insecureRegistries` entries as plain-HTTP registries |
+| `di-framework-kube` | **v0.0.5** | passes `routeAliases`, `tenantAuth`, `insecureRegistries` and the backing-class keys through `--platform-config` (kube #10/#11); older CLIs reject them or wipe hand-set ones on every `up` |
+| `@di-framework/cli-plugin-platform` | **6.2.0** | 6.1.0 fails the build with `di-framework:pglite/database@0.2.0` unresolved. If the installed one is older and must stay, install 6.2.0 into its own directory and point `DI_FRAMEWORK_EXTENSIONS_DIR` at it for steps 1 and 8 |
+
+Also needed: Bun (with `Bun.YAML`), kubectl, jq, oras, Node.js, npm and the Pulumi CLI (for
+`up` and the preview), wasmtime 48, `wasm-tools`, rustup (the runner builds with the toolchain in
+`deploy/cutover/pglite-runner/rust-toolchain.toml` on first use), podman (step 12's restore
+check), and **`wac` on `PATH`**. The build (`di-framework platform build`) finds `wac` only on
+`PATH`; `WAC=<path>` is read by the import runner alone, so it is not enough.
 
 ```sh
-KC="$HOME/Library/Application Support/di-framework-kube/authproto/kubeconfig"
+STATE="$HOME/Library/Application Support/di-framework-kube/authproto"
+KC="$STATE/kubeconfig"
 CTX="$(kubectl --kubeconfig "$KC" config current-context)"
 NEW=identity-pg                     # the new tenant; any DNS label but `identity`
+PUSHER=identity-cutover             # a NEW platform user that pushes the guest into $NEW's registry (step 8)
 OUT=/path/on/encrypted/volume/authproto-cutover
-GW=http://127.0.0.1:<gateway port>  # authproto's platform gateway
 mkdir -m 700 -p "$OUT"
-export WAC=/path/to/wac
+HTTP_PORT="$(jq -r .httpPort "$STATE/state.json")"   # 28280 on authproto
+GW="http://127.0.0.1:$HTTP_PORT"    # authproto's platform gateway
+KUBE=/path/to/di-framework-kube     # v0.0.5 or later
+PLATFORM_PACKAGE=@di-framework/platform@6.0.13
+export PATH="/dir/containing/wac:$PATH"
+# Every platform `up` in this runbook goes through this, with a whole config file (see "Rules").
+up_platform() {
+  "$KUBE" up --name authproto --http-port "$HTTP_PORT" --allow-insecure-registries \
+    --platform-package "$PLATFORM_PACKAGE" --platform-config "$1" --timeout 20m
+}
 # directory's Postgres pod, for the read-only checks below and step 2.
 POD="$(kubectl --kubeconfig "$KC" -n di-runtime-identity get pods -l app=di-bs-directory -o jsonpath='{.items[0].metadata.name}')"
 psql_directory() { kubectl --kubeconfig "$KC" -n di-runtime-identity exec "$POD" -- psql -X -A -t -U app -d app -c "$1"; }
@@ -481,10 +507,32 @@ The confirmation the guard wants is literally `IDENTITY_AUTHPROTO_CUTOVER=authpr
 the word `authproto`, a slash and the new tenant, whatever the instance is called. On a rehearsal
 instance (`pgprove`, with its own `directory`) it is still `authproto/$NEW`, not `pgprove/$NEW`.
 
+**Rules for every platform `up`:**
+
+- **Always a whole file.** `--platform-config` *replaces* every key it allowlists (`tenants`,
+  `users`, `tenantHostImage`, `tenantHostImagePullPolicy`, `networkPolicyEngine`, `storageRoot`,
+  `egressAllowedDestinations`, `routeAliases`, `tenantAuth`, `insecureRegistries`,
+  `backingServiceClasses`, `seedDefaultBackingClasses`); a key left out of the file is removed
+  from the stack. Use only the two files P2 writes: `$OUT/platform.json` (no alias) and
+  `$OUT/platform-alias.json` (the same plus the alias). Never edit the stack with `pulumi config
+  set` in between.
+- **Always `--allow-insecure-registries`.** The files list a plain-HTTP registry, and the CLI
+  refuses a non-empty `insecureRegistries` without it on every `up`. `up_platform` passes it.
+- **A rejected `up` still saves its config** (kube#13): the stack config is written before
+  Pulumi validates it. After **any** failed `up`, run `up_platform` again with a known-good file
+  (`$OUT/platform.json` before the switch in step 10, `$OUT/platform-alias.json` after it) before
+  anything else, and never run a plain `up` (no `--platform-config`) during the cutover: it
+  would apply whatever the failed run left behind.
+- **Each gateway roll drops connections for under a second** (platform#223). The switch
+  (step 10) and the route rollback each roll `di-platform-gateway` once; a client may see one
+  failed request and retry.
+
 ##### Preconditions (before any freeze)
 
-None of these checks stops or changes the old guest. If one fails, **STOP**: do not freeze, and
-present the options below to the coordinator. Resume only once a decision is recorded.
+None of these checks stops or changes the old guest's data. P2 changes the platform (it adds
+tenant `$NEW` and restarts every tenant host, the old guest's included), which the user accepted
+as a maintenance blip. If a check fails, **STOP**: do not freeze, and present the options to the
+coordinator. Resume only once a decision is recorded.
 
 P0. **The source's runtime rows.** `export.ts` refuses any `identity_runtime_secret` row it has no
     setting for (step 3), so compare the names now, names only (never `value`):
@@ -504,62 +552,223 @@ P0. **The source's runtime rows.** `export.ts` refuses any `identity_runtime_sec
     new guest's bootstrap fingerprint would differ and it would bootstrap a second organization,
     owner and viewer from the defaults. They are personal data, not secrets; the tools print
     their names only.
-P1. **The issuer host.** While the old guest is still up, read its issuer from its public
-    discovery document:
-    `ISSUER="$(curl -s -H 'Host: identity.identity.localhost' "$GW/.well-known/openid-configuration" | jq -r .issuer)"`.
-    The cutover keeps this issuer (and so every issued token), so after step 10 requests for
-    `$ISSUER`'s host must reach tenant `$NEW`. The gateway routes `<name>.<tenant>.localhost` by
-    tenant name, so if the host is `*.identity.localhost`, or if nothing defines how that host is
-    moved to `$NEW`, STOP. Options:
-    - an alias in front of the gateway that sends `$ISSUER`'s host to `identity.$NEW.localhost`
-      (its own change; moving it back is the route rollback);
-    - a new issuer, which invalidates every token and relying party configuration (not "migrate
-      everything", so a new sign-off);
-    - deploying into tenant `identity` after `directory` is retired: the guard refuses this by
-      design, and it would need its own change and its own rollback story.
-
-    Known gap: the gateway keeps idle keep-alive connections to the tenant host it last routed
-    to. After a route change, requests on such a connection still reach the old tenant host
-    until the connection closes. Deleting the old tenant host pod
-    (`hostgroup-tenant-identity-*` in `di-runtime-identity`) closes them; the Deployment starts
-    a new pod.
-P2. **The exclusive tenant host image.** Create the new tenant now (the old guest is untouched).
-    With the installation label of the existing tenant
-    (`kubectl --kubeconfig "$KC" get tenants.platform.di-framework.dev identity -o jsonpath='{.metadata.labels}'`):
+P1. **The issuer host and the route alias.** While the old guest is still up, read its issuer
+    and signing key id from its public documents:
     ```sh
-    kubectl --kubeconfig "$KC" apply -f - <<EOF
-    apiVersion: platform.di-framework.dev/v1alpha1
-    kind: Tenant
-    metadata:
-      name: $NEW
-      labels: { <installation label key>: <value> }
-    spec: {}
-    EOF
-    kubectl --kubeconfig "$KC" wait tenants.platform.di-framework.dev/$NEW --for=condition=Ready --timeout=300s
-    kubectl --kubeconfig "$KC" -n "di-runtime-$NEW" get deploy "hostgroup-tenant-$NEW" -o jsonpath='{.spec.template.spec.containers[*].image}'
+    ISSUER="$(curl -s -H 'Host: identity.identity.localhost' "$GW/.well-known/openid-configuration" | jq -r .issuer)"
+    OLD_KID="$(curl -s -H 'Host: identity.identity.localhost' "$GW/oauth2/jwks" | jq -r '.keys[].kid')"
+    echo "$ISSUER $OLD_KID"
     ```
-    The image must be the exclusive-instance build, `ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive`.
-    `deploy.sh` (through `runtime-secrets.ts guard`) refuses the cutover otherwise, but its check
-    is by **name only**: some image in the Deployment's pod template must match
-    `(^|/)wash:<tag>` with `exclusive` in the tag (`/(^|\/)wash:[^\s@]*exclusive/`), with or
-    without an `@sha256:` suffix. It does not compare a digest, so a rebuilt or retagged image
-    under that name passes. To pin the digest too, set
+    The cutover keeps this issuer, and so every issued token. On authproto it is
+    `http://identity.identity.localhost:28280`. The gateway routes `<route-host>.<tenant>.localhost`
+    by tenant name, so this host reaches tenant `identity` only. Step 10 moves it with an
+    administrator **gateway route alias** (platform #218/#219, `@di-framework/platform` 6.0.13):
+    `"routeAliases": {"identity.identity": "identity.$NEW"}` in the platform config. The gateway
+    then sends `Host: identity.identity.localhost:28280` to `di-http` in `di-runtime-$NEW` with
+    `Host: identity`, and keeps the original name in `X-Forwarded-Host`. Removing the alias with
+    another `up` is the route rollback. Tenants can neither see nor change aliases.
+
+    STOP if `$ISSUER` is not exactly `http://identity.identity.localhost:$HTTP_PORT`. The alias
+    rewrites only the tenant label, so the route host must stay `identity`, which the new guest
+    serves too. Also STOP if the stack already has a `routeAliases` entry (P2's builder checks
+    this). If neither holds, the alternatives are a new issuer (it invalidates every token and
+    relying-party configuration, so it is not "migrate everything" and needs a new sign-off), or
+    deploying into tenant `identity` after `directory` is retired (the guard refuses this by
+    design).
+P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the exclusive image, and
+    allowlist the plain-HTTP registry.** One `up` does all three, before the freeze, while the old
+    guest still serves.
+
+    1. **Instance settings.** `up` rebuilds the stack config from its flags as well as from the
+       file. Print what the instance was created with:
+       `jq '{httpPort, nodePort, namespace, release, chartVersion, kubesoloVersion, runMode}' "$STATE/state.json"`.
+       Every value must equal what `up_platform` passes: `httpPort` the `$HTTP_PORT` above, and
+       the others the defaults `"$KUBE" up --help` lists. If one differs, add the matching flag
+       (`--node-port`, `--namespace`, `--release`, `--chart-version`, `--kubesolo-version`,
+       `--run-mode`) to `up_platform`. If you cannot tell why it differs, STOP.
+    2. **The exclusive host image.** The pglite guest needs the exclusive-instance wash build,
+       which also carries wash patch 0002 (`--insecure-registry`). The kube CLI's default tenant
+       host image predates 0002, and the platform refuses it together with `insecureRegistries`,
+       so `tenantHostImage` must name the exclusive build explicitly. Pin it by digest:
+       ```sh
+       HOST_IMAGE="ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive@$(oras manifest fetch --descriptor ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive | jq -r .digest)"
+       ```
+       Switching the image restarts **every** tenant host (`acme` and the old guest's
+       `identity` too). The user accepted that blip. Item 6 proves the old guest on the new
+       image before the freeze, so a rollback restores it onto an image it has run on.
+    3. **Build the two config files** from the instance's stack config, carrying every key `up`
+       would otherwise drop, and adding tenant `$NEW`, user `$PUSHER` (a member of `$NEW` only,
+       for the push in step 8), the host image and the plain-HTTP registry:
+       ```sh
+       umask 077
+       STATE="$STATE" NEW="$NEW" PUSHER="$PUSHER" HOST_IMAGE="$HOST_IMAGE" OUT="$OUT" bun -e '
+       const { STATE, NEW, PUSHER, HOST_IMAGE, OUT } = process.env;
+       const stop = (why) => { console.error(`STOP: ${why}`); process.exit(1); };
+       // The keys di-framework-kube passes from --platform-config (kube internal/platform/pulumi.go).
+       const KEYS = ["tenants", "users", "tenantHostImage", "tenantHostImagePullPolicy", "networkPolicyEngine",
+         "storageRoot", "egressAllowedDestinations", "routeAliases", "tenantAuth", "insecureRegistries",
+         "backingServiceClasses", "seedDefaultBackingClasses"];
+       const TEXT = new Set(["tenantHostImage", "tenantHostImagePullPolicy", "networkPolicyEngine", "storageRoot"]);
+       const stack = Bun.YAML.parse(await Bun.file(`${STATE}/platform/Pulumi.dev.yaml`).text()).config ?? {};
+       const config = {};
+       for (const key of KEYS) {
+         let value = stack[`di-framework-kube:${key}`];
+         if (value === undefined) continue;
+         if (value !== null && typeof value === "object" && "secure" in value) stop(`${key} is a Pulumi secret`);
+         // A key set by hand with `pulumi config set` (tenantAuth on authproto) is stored as JSON text.
+         if (typeof value === "string" && !TEXT.has(key)) value = JSON.parse(value);
+         config[key] = value;
+       }
+       if (Object.keys(config.routeAliases ?? {}).length > 0) stop("the stack already has routeAliases");
+       delete config.routeAliases;
+       if (!config.tenantAuth?.registry) stop("tenantAuth.registry is not set, so tenant " + NEW + " gets no registry");
+       config.tenants ??= [];
+       config.users ??= [];
+       if (config.tenants.some((t) => t.name === NEW)) stop(`tenant ${NEW} is already declared`);
+       if (config.users.some((u) => u.name === PUSHER)) stop(`user ${PUSHER} is already declared; pick a new name`);
+       config.tenants.push({ name: NEW });
+       config.users.push({ name: PUSHER, memberships: [{ tenant: NEW, role: "developer" }] });
+       config.tenantHostImage = HOST_IMAGE;
+       config.insecureRegistries = [...new Set([...(config.insecureRegistries ?? []),
+         "examples-registry.wasmcloud.svc.cluster.local:5000"])];
+       const write = (name, value) => Bun.write(`${OUT}/${name}`, JSON.stringify(value, null, 2) + "\n");
+       await write("platform.json", config);
+       await write("platform-alias.json", { ...config, routeAliases: { "identity.identity": `identity.${NEW}` } });
+       // What `up` derives from its flags rather than from the file: compare with `up --help`.
+       for (const key of ["namespace", "release", "chart", "chartVersion", "httpNodePort", "httpEndpoint", "insecureRegistry", "values"])
+         console.log(`${key}: ${JSON.stringify(stack[`di-framework-kube:${key}`])}`);
+       '
+       ```
+       Any `STOP:` line: stop. The printed flag-derived keys must agree with item 1
+       (`httpEndpoint` is `http://127.0.0.1:$HTTP_PORT`, `values` is `{}`; anything else means the
+       instance was brought up with `--values` files, which `up_platform` must then pass with
+       `-f`). Review both files by eye: they hold no secret (`tenantAuth` names its OAuth Secret,
+       it does not contain it), but they are the whole platform declaration from now on.
+
+       Two rules shape these files. **Tenant `$NEW` is created by declaring it here, never with
+       `kubectl apply`.** The Pulumi provider does not adopt existing objects, so declaring a
+       Tenant that `kubectl` already created fails the `up` with "already exists" (and the alias
+       target must be a declared tenant anyway). **The push user is declared here too**, with a
+       membership in `$NEW` only, rather than by editing User objects with `kubectl`.
+    4. **Every plain-HTTP registry is allowlisted.** authproto's old identity guest and
+       `acme/greeter-staging` pull from plain-HTTP
+       `examples-registry.wasmcloud.svc.cluster.local:5000`. Since 6.0.11 tenant hosts pull over
+       plain HTTP only from the `insecureRegistries` entries, so without that entry their hosts
+       cannot pull again after the upgrade restarts them, and the rollback target is lost. List
+       the registry host of every component every WorkloadDeployment references and compare:
+       ```sh
+       kubectl --kubeconfig "$KC" get workloaddeployments -A -o json \
+         | jq -r '.items[] | "\(.metadata.namespace)/\(.metadata.name)" as $w
+             | .spec | [.. | objects | select(has("image")) | .image | strings] | unique[] | "\(split("/")[0]) \($w)"' \
+         | LC_ALL=C sort -u > "$OUT/workload-registries"
+       cat "$OUT/workload-registries"
+       jq -r --rawfile seen "$OUT/workload-registries" '(.insecureRegistries // []) as $plain
+           | $seen | split("\n")[] | select(length > 0) | split(" ") as [$host, $workload]
+           | select(($plain | index([$host])) == null)
+           | select($host | test("^(ghcr\\.io|tenant-registry\\.di-runtime-[a-z0-9-]+\\.svc)$") | not)
+           | "\($host) \($workload)"' "$OUT/platform.json"   # must print nothing
+       ```
+       The second command prints every registry that is neither allowlisted nor known to be TLS
+       (GHCR, and the platform's own `tenant-registry.di-runtime-<tenant>.svc` pull listener).
+       For each line, find out how that registry is served. A plain-HTTP one goes into
+       `insecureRegistries`, spelled exactly as the reference spells it (wash matches it
+       case-sensitively, with no default port), after which you rebuild the files (item 3,
+       adding it to the list there). A TLS one needs nothing. If you cannot tell, STOP.
+    5. **Preview on a copy** of the project and its state, never on the instance itself:
+       ```sh
+       PREVIEW="$OUT/preview"      # holds the stack's state and passphrase: same care as $OUT
+       rm -rf "$PREVIEW" && cp -Rp "$STATE/platform" "$PREVIEW"
+       PREVIEW="$PREVIEW" CONFIG="$OUT/platform.json" PACKAGE="$PLATFORM_PACKAGE" bun -e '
+       const { PREVIEW, CONFIG, PACKAGE } = process.env;
+       const KEYS = ["tenants", "users", "tenantHostImage", "tenantHostImagePullPolicy", "networkPolicyEngine",
+         "storageRoot", "egressAllowedDestinations", "routeAliases", "tenantAuth", "insecureRegistries",
+         "backingServiceClasses", "seedDefaultBackingClasses"];
+       const read = async (name) => Bun.YAML.parse(await Bun.file(`${PREVIEW}/${name}`).text());
+       const project = await read("Pulumi.yaml");
+       project.backend = { url: Bun.pathToFileURL(`${PREVIEW}/state`).href };   // the copy, not the instance
+       const pkg = await read("package.json");
+       pkg.dependencies["@di-framework/platform"] = PACKAGE.replace(/^@di-framework\/platform@/, "");
+       const stack = await read("Pulumi.dev.yaml");
+       for (const key of KEYS) delete stack.config[`di-framework-kube:${key}`];
+       for (const [key, value] of Object.entries(JSON.parse(await Bun.file(CONFIG).text())))
+         stack.config[`di-framework-kube:${key}`] = value;
+       stack.config["di-framework-kube:insecureRegistry"] = true;
+       stack.config["di-framework-kube:timeoutSeconds"] = 1200;
+       for (const [name, value] of [["Pulumi.yaml", project], ["package.json", pkg], ["Pulumi.dev.yaml", stack]])
+         await Bun.write(`${PREVIEW}/${name}`, JSON.stringify(value, null, 2) + "\n");
+       '
+       (cd "$PREVIEW" && npm install --no-audit --no-fund >/dev/null \
+         && PULUMI_CONFIG_PASSPHRASE_FILE="$PREVIEW/.passphrase" PULUMI_BACKEND_URL="$(jq -r .backend.url Pulumi.yaml)" \
+           pulumi preview --stack dev --diff --non-interactive) > "$OUT/preview.txt" 2>&1
+       rm -rf "$PREVIEW"
+       ```
+       The only changes allowed are:
+       - **create:** Namespaces `di-tenant-$NEW` and `di-runtime-$NEW`, Tenant `$NEW`, and
+         User `$PUSHER`;
+       - **update:** the runtime operator's Helm release, whose `hostNamespaces` gains
+         `di-runtime-$NEW`;
+       - **replace:** the gateway's ConfigMap;
+       - **rolls (pod template updates):** `di-platform-gateway`, `di-platform-controller` and the
+         runtime operator. The controller rolls once on this first upgrade only, because
+         `tenantAuth`'s stored form changes from JSON text to an object.
+
+       Anything else is a STOP, in particular any delete, a change to Tenant `identity` or
+       `acme`, or to an existing User. The tenant hosts' new image does not show here: the
+       platform controller applies it to the host Deployments after the `up`.
+    6. **Upgrade**, after saving the instance's project as it is now:
+       ```sh
+       cp -Rp "$STATE/platform" "$OUT/platform-before-upgrade"   # holds the stack's passphrase
+       up_platform "$OUT/platform.json"
+       ```
+       If it fails, follow the rules above: `up_platform "$OUT/platform.json"` again once the
+       cause is fixed, never a plain `up`. Then wait for the new tenant's auth pair and registry,
+       and for every tenant host to run the new image:
+       ```sh
+       kubectl --kubeconfig "$KC" wait "tenants.platform.di-framework.dev/$NEW" --for=condition=TenantAuthReady --timeout=600s
+       registry=
+       for i in $(seq 1 120); do   # up to 10 minutes; `kubectl wait` has exited early on WorkloadDeployments
+         registry="$(kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" get workloaddeployment di-tenant-registry -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}')"
+         [ "$registry" = True ] && break
+         sleep 5
+       done
+       [ "$registry" = True ] && echo 'tenant registry Ready' || echo 'tenant registry NOT Ready: STOP'
+       for t in $(jq -r '.tenants[].name' "$OUT/platform.json"); do
+         kubectl --kubeconfig "$KC" -n "di-runtime-$t" rollout status "deploy/hostgroup-tenant-$t" --timeout=600s
+         kubectl --kubeconfig "$KC" -n "di-runtime-$t" get deploy "hostgroup-tenant-$t" -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}'
+       done
+       ```
+       Every host must list `$HOST_IMAGE`. Then prove that the old guest and `acme` run on it:
+       `curl -s -H 'Host: identity.identity.localhost' "$GW/.well-known/openid-configuration" | jq -r .issuer`
+       must print `$ISSUER`, the same JWKS request as in P1 must print `$OLD_KID`, and
+       WorkloadDeployments `identity` in `di-tenant-identity` and `greeter-staging` in
+       `di-tenant-acme` must be `Ready`. If anything fails, STOP before the freeze: the old guest
+       is still the only guest. Fix the file and `up_platform` again; the project copy in
+       `$OUT/platform-before-upgrade` records the previous stack config.
+
+    `deploy.sh` (through `runtime-secrets.ts guard`) refuses the cutover unless `$NEW`'s host
+    runs the exclusive build, and that check is by **name only**: some image in the Deployment's
+    pod template must match `(^|/)wash:<tag>` with `exclusive` in the tag
+    (`/(^|\/)wash:[^\s@]*exclusive/`), with or without an `@sha256:` suffix. It does not compare
+    a digest, so a rebuilt or retagged image under that name passes. To pin the digest too, set
     `IDENTITY_EXCLUSIVE_HOST_DIGEST=sha256:<64 hex>` for step 8: the guard then also requires
     every running `hostgroup-tenant-$NEW-*` pod to report that digest in
     `.status.containerStatuses[*].imageID` (what the node actually pulled), and refuses a
     malformed value or no running host pod. Read the digest from a host pod you trust:
     `kubectl --kubeconfig "$KC" -n "di-runtime-$NEW" get pods -o jsonpath='{.items[*].status.containerStatuses[*].imageID}'`.
-    If the image is not the exclusive build, STOP: switching it is a platform
-    config change that rolls **every** tenant host, the old guest's included, which a rollback
-    would then restore onto an image it was never tested with. Options: switch the image and
-    prove the old guest on it before the cutover, or a platform change that gives only `$NEW`'s
-    host the exclusive build. Tenant `$NEW` can stay or be deleted; nothing else changed.
+
+    `tenantAuth.issuer` on authproto may be `$ISSUER` itself (`jq -r .tenantAuth.issuer "$OUT/platform.json"`).
+    A tenant controller reads the issuer's discovery document when it starts, so between the
+    freeze (step 2) and the switch (step 10) restart no tenant controller and run no `up` but
+    step 10's (and rollback step 2's), which roll only the gateway. The push in step 8 uses an
+    API key, which the controller checks without the issuer.
 
 ##### Cutover
 
 1. **Build the guest** (the import uses the provider this build composes):
    `(cd apps/guest && di-framework platform build)`. It must log
-   `Composing the PGlite encryption layer into the provider`.
+   `Composing the PGlite encryption layer into the provider`. With an older plugin installed,
+   prefix it with `DI_FRAMEWORK_EXTENSIONS_DIR=<dir with cli-plugin-platform 6.2.0>` (also for
+   step 8).
 2. **Freeze writes on the Postgres guest.** Record its replicas, then stop it:
    `kubectl --kubeconfig "$KC" -n di-tenant-identity get workloaddeployment identity -o jsonpath='{.spec.replicas}'`,
    then
@@ -637,26 +846,81 @@ P2. **The exclusive tenant host image.** Create the new tenant now (the old gues
    counts, and repeat with `--yes`. Expect
    `installed: N/N files match, 0 missing, 0 changed, 0 extra; 0 not owned by 65532`.
    Record the target path it prints (`TARGET=...`) for step 12.
-8. **Deploy.** First wait for the new tenant's registry, WorkloadDeployment `di-tenant-registry`
-   in `di-tenant-$NEW`: on a brand-new tenant the push 404s until it is Ready. Poll it (as
-   `deploy.sh` polls, `kubectl wait` has exited early on WorkloadDeployments):
-   ```sh
-   registry=
-   for i in $(seq 1 60); do   # up to 5 minutes
-     registry="$(kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" get workloaddeployment di-tenant-registry -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}')"
-     [ "$registry" = True ] && break
-     sleep 5
-   done
-   [ "$registry" = True ] && echo 'tenant registry Ready' || echo 'tenant registry not Ready: do not deploy yet'
-   ```
-   Then (registry port-forward as for authproto's earlier deploys):
-   `kubectl --kubeconfig "$KC" -n wasmcloud port-forward svc/examples-registry 25001:5000 &`, then
-   `IDENTITY_AUTHPROTO_CUTOVER=authproto/$NEW deploy/guest/deploy.sh authproto "$NEW" "$OUT/export/values.json"`
-   (with `IDENTITY_EXCLUSIVE_HOST_DIGEST=sha256:...` too, to pin the host image; see P2).
-   It logs `authproto cutover confirmed for the new tenant`, builds, deploys, waits for Ready and
-   writes `identity-control`. If the deploy fails before the WorkloadDeployment exists,
-   `deploy.sh` says so and prints the deploy command to re-run; `runtime-secrets.ts apply` is
-   the recovery only once the WorkloadDeployment exists, and `deploy.sh` prints it only then.
+8. **Deploy into `$NEW`'s own registry.** The guest is pushed to tenant `$NEW`'s registry
+   (`tenantAuth.registry`, WorkloadDeployment `di-tenant-registry`, Ready since P2) as user
+   `$PUSHER`, and `$NEW`'s host pulls it from the in-cluster pull listener over TLS.
+   1. **An API key for `$PUSHER`.** Console sign-in needs the issuer, which is frozen since
+      step 2, so mint the key with the admin kubeconfig the way the tenant controller stores
+      keys: a Secret `di-apikey-<id>` in `di-runtime-$NEW` holding only the SHA-256 of the
+      secret part, labelled with the tenant and user. The full key goes into a mode 0600 Docker
+      config and is never printed:
+      ```sh
+      umask 077
+      REG_PORT=28790                  # any free loopback port
+      key_id="$(openssl rand -hex 8)"
+      key_secret="$(openssl rand 32 | base64 | tr '+/' '-_' | tr -d '=\n')"
+      kubectl --kubeconfig "$KC" -n "di-runtime-$NEW" create secret generic "di-apikey-$key_id" \
+        --from-literal=hash="$(printf %s "$key_secret" | shasum -a 256 | awk '{print $1}')" \
+        --from-literal=name=identity-cutover \
+        --from-literal=createdAt="$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" \
+        --from-literal=expiresAt="$(date -u -v+1d +%Y-%m-%dT%H:%M:%S.000Z)"
+      kubectl --kubeconfig "$KC" -n "di-runtime-$NEW" label secret "di-apikey-$key_id" \
+        platform.di-framework.dev/api-key=true "platform.di-framework.dev/tenant=$NEW" "platform.di-framework.dev/user=$PUSHER"
+      mkdir -m 700 -p "$OUT/docker" "$OUT/bin"
+      printf '{"auths":{"127.0.0.1:%s":{"auth":"%s"}}}\n' "$REG_PORT" \
+        "$(printf '%s:dik_%s_%s' "$PUSHER" "$key_id" "$key_secret" | base64 | tr -d '\n')" > "$OUT/docker/config.json"
+      unset key_secret
+      ```
+      The key expires after a day (`expiresAt`); delete it after the deploy (below).
+   2. **The registry front, by port-forward.** Port 8790 of `tenant-controller` is TLS only (it
+      answers plain HTTP with `400`), with a certificate for its in-cluster and public names,
+      not for `127.0.0.1`. The plugin has no CA or TLS-skip option for its `oras` calls, so a
+      wrapper on `PATH` adds `--insecure`, which turns verification off for this loopback
+      port-forward only:
+      ```sh
+      kubectl --kubeconfig "$KC" -n "di-runtime-$NEW" port-forward svc/tenant-controller "$REG_PORT:8790" &
+      PF=$!
+      ORAS="$(command -v oras)"
+      cat > "$OUT/bin/oras" <<EOF
+      #!/bin/sh
+      case "\${1:-}" in version|--version|-h|--help|"") exec "$ORAS" "\$@" ;; esac
+      exec "$ORAS" "\$@" --insecure
+      EOF
+      chmod 700 "$OUT/bin/oras"
+      ```
+   3. **Deploy.** Override `deploy.sh`'s registry defaults with the **schemeless** push URL (an
+      `http://` URL, `deploy.sh`'s default form, makes the push plain HTTP, which the front
+      refuses) and the tenant's pull reference:
+      ```sh
+      PATH="$OUT/bin:$PATH" DOCKER_CONFIG="$OUT/docker" \
+        IDENTITY_REGISTRY_PUSH="127.0.0.1:$REG_PORT/identity" \
+        IDENTITY_REGISTRY_PULL="tenant-registry.di-runtime-$NEW.svc/identity" \
+        IDENTITY_AUTHPROTO_CUTOVER="authproto/$NEW" \
+        deploy/guest/deploy.sh authproto "$NEW" "$OUT/export/values.json"
+      ```
+      (with `IDENTITY_EXCLUSIVE_HOST_DIGEST=sha256:...` too, to pin the host image; see P2).
+      It logs `authproto cutover confirmed for the new tenant`, builds, deploys, waits for Ready
+      and writes `identity-control`. If the deploy fails before the WorkloadDeployment exists,
+      `deploy.sh` says so and prints the deploy command to re-run (add the variables above
+      again); `runtime-secrets.ts apply` is the recovery only once the WorkloadDeployment
+      exists, and `deploy.sh` prints it only then. The workload must reference the tenant
+      registry:
+      `kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" get workloaddeployment identity -o jsonpath='{.spec.template.spec.components[*].image}'`
+      starts with `tenant-registry.di-runtime-$NEW.svc/identity`.
+   4. **Clean up the push credentials:**
+      `kill "$PF"; kubectl --kubeconfig "$KC" -n "di-runtime-$NEW" delete secret "di-apikey-$key_id"; rm -rf "$OUT/docker" "$OUT/bin"`.
+      A later redeploy of `$NEW` mints a new key the same way, or through the console once the
+      issuer serves from `$NEW`.
+
+   **Why not authproto's `examples-registry`.** Pushing to
+   `examples-registry.wasmcloud.svc.cluster.local:5000` (`deploy.sh`'s defaults, with
+   `kubectl -n wasmcloud port-forward svc/examples-registry 25001:5000`) is simpler: no user,
+   key or wrapper, and the pull reference is already in `insecureRegistries`. It is not
+   recommended. That registry is plain HTTP and takes unauthenticated pushes, so anything that
+   reaches it in the cluster could replace the identity provider's component. It would also
+   tie the new guest to an allowlist entry that exists only for the old guest and `acme`, and
+   it is not the path proven on pgprove. Use it only as a recorded decision if `$NEW`'s
+   registry cannot be made Ready.
 9. **Verify on the tenant host** (`Host: identity.$NEW.localhost`):
    `bun apps/guest/scripts/live-check.ts --values "$OUT/export/values.json" --url "$GW" --host identity.$NEW.localhost --read-only`.
    With `--read-only` and no `--slug` it reads the bootstrap organization, which bootstrap
@@ -667,14 +931,38 @@ P2. **The exclusive tenant host image.** Create the new tenant now (the old gues
    owner changed it (see step 6) and does not change the exit code. Then compare
    `curl -s -H "Host: identity.$NEW.localhost" "$GW/oauth2/jwks" | jq -r '.keys[].kid'`
    with `jq -r '.AUTH_ACTIVE_PRIVATE_JWK | fromjson | .kid' "$OUT/export/values.json"` (a public
-   key id). This proves the guest, not the route: relying parties use `$ISSUER`.
-10. **Move the public route** for `$ISSUER`'s host to tenant `$NEW`, as decided in P1 (see the
-    known gap there about kept-alive gateway connections). Then verify against the real issuer
-    host, as a relying party sees it:
-    `curl -s "$ISSUER/.well-known/openid-configuration" | jq -r .issuer` must equal `$ISSUER`
-    and `jq -r .ISSUER_URL "$OUT/export/values.json"`; the `jwks_uri` it names must serve the kid
-    from step 9; and `live-check.ts` as in step 9 with `--url` and `--host` taken from `$ISSUER`
-    must pass. If any check fails, roll back (below).
+   key id, and `$OLD_KID` from P1). This proves the guest, not the route: relying parties use
+   `$ISSUER`.
+10. **Switch the public route** to tenant `$NEW` with the gateway alias (P1).
+    1. **One signer only.** Every other guest holding this signing key must be at 0 replicas
+       before `$ISSUER` reaches `$NEW`. That is the old guest, frozen at 0 since step 2, and
+       any guest a rolled-back attempt left behind:
+       ```sh
+       kubectl --kubeconfig "$KC" get workloaddeployments -A -o json \
+         | jq -r '.items[] | select(.metadata.name == "identity") | "\(.metadata.namespace) replicas=\(.spec.replicas)"'
+       ```
+       Every line but `di-tenant-$NEW` must read `replicas=0`. Scale any other to 0 first, as in
+       step 2.
+    2. **Switch:**
+       ```sh
+       up_platform "$OUT/platform-alias.json"
+       kubectl --kubeconfig "$KC" -n wasmcloud rollout status deploy/di-platform-gateway --timeout=300s
+       ```
+       The only change is the alias: the gateway's config and its `di-framework.dev/config-hash`
+       annotation change, so `di-platform-gateway` rolls. On pgprove the switch took effect
+       about 4 s after the rollout completed, about 17 s after `up` started. The old gateway pod
+       keeps routing until the new one is Ready, then closes its idle keep-alive connections and
+       lets in-flight requests finish, so no pooled upstream connection to the old tenant host
+       outlives it. Open client connections drop for under a second (platform#223). If the
+       `up` fails, `up_platform "$OUT/platform.json"` first (the rules above), then retry or
+       roll back.
+    3. **Verify against the real issuer host**, as a relying party sees it:
+       `curl -s "$ISSUER/.well-known/openid-configuration" | jq -r .issuer` must equal `$ISSUER`
+       and `jq -r .ISSUER_URL "$OUT/export/values.json"`; the `jwks_uri` it names must serve the
+       kid from step 9 (`curl -s "$(curl -s "$ISSUER/.well-known/openid-configuration" | jq -r .jwks_uri)" | jq -r '.keys[].kid'`);
+       and
+       `bun apps/guest/scripts/live-check.ts --values "$OUT/export/values.json" --url "$ISSUER" --host "${ISSUER#http://}" --read-only`
+       must pass. If any check fails, roll back (below).
 11. **Soak.** Leave the old workload at 0 replicas and `directory` untouched for the soak period
     the coordinator sets, watching sign-ins, token refreshes and the guest's logs. Rollback is
     still available. Browser sessions expire after 30 minutes without use
@@ -697,21 +985,30 @@ P2. **The exclusive tenant host image.** Create the new tenant now (the old gues
       every secret, so `--rm` and remove it at once) and compare every exported table's rows:
       ```sh
       podman run -d --rm --name directory-restore-check -e POSTGRES_PASSWORD=restore-check --tmpfs /var/lib/postgresql/data postgres:16-alpine
+      restore_ok=yes
       deadline=$(( $(date +%s) + 120 ))
       until podman logs directory-restore-check 2>&1 | grep -q 'init process complete' \
         && podman exec directory-restore-check pg_isready -U postgres >/dev/null 2>&1; do
-        if [ "$(date +%s)" -ge "$deadline" ]; then echo 'scratch Postgres not ready after 2 minutes'; podman stop directory-restore-check; break; fi
+        if [ "$(date +%s)" -ge "$deadline" ]; then echo 'scratch Postgres not ready after 2 minutes'; restore_ok=no; break; fi
         sleep 1
       done
-      podman exec directory-restore-check createdb -U postgres restored
-      podman exec -i directory-restore-check pg_restore -U postgres -d restored --no-owner --no-privileges --exit-on-error < "$DUMP"
-      jq -r '.tables[] | "\(.name) \(.count)"' "$OUT/export/manifest.json" | while read -r table count; do
-        got="$(podman exec directory-restore-check psql -X -A -t -U postgres -d restored -c "SELECT count(*) FROM \"$table\"")"
-        [ "$got" = "$count" ] && echo "ok $table $got" || echo "MISMATCH $table restored $got, exported $count"
-      done
+      if [ "$restore_ok" = yes ]; then
+        podman exec directory-restore-check createdb -U postgres restored \
+          && podman exec -i directory-restore-check pg_restore -U postgres -d restored --no-owner --no-privileges --exit-on-error < "$DUMP" \
+          || restore_ok=no
+      fi
+      if [ "$restore_ok" = yes ]; then
+        jq -r '.tables[] | "\(.name) \(.count)"' "$OUT/export/manifest.json" | while read -r table count; do
+          got="$(podman exec directory-restore-check psql -X -A -t -U postgres -d restored -c "SELECT count(*) FROM \"$table\"")"
+          [ "$got" = "$count" ] && echo "ok $table $got" || echo "MISMATCH $table restored $got, exported $count"
+        done
+      fi
       podman stop directory-restore-check
+      [ "$restore_ok" = yes ] || echo 'RESTORE CHECK NOT DONE: STOP, the dump is not verified'
       ```
-      Every line must be `ok`: the dump was taken in the same freeze as the export (or, for a
+      A timeout or a failed restore sets `restore_ok=no`, skips the comparison and ends with
+      `RESTORE CHECK NOT DONE`: STOP and find the cause; nothing is verified then. Otherwise
+      every line must be `ok`: the dump was taken in the same freeze as the export (or, for a
       fresh dump, from a `directory` nothing has written to since). Use a Postgres image at
       least as new as `directory`'s server. Record the file and its SHA-256.
     - **The new guest's encrypted data directory** (`$TARGET` from step 7), copied off the node
@@ -776,19 +1073,33 @@ P2. **The exclusive tenant host image.** Create the new tenant now (the old gues
     `directory` is never dropped without a restorable copy verified this way.
 13. **Retire** the old workload, the `directory` BackingService and tenant `identity`. Destroy
     `$OUT` once the new guest's own backups run; `directory.dump`, the old volume and every older
-    backup of `directory` stay secret-bearing until destroyed. After the retirement the guard
-    still recognises authproto by its kubeconfig (path or API server) and by the instance name,
-    so **every later** `deploy.sh` or `runtime-secrets.ts apply` with authproto's kubeconfig,
-    including routine redeploys of `$NEW`, still needs `IDENTITY_AUTHPROTO_CUTOVER=authproto/$NEW`
-    and still checks the exclusive tenant host image. That is intended.
+    backup of `directory` stay secret-bearing until destroyed. The alias stays: `$ISSUER`'s host
+    is served through it for as long as the issuer is kept, so every later platform config keeps
+    `"routeAliases": {"identity.identity": "identity.$NEW"}` (the alias source's tenant need not
+    be declared; only the target must). Retiring tenant `identity` is a later `up_platform` with
+    it removed from `tenants` in `platform-alias.json`. Keep
+    `examples-registry.wasmcloud.svc.cluster.local:5000` in `insecureRegistries` while any
+    workload still pulls from it (`acme/greeter-staging` does). Remove user `$PUSHER` the same
+    way once no deploy needs it. After the retirement the guard still recognises authproto by
+    its kubeconfig (path or API server) and by the instance name, so **every later**
+    `deploy.sh` or `runtime-secrets.ts apply` with authproto's kubeconfig, including routine
+    redeploys of `$NEW`, still needs `IDENTITY_AUTHPROTO_CUTOVER=authproto/$NEW` and still
+    checks the exclusive tenant host image. That is intended.
 
 **Rollback** (any time before step 13; the export never writes to `directory`). Never let the two
-guests run at once: they share the signing key, and their refresh-token state diverges.
+guests run at once: they share the signing key, and their refresh-token state diverges. The
+platform upgrade from P2 stays (tenant `$NEW`, the exclusive host image, the allowlist): the
+old guest was proven on it before the freeze.
 
 1. Stop the **new** guest first:
    `kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" patch workloaddeployment identity --type merge -p '{"spec":{"replicas":0}}'`,
    and check that `Host: identity.$NEW.localhost` no longer answers `/health`.
-2. If the route moved (step 10), move it back to tenant `identity`.
+2. If the alias is set (step 10), remove it: `up_platform "$OUT/platform.json"` (the same file
+   without `routeAliases`), then
+   `kubectl --kubeconfig "$KC" -n wasmcloud rollout status deploy/di-platform-gateway --timeout=300s`.
+   On pgprove this took about 17 s; the gateway roll drops open connections for under a second
+   (platform#223). If the `up` fails, run it again with the same file (the rules above); do
+   not continue to step 3 while `$ISSUER` may still reach `$NEW`.
 3. Only then restore the old guest's replicas from step 2 and check that
    `Host: identity.identity.localhost` answers `/health` (and `$ISSUER`, if the route moved).
 4. Remove the new tenant's workload, in `di-tenant-$NEW`:
@@ -807,13 +1118,16 @@ Data written to the new guest after step 8 is not copied back.
 
 **Roll forward after a rollback: into a fresh tenant.** Do not reuse `$NEW`. The old guest took
 writes again after rollback step 3, so the cutover starts over: pick another tenant name
-(`NEW=identity-pg2`), and run P0..P2 and steps 1..12 again, with a new export (`rm -rf
-"$OUT/export" "$OUT/data"` first; both hold secrets) and so a new `values.json` and a new
-`DI_PGLITE_KEY`. There is deliberately no `install.ts --wipe-target`: wiping would delete, through
-a root pod, the only copy of what the rolled-back guest wrote, and a fresh tenant needs no new
-destructive tooling and costs only a name. Keep the first attempt's data directory and its
-`values.json` until whatever it holds is reviewed, then retire tenant `$NEW` (its directory goes
-with it, or by hand) and destroy that `values.json`.
+(`NEW=identity-pg2`) and push user (`PUSHER=identity-cutover2`), and run P0..P2 and steps 1..12
+again, with a new export (`rm -rf "$OUT/export" "$OUT/data"` first; both hold secrets) and so a
+new `values.json` and a new `DI_PGLITE_KEY`. P2 declares the new tenant through new config files
+built from the stack as it is then (which still declares the first attempt's tenant), and the
+alias then targets `identity.$NEW` of the new attempt. There is deliberately no
+`install.ts --wipe-target`: wiping would delete, through a root pod, the only copy of what the
+rolled-back guest wrote, and a fresh tenant needs no new destructive tooling and costs only a
+name. Keep the first attempt's data directory and its `values.json` until whatever it holds is
+reviewed, then retire the first attempt's tenant (its directory goes with it, or by hand) and
+destroy that `values.json`.
 
 #### Proof of the cutover tooling
 
@@ -823,6 +1137,29 @@ value, the image check, rollback and roll-forward, the first push into a new ten
 backup checks) is folded into the runbook and tools above. Separately, authproto's
 `identity_runtime_secret` turned out to override the eight bootstrap identity settings, which
 the export now carries (P0).
+
+2026-10-13, the route alias on pgprove, with the platform and kube changes that ship as
+`@di-framework/platform` 6.0.13 and `di-framework-kube` v0.0.5. Every step passed: P2's
+`platform.json` built from the instance's stack config, the preview on a copy (only the changes
+P2 allows), the upgrade with `--allow-insecure-registries`, `TenantAuthReady` and the new tenant's
+registry, steps 1 and 5..9 into the new tenant, the single-signer check, the switch
+(`routeAliases`, effective about 4 s after the gateway rollout and 17 s after `up` started),
+the issuer checks of step 10, and the rollback (`up` without the alias, about 17 s). What it
+found is folded into the runbook:
+
+- a tenant created with `kubectl apply` cannot be declared afterwards ("already exists"), so P2
+  creates it by declaring it;
+- authproto's old guest and `acme/greeter-staging` pull from plain-HTTP `examples-registry`,
+  which must be in `insecureRegistries` or their hosts cannot pull after the upgrade (P2 item 4);
+- the kube CLI's default tenant host image is refused with `insecureRegistries`, so P2 names the
+  exclusive build, which restarts every tenant host;
+- a rejected `up` still saves its config (kube#13), and each gateway roll drops connections for
+  under a second (platform#223) (the rules for every `up`);
+- the build needs cli-plugin-platform 6.2.0 and `wac` on `PATH`;
+- the tenant registry front (8790) is TLS only: the push that works is the schemeless URL with
+  an `oras --insecure` wrapper and an API key of a user declared as a member of the new tenant
+  (step 8);
+- the first upgrade rolls the controller once, because `tenantAuth`'s stored form changes.
 
 2026-10-12. The live pgprove run was not possible: `kubesolo-pgprove` (stopped with exit 137)
 restarted in a loop because Kubesolo could not pull `rancher/local-path-provisioner` through the
@@ -864,17 +1201,21 @@ mapping, refusals, the runner protocol, the ciphertext check and the install pla
 `commands.test.ts` runs the export, import and install orchestration with stubbed psql, kubectl
 and runner processes (atomic export, cleanup on failure, the helper pod deleted on every path).
 
-**Not proven:** anything on a cluster. Creating a tenant with `kubectl apply`, the install helper
-pod and its image on the node, deploying into a tenant whose storage was pre-filled, the guest
-under wash (QuickJS and the composed Argon2 component) on imported data, the freeze in step 2
-(`replicas: 0` on a WorkloadDeployment), and the route move. The rehearsal runs the guest's code
-on Bun, not the component, and wasmtime, not wash.
+**Not proven by this offline run:** anything on a cluster. The install helper pod and its image
+on the node, deploying into a tenant whose storage was pre-filled, the guest under wash (QuickJS
+and the composed Argon2 component) on imported data, the freeze in step 2 (`replicas: 0` on a
+WorkloadDeployment), and the route move were proven later on pgprove (above). The rehearsal runs
+the guest's code on Bun, not the component, and wasmtime, not wash. Nothing has run against
+authproto.
 
-**Decisions the runbook stops for** (preconditions P1 and P2, before any freeze):
+**Decisions behind the preconditions** (P1 and P2, before any freeze):
 
-- **The issuer's host** (P1). If authproto's issuer names tenant `identity` in its host, keeping
-  the issuer (and so every token) means serving that host from the new tenant, which the gateway
-  does not do by tenant name; P1 lists the options.
-- **The tenant host image** (P2). The pglite guest needs the exclusive-instance wash build; if
-  the new tenant's host runs another image, switching it rolls every tenant host, the old
-  guest's included; P2 lists the options.
+- **The issuer's host** (P1). authproto's issuer names tenant `identity` in its host. Keeping it
+  (and so every token) means serving that host from the new tenant, which the gateway does not
+  do by tenant name. Decided 2026-10-13: an administrator gateway route alias (platform #218/#219)
+  rather than a CoreDNS rewrite or reusing tenant `identity`. P1 still stops for an issuer the
+  alias cannot move.
+- **The tenant host image** (P2). The pglite guest needs the exclusive-instance wash build, and
+  `insecureRegistries` needs wash patch 0002, which that build carries. Switching it restarts
+  every tenant host, the old guest's included; the user accepted that maintenance blip, and P2
+  proves the old guest on the new image before the freeze.
