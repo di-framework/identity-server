@@ -660,7 +660,9 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
          if (value === undefined) continue;
          if (value !== null && typeof value === "object" && "secure" in value) stop(`${key} is a Pulumi secret`);
          // A key set by hand with `pulumi config set` (tenantAuth on authproto) is stored as JSON text.
-         if (typeof value === "string" && !TEXT.has(key)) value = JSON.parse(value);
+         if (typeof value === "string" && !TEXT.has(key)) {
+           try { value = JSON.parse(value); } catch { stop(`${key} is not valid JSON`); }   // never echo the value
+         }
          config[key] = value;
        }
        if (Object.keys(config.routeAliases ?? {}).length > 0) stop("the stack already has routeAliases");
@@ -815,7 +817,8 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
          [ "$ready" = True ] && echo "$w: Ready" || echo "STOP: $w Ready='$ready'"
        done
        # c. tenant $NEW's auth pair and registry
-       kubectl --kubeconfig "$KC" wait "tenants.platform.di-framework.dev/$NEW" --for=condition=TenantAuthReady --timeout=600s
+       kubectl --kubeconfig "$KC" wait "tenants.platform.di-framework.dev/$NEW" --for=condition=TenantAuthReady --timeout=600s \
+         || echo "STOP: tenant $NEW is not TenantAuthReady"
        registry=
        for i in $(seq 1 120); do   # up to 10 minutes; `kubectl wait` has exited early on WorkloadDeployments
          registry="$(kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" get workloaddeployment di-tenant-registry -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}')"
@@ -1073,13 +1076,19 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
       default form, makes the push plain HTTP, which the front refuses) and the tenant's pull
       reference:
       ```sh
-      kubectl --kubeconfig "$KC" -n "di-runtime-$NEW" port-forward svc/tenant-controller "$REG_PORT:8790" &
-      PF=$!
-      PATH="$OUT/bin:$PATH" DOCKER_CONFIG="$OUT/docker" \
-        IDENTITY_REGISTRY_PUSH="127.0.0.1:$REG_PORT/identity" \
-        IDENTITY_REGISTRY_PULL="tenant-registry.di-runtime-$NEW.svc/identity" \
-        IDENTITY_AUTHPROTO_CUTOVER="authproto/$NEW" \
-        deploy/guest/deploy.sh authproto "$NEW" "$OUT/export/values.json"
+      if [ -s "$OUT/docker/config.json" ] && [ -x "$OUT/bin/oras" ] \
+        && tenant_auth_state | diff "$OUT/tenant-auth.baseline" -; then
+        kubectl --kubeconfig "$KC" -n "di-runtime-$NEW" port-forward svc/tenant-controller "$REG_PORT:8790" &
+        PF=$!
+        PATH="$OUT/bin:$PATH" DOCKER_CONFIG="$OUT/docker" \
+          IDENTITY_REGISTRY_PUSH="127.0.0.1:$REG_PORT/identity" \
+          IDENTITY_REGISTRY_PULL="tenant-registry.di-runtime-$NEW.svc/identity" \
+          IDENTITY_AUTHPROTO_CUTOVER="authproto/$NEW" \
+          deploy/guest/deploy.sh authproto "$NEW" "$OUT/export/values.json" \
+          || echo 'STOP: the deploy failed (see below)'
+      else
+        echo 'STOP: no push key or wrapper (items 1 and 2), or the tenant-auth check failed: not deployed'
+      fi
       ```
       (with `IDENTITY_EXCLUSIVE_HOST_DIGEST=sha256:...` too, to pin the host image; see P2).
       It logs `authproto cutover confirmed for the new tenant`, builds, deploys, waits for Ready
@@ -1120,9 +1129,11 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
    owner changed it (see step 6) and does not change the exit code. Then compare the key ids
    (public; nothing else of the key is printed):
    ```sh
-   NEW_KID="$(jq -r '.AUTH_ACTIVE_PRIVATE_JWK | fromjson | .kid' "$OUT/export/values.json")"
+   # try/catch and 2>/dev/null: jq's fromjson error quotes its input, which here is the private key.
+   NEW_KID="$(jq -r 'try (.AUTH_ACTIVE_PRIVATE_JWK | fromjson | (.kid? // "")) catch "UNREADABLE"' "$OUT/export/values.json" 2>/dev/null)"
    served_kid="$(curl -s -m 10 -H "Host: identity.$NEW.localhost" "$GW/oauth2/jwks" | jq -r '.keys[].kid')"
-   [ -n "$NEW_KID" ] && [ "$NEW_KID" != null ] && [ "$served_kid" = "$NEW_KID" ] && [ "$NEW_KID" = "$OLD_KID" ] \
+   case "$NEW_KID" in ''|null|UNREADABLE) NEW_KID= ;; esac   # unreadable: STOP below, never a match
+   [ -n "$NEW_KID" ] && [ "$served_kid" = "$NEW_KID" ] && [ "$NEW_KID" = "$OLD_KID" ] \
      && echo "kid ok: $NEW_KID" || echo "STOP: values '$NEW_KID', served '$served_kid', old guest '$OLD_KID'"
    ```
    This proves the guest, not the route: relying parties use `$ISSUER`.
@@ -1138,11 +1149,13 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
        - `di-tenant-$NEW/identity` is listed at `replicas=1`;
        - every other workload named `identity` is at `replicas=0`;
        - every other running workload has no `<workload>-control` Secret whose
-         `AUTH_ACTIVE_PRIVATE_JWK` has `$NEW_KID` (step 9). Only the `kid` is decoded and compared;
-         the key is never printed or written to a file.
+         `AUTH_ACTIVE_PRIVATE_JWK` has `$NEW_KID` (step 9), and none has a key without a readable
+         `kid` (it cannot be shown to be a different key). Only the `kid` is decoded and
+         compared, inside `try … catch` with jq's errors discarded, because jq's decode errors
+         quote their input; the key is never printed or written to a file.
        ```sh
        check_signers() {
-         case "$NEW_KID" in ''|null) echo 'STOP: no kid (step 9)'; return 1 ;; esac
+         case "$NEW_KID" in ''|null|UNREADABLE) echo 'STOP: no kid (step 9)'; return 1 ;; esac
          kubectl --kubeconfig "$KC" get workloaddeployments -A -o json > "$OUT/workloads.json" \
            || { echo 'STOP: cannot list the workloads'; return 1; }
          jq -r '.items[] | "\(.metadata.namespace) \(.metadata.name) \(.spec.replicas)"' "$OUT/workloads.json" > "$OUT/workloads.txt" \
@@ -1157,8 +1170,11 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
            jwk="$(kubectl --kubeconfig "$KC" -n "$ns" get secret "$name-control" --ignore-not-found -o 'jsonpath={.data.AUTH_ACTIVE_PRIVATE_JWK}')" \
              || { echo "STOP: cannot read $ns/$name-control"; bad=1; continue; }
            [ -n "$jwk" ] || continue
-           kid="$(printf '%s' "$jwk" | jq -Rr '@base64d | fromjson | .kid // empty')" \
-             || { echo "STOP: unreadable key in $ns/$name-control"; bad=1; continue; }
+           # try/catch and 2>/dev/null: jq's @base64d and fromjson errors quote their input (the key).
+           kid="$(printf '%s' "$jwk" | jq -Rr 'try (@base64d | fromjson | (.kid? // "")) catch "UNREADABLE"' 2>/dev/null)"
+           case "$kid" in
+             ''|UNREADABLE) echo "STOP: no readable kid in $ns/$name-control"; bad=1; continue ;;
+           esac
            [ "$kid" != "$NEW_KID" ] || { echo "STOP: $ns/$name signs with kid $kid and runs with replicas=$replicas"; bad=1; }
          done < "$OUT/workloads.txt"
          unset jwk
@@ -1173,10 +1189,15 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
        `di-tenant-identity/identity` is checked by name. Then the tenant-auth check: `tenant_auth_state | diff "$OUT/tenant-auth.baseline" -`
        must print nothing (`$NEW`'s new workload does not show in it); otherwise roll back (P2,
        "The frozen issuer").
-    2. **Switch:**
+    2. **Switch**, only if both checks of item 1 still pass at that moment:
        ```sh
-       up_platform "$OUT/platform-alias.json"
-       kubectl --kubeconfig "$KC" -n wasmcloud rollout status deploy/di-platform-gateway --timeout=300s
+       if check_signers && tenant_auth_state | diff "$OUT/tenant-auth.baseline" -; then
+         up_platform "$OUT/platform-alias.json" \
+           && kubectl --kubeconfig "$KC" -n wasmcloud rollout status deploy/di-platform-gateway --timeout=300s \
+           || echo 'STOP: the switch failed (the rules above)'
+       else
+         echo 'STOP: not switched'
+       fi
        ```
        The only change is the alias: the gateway's config and its `di-framework.dev/config-hash`
        annotation change, so `di-platform-gateway` rolls. On pgprove the switch took effect
@@ -1251,13 +1272,30 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
       helper pod like `install.ts`'s dry-run pod (root with DAC_READ_SEARCH only, which may read
       the host uid's 0700 files and change nothing; the target mounted read-only):
       ```sh
-      NEW_REPLICAS="$(kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" get workloaddeployment identity -o jsonpath='{.spec.replicas}')"
-      case "$NEW_REPLICAS" in ''|*[!0-9]*) echo "STOP: could not read the replicas: '$NEW_REPLICAS'" ;; esac
-      echo "recorded replicas: $NEW_REPLICAS"   # keep this; it is restored below
-      kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" patch workloaddeployment identity --type merge -p '{"spec":{"replicas":0}}'
-      # wait until Host: identity.$NEW.localhost no longer answers /health
-      NODE="$(kubectl --kubeconfig "$KC" get nodes -o jsonpath='{.items[0].metadata.name}')"
-      kubectl --kubeconfig "$KC" apply -f - <<EOF
+      (
+        umask 077
+        r="$(kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" get workloaddeployment identity -o jsonpath='{.spec.replicas}')"
+        case "$r" in ''|*[!0-9]*) echo "STOP: could not read the new guest's replicas: '$r'; nothing changed"; exit 1 ;; esac
+        printf '%s\n' "$r" > "$OUT/new-replicas" || { echo 'STOP: cannot record the replicas; nothing changed'; exit 1; }
+        echo "recorded replicas: $r (in $OUT/new-replicas)"
+        restore() {
+          saved="$(cat "$OUT/new-replicas")"
+          case "$saved" in ''|*[!0-9]*) echo "STOP: $OUT/new-replicas holds '$saved'; restore the replicas by hand"; return 1 ;; esac
+          kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" patch workloaddeployment identity --type merge -p "{\"spec\":{\"replicas\":$saved}}" \
+            && echo "replicas restored: $saved" || { echo "STOP: restore the replicas ($saved) by hand"; return 1; }
+        }
+        kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" patch workloaddeployment identity --type merge -p '{"spec":{"replicas":0}}' \
+          || { echo 'STOP: could not scale the new guest to 0'; restore; exit 1; }
+        stopped=no
+        for i in $(seq 1 60); do   # up to 5 minutes
+          [ "$(curl -s -o /dev/null -m 10 -w '%{http_code}' -H "Host: identity.$NEW.localhost" "$GW/health")" != 200 ] && { stopped=yes; break; }
+          sleep 5
+        done
+        [ "$stopped" = yes ] || { echo 'STOP: the new guest still answers /health'; restore; exit 1; }
+        NODE="$(kubectl --kubeconfig "$KC" get nodes -o jsonpath='{.items[0].metadata.name}')"
+        ok=yes
+        [ -n "$NODE" ] && [ -n "$TARGET" ] || ok=no
+        [ "$ok" = yes ] && { kubectl --kubeconfig "$KC" apply -f - <<EOF
       apiVersion: v1
       kind: Pod
       metadata: { name: identity-cutover-backup, namespace: kube-system }
@@ -1277,24 +1315,32 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
             volumeMounts: [{ name: data, mountPath: /data, readOnly: true }]
         volumes: [{ name: data, hostPath: { path: $TARGET, type: Directory } }]
       EOF
-      kubectl --kubeconfig "$KC" -n kube-system wait --for=condition=Ready pod/identity-cutover-backup --timeout=180s
-      umask 077
-      kubectl --kubeconfig "$KC" -n kube-system exec identity-cutover-backup -- sh -c 'cd /data && find . -type f -exec sha256sum {} +' \
-        | LC_ALL=C sort > "$OUT/final-data.node.sha256"
-      kubectl --kubeconfig "$KC" -n kube-system exec identity-cutover-backup -- tar -C /data -cf - . > "$OUT/final-data.tar"
-      kubectl --kubeconfig "$KC" -n kube-system delete pod identity-cutover-backup
-      kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" patch workloaddeployment identity --type merge -p "{\"spec\":{\"replicas\":$NEW_REPLICAS}}"
-      mkdir -m 700 "$OUT/final-data" && tar -C "$OUT/final-data" -xf "$OUT/final-data.tar"
-      (cd "$OUT/final-data" && find . -type f -exec shasum -a 256 {} +) | LC_ALL=C sort > "$OUT/final-data.copy.sha256"
-      diff "$OUT/final-data.node.sha256" "$OUT/final-data.copy.sha256" && echo 'copy matches the node'
-      dd if="$OUT/final-data/.di-encfs" bs=1 skip=8 count=16 2>/dev/null | xxd -p
+        } || ok=no
+        [ "$ok" = yes ] && kubectl --kubeconfig "$KC" -n kube-system wait --for=condition=Ready pod/identity-cutover-backup --timeout=180s || ok=no
+        [ "$ok" = yes ] && kubectl --kubeconfig "$KC" -n kube-system exec identity-cutover-backup -- sh -c 'cd /data && find . -type f -exec sha256sum {} +' \
+          > "$OUT/final-data.node.raw" || ok=no
+        [ "$ok" = yes ] && kubectl --kubeconfig "$KC" -n kube-system exec identity-cutover-backup -- tar -C /data -cf - . > "$OUT/final-data.tar" || ok=no
+        kubectl --kubeconfig "$KC" -n kube-system delete pod identity-cutover-backup --ignore-not-found \
+          || echo 'delete pod kube-system/identity-cutover-backup by hand'
+        restore || ok=no
+        [ "$ok" = yes ] || { echo 'STOP: the copy failed; it is not a backup'; exit 1; }
+        LC_ALL=C sort "$OUT/final-data.node.raw" > "$OUT/final-data.node.sha256"
+        mkdir -m 700 "$OUT/final-data" && tar -C "$OUT/final-data" -xf "$OUT/final-data.tar" || { echo 'STOP: cannot unpack the copy'; exit 1; }
+        (cd "$OUT/final-data" && find . -type f -exec shasum -a 256 {} +) | LC_ALL=C sort > "$OUT/final-data.copy.sha256"
+        [ -s "$OUT/final-data.node.sha256" ] && diff "$OUT/final-data.node.sha256" "$OUT/final-data.copy.sha256" \
+          && echo 'copy matches the node' || { echo 'STOP: the copy does not match the node'; exit 1; }
+        dd if="$OUT/final-data/.di-encfs" bs=1 skip=8 count=16 2>/dev/null | xxd -p
+      )
       ```
-      Both listings use `LC_ALL=C sort`, since `find` order and the locale's collation differ
-      between the node and the workstation. The `diff` must print nothing, and the KCV (bytes
-      8..24 of `.di-encfs`) must equal `DI_PGLITE_KEY`'s from step 4
-      (`bun deploy/guest/runtime-secrets.ts kcv --values "$OUT/export/values.json"`). Delete the
-      pod even if a step fails. Then move `final-data.tar` (or `final-data/`) to the backup
-      location.
+      The block runs in a subshell, and every `STOP` ends it. It touches the guest only after
+      the replicas read as a number, which it records in `$OUT/new-replicas`. After the patch
+      to 0, every path, failed or not, deletes the helper pod and restores the replicas from that
+      file under the same number check. Both listings use `LC_ALL=C sort`, since `find` order
+      and the locale's collation differ between the node and the workstation. It must print
+      `copy matches the node`, and the KCV it prints last (bytes 8..24 of `.di-encfs`) must
+      equal `DI_PGLITE_KEY`'s from step 4
+      (`bun deploy/guest/runtime-secrets.ts kcv --values "$OUT/export/values.json"`). Then move
+      `final-data.tar` (or `final-data/`) to the backup location.
     - **`values.json`** (it holds `DI_PGLITE_KEY` and every secret), stored apart from the data
       copy: on a different volume or a different host from the copied data directory, so
       neither copy alone opens the other.
