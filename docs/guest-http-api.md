@@ -505,14 +505,22 @@ POD="$(kubectl --kubeconfig "$KC" -n di-runtime-identity get pods -l app=di-bs-d
 psql_directory() { kubectl --kubeconfig "$KC" -n di-runtime-identity exec "$POD" -- psql -X -A -t -U app -d app -c "$1"; }
 # Every Tenant's TenantAuthReady, each tenant-auth Deployment's readiness, and its pods with their
 # restart counts, sorted. Two snapshots compared with diff show any restart (a new pod name too).
+# Fails closed: a kubectl error or no tenant prints an ERROR line, which no check accepts, and a pod
+# without container statuses (Pending) reads ready=false.
 tenant_auth_state() {
-  for t in $(kubectl --kubeconfig "$KC" get tenants.platform.di-framework.dev -o jsonpath='{.items[*].metadata.name}'); do
-    echo "tenant $t TenantAuthReady=$(kubectl --kubeconfig "$KC" get tenants.platform.di-framework.dev "$t" -o 'jsonpath={.status.conditions[?(@.type=="TenantAuthReady")].status}')"
+  tenants="$(kubectl --kubeconfig "$KC" get tenants.platform.di-framework.dev -o jsonpath='{.items[*].metadata.name}')" \
+    || { echo 'ERROR cannot list tenants'; return 1; }
+  [ -n "$tenants" ] || { echo 'ERROR no tenants listed'; return 1; }
+  for t in $tenants; do
+    echo "tenant $t TenantAuthReady=$(kubectl --kubeconfig "$KC" get tenants.platform.di-framework.dev "$t" -o 'jsonpath={.status.conditions[?(@.type=="TenantAuthReady")].status}' || echo ERROR)"
     for d in tenant-controller tenant-console; do
-      echo "deploy di-runtime-$t/$d ready=$(kubectl --kubeconfig "$KC" -n "di-runtime-$t" get deploy "$d" -o 'jsonpath={.status.readyReplicas}/{.spec.replicas}')"
+      echo "deploy di-runtime-$t/$d ready=$(kubectl --kubeconfig "$KC" -n "di-runtime-$t" get deploy "$d" -o 'jsonpath={.status.readyReplicas}/{.spec.replicas}' || echo ERROR)"
     done
-    kubectl --kubeconfig "$KC" -n "di-runtime-$t" get pods -l 'app in (tenant-controller,tenant-console)' -o json \
-      | jq -r '.items[] | "pod \(.metadata.namespace)/\(.metadata.name) ready=\([.status.containerStatuses[]?.ready] | all) restarts=\([.status.containerStatuses[]?.restartCount] | add // 0)"'
+    pods="$(kubectl --kubeconfig "$KC" -n "di-runtime-$t" get pods -l 'app in (tenant-controller,tenant-console)' -o json)" \
+      || { echo "ERROR cannot list the tenant-auth pods of $t"; continue; }
+    printf '%s\n' "$pods" | jq -r '.items[] | (.status.containerStatuses // []) as $c
+      | "pod \(.metadata.namespace)/\(.metadata.name) ready=\(($c | length) > 0 and all($c[]; .ready)) restarts=\([$c[].restartCount] | add // 0)"' \
+      || echo "ERROR cannot read the tenant-auth pods of $t"
   done | LC_ALL=C sort
 }
 ```
@@ -551,14 +559,16 @@ coordinator. Resume only once a decision is recorded.
 P0. **The source's runtime rows.** `export.ts` refuses any `identity_runtime_secret` row it has no
     setting for (step 3), so compare the names now, names only (never `value`):
     ```sh
-    psql_directory 'SELECT name FROM identity_runtime_secret' | LC_ALL=C sort > "$OUT/source-row-names"
+    psql_directory 'SELECT name FROM identity_runtime_secret' > "$OUT/source-row-names.raw" \
+      && [ -s "$OUT/source-row-names.raw" ] || echo 'STOP: could not read the row names'
+    LC_ALL=C sort "$OUT/source-row-names.raw" > "$OUT/source-row-names"
     bun -e "import {RUNTIME_SETTING_NAMES} from './deploy/platform/components/control-secret.ts';
       import {STATE_ROW_NAMES, TRANSIENT_ROW_NAMES} from './deploy/cutover/source.ts';
       console.log([...RUNTIME_SETTING_NAMES, ...STATE_ROW_NAMES, ...TRANSIENT_ROW_NAMES].join('\n'))" \
       | LC_ALL=C sort > "$OUT/known-row-names"
     LC_ALL=C comm -23 "$OUT/source-row-names" "$OUT/known-row-names"   # must print nothing
     ```
-    Any name it prints is a setting the old guest applied that the new guest would silently lose:
+    An empty comparison counts only after the read succeeded (no `STOP` line). Any name it prints is a setting the old guest applied that the new guest would silently lose:
     STOP. The known names include the eight bootstrap identity overrides
     (`AUTH_BOOTSTRAP_{ORGANIZATION_SLUG,ORGANIZATION_NAME,OWNER_LOGIN,OWNER_EMAIL,OWNER_DISPLAY_NAME,VIEWER_LOGIN,VIEWER_EMAIL,VIEWER_DISPLAY_NAME}`),
     which authproto sets. They are carried into `values.json` and the `identity-control` Secret
@@ -571,7 +581,8 @@ P1. **The issuer host and the route alias.** While the old guest is still up, re
     ```sh
     ISSUER="$(curl -s -H 'Host: identity.identity.localhost' "$GW/.well-known/openid-configuration" | jq -r .issuer)"
     OLD_KID="$(curl -s -H 'Host: identity.identity.localhost' "$GW/oauth2/jwks" | jq -r '.keys[].kid')"
-    echo "$ISSUER $OLD_KID"
+    [ "$ISSUER" = "http://identity.identity.localhost:$HTTP_PORT" ] && [ -n "$OLD_KID" ] \
+      && echo "issuer $ISSUER, kid $OLD_KID" || echo "STOP: issuer '$ISSUER', kid '$OLD_KID'"
     ```
     The cutover keeps this issuer, and so every issued token. On authproto it is
     `http://identity.identity.localhost:28280`. The gateway routes `<route-host>.<tenant>.localhost`
@@ -696,10 +707,12 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
        cannot pull again after the upgrade restarts them, and the rollback target is lost. List
        the registry host of every component every WorkloadDeployment references and compare:
        ```sh
-       kubectl --kubeconfig "$KC" get workloaddeployments -A -o json \
-         | jq -r '.items[] | "\(.metadata.namespace)/\(.metadata.name)" as $w
+       kubectl --kubeconfig "$KC" get workloaddeployments -A -o json > "$OUT/workloads.json" \
+         && jq -r '.items[] | "\(.metadata.namespace)/\(.metadata.name)" as $w
              | .spec | [.. | objects | select(has("image")) | .image | strings] | unique[] | "\(split("/")[0]) \($w)"' \
-         | LC_ALL=C sort -u > "$OUT/workload-registries"
+             "$OUT/workloads.json" | LC_ALL=C sort -u > "$OUT/workload-registries" \
+         && grep -q ' di-tenant-identity/identity$' "$OUT/workload-registries" \
+         || echo 'STOP: could not list the workloads (the old guest is not among them)'
        cat "$OUT/workload-registries"
        jq -r --rawfile seen "$OUT/workload-registries" '(.insecureRegistries // []) as $plain
            | $seen | split("\n")[] | select(length > 0) | split(" ") as [$host, $workload]
@@ -781,8 +794,10 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
        ```sh
        # a. every tenant host rolled onto the new image
        for t in $(jq -r '.tenants[].name' "$OUT/platform.json"); do
-         kubectl --kubeconfig "$KC" -n "di-runtime-$t" rollout status "deploy/hostgroup-tenant-$t" --timeout=600s
-         kubectl --kubeconfig "$KC" -n "di-runtime-$t" get deploy "hostgroup-tenant-$t" -o jsonpath='{.spec.template.spec.containers[*].image}{"\n"}'
+         kubectl --kubeconfig "$KC" -n "di-runtime-$t" rollout status "deploy/hostgroup-tenant-$t" --timeout=600s \
+           || echo "STOP: hostgroup-tenant-$t did not roll out"
+         images="$(kubectl --kubeconfig "$KC" -n "di-runtime-$t" get deploy "hostgroup-tenant-$t" -o jsonpath='{.spec.template.spec.containers[*].image}')"
+         case " $images " in *" $HOST_IMAGE "*) echo "host $t: ok" ;; *) echo "STOP: host $t runs '$images'" ;; esac
        done
        # b. the old guest serves again, with the same issuer and key (the host pulls the component first)
        served=
@@ -791,8 +806,14 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
          [ "$served" = "$ISSUER" ] && break
          sleep 10
        done
-       echo "issuer: $served"
-       curl -s -H 'Host: identity.identity.localhost' "$GW/oauth2/jwks" | jq -r '.keys[].kid'   # must print $OLD_KID
+       kid="$(curl -s -m 10 -H 'Host: identity.identity.localhost' "$GW/oauth2/jwks" | jq -r '.keys[].kid')"
+       [ -n "$ISSUER" ] && [ "$served" = "$ISSUER" ] && [ -n "$OLD_KID" ] && [ "$kid" = "$OLD_KID" ] \
+         && echo 'old guest: ok' || echo "STOP: old guest issuer '$served', kid '$kid'"
+       # the old guest's and acme's workloads Ready again
+       for w in di-tenant-identity/identity di-tenant-acme/greeter-staging; do
+         ready="$(kubectl --kubeconfig "$KC" -n "${w%/*}" get workloaddeployment "${w#*/}" -o 'jsonpath={.status.conditions[?(@.type=="Ready")].status}')"
+         [ "$ready" = True ] && echo "$w: Ready" || echo "STOP: $w Ready='$ready'"
+       done
        # c. tenant $NEW's auth pair and registry
        kubectl --kubeconfig "$KC" wait "tenants.platform.di-framework.dev/$NEW" --for=condition=TenantAuthReady --timeout=600s
        registry=
@@ -803,9 +824,8 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
        done
        [ "$registry" = True ] && echo 'tenant registry Ready' || echo 'tenant registry NOT Ready: STOP'
        ```
-       Every host must list `$HOST_IMAGE`, the issuer must be `$ISSUER` and the kid `$OLD_KID`,
-       and WorkloadDeployments `identity` in `di-tenant-identity` and `greeter-staging` in
-       `di-tenant-acme` must be `Ready`. If anything fails, STOP before the freeze: the old guest
+       Each check prints `ok`/`Ready` or a `STOP` line; a missing or empty answer is a `STOP`,
+       never a pass. If anything fails, STOP before the freeze: the old guest
        is still the only guest. Fix the file and `up_platform` again; the project copy in
        `$OUT/platform-before-upgrade` records the previous stack config.
     7. **Tenant-auth gate.** Every Tenant must be `TenantAuthReady` and every tenant-auth
@@ -815,12 +835,15 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
        ```sh
        for i in $(seq 1 40); do   # up to 10 minutes after the old guest serves
          tenant_auth_state > "$OUT/tenant-auth.now"
-         grep -Ev 'TenantAuthReady=True$| ready=(1/1|/0)$| ready=true restarts=[0-9]+$' "$OUT/tenant-auth.now" || break
+         [ -s "$OUT/tenant-auth.now" ] \
+           && ! grep -Ev 'TenantAuthReady=True$| ready=(1/1|/0)$| ready=true restarts=[0-9]+$' "$OUT/tenant-auth.now" \
+           && break
          sleep 15
        done
        cat "$OUT/tenant-auth.now"
        ```
-       The `grep` prints what is not ready yet; the loop ends when it prints nothing. If a pod is
+       The `grep` prints what is not ready yet (an `ERROR` line included); the loop ends only
+       when the snapshot is non-empty and it prints nothing. If a pod is
        still in `CrashLoopBackOff` after that (it exhausted its discovery budget while the old
        guest was down), restart it once, now that the guest serves:
        `kubectl --kubeconfig "$KC" -n di-runtime-<tenant> rollout restart deploy/<tenant-controller|tenant-console>`,
@@ -881,24 +904,41 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
    steps 2 to 10 run with the issuer frozen, and nothing that can run before belongs there.
 2. **Freeze writes on the Postgres guest.** First the tenant-auth check:
    `tenant_auth_state | diff "$OUT/tenant-auth.baseline" -` must print nothing (P2, "The frozen
-   issuer"); otherwise STOP and run P2 item 7 again. Then record the old guest's replicas and
-   stop it:
-   `kubectl --kubeconfig "$KC" -n di-tenant-identity get workloaddeployment identity -o jsonpath='{.spec.replicas}'`,
-   then
-   `kubectl --kubeconfig "$KC" -n di-tenant-identity patch workloaddeployment identity --type merge -p '{"spec":{"replicas":0}}'`,
-   and check that `Host: identity.identity.localhost` no longer answers `/health`. Then check that
-   nothing else is connected to `directory`. The count must reach `0`, but not at once: after
+   issuer"); otherwise STOP and run P2 item 7 again. Then record the old guest's replicas (a
+   number, kept in `$OUT/old-replicas` for the rollback) and stop it:
+   ```sh
+   OLD_REPLICAS="$(kubectl --kubeconfig "$KC" -n di-tenant-identity get workloaddeployment identity -o jsonpath='{.spec.replicas}')"
+   case "$OLD_REPLICAS" in
+     ''|*[!0-9]*) echo "STOP: could not read the old guest's replicas: '$OLD_REPLICAS'" ;;
+     *) echo "$OLD_REPLICAS" > "$OUT/old-replicas" && echo "recorded replicas: $OLD_REPLICAS" \
+          && kubectl --kubeconfig "$KC" -n di-tenant-identity patch workloaddeployment identity --type merge -p '{"spec":{"replicas":0}}' ;;
+   esac
+   ```
+   Then the freeze must hold on all three counts: the workload at `replicas: 0`,
+   `Host: identity.identity.localhost` no longer answering `/health` with 200, and nothing else
+   connected to `directory`. The connection count reaches `0`, but not at once: after
    `replicas: 0` the tenant host (`hostgroup-tenant-identity`) keeps the old guest's pooled
    connection open, idle, until its pool drops it. On pgprove that took 3.5 to 4.5 minutes, so
-   wait for it, with a timeout:
+   wait for it, with a timeout. `freeze_check` prints `frozen: ok` only when every answer is
+   there and right; a failed `kubectl`, `curl` or `psql`, or an empty answer, is a `STOP`:
    ```sh
    others='SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid()'
+   freeze_check() {
+     r="$(kubectl --kubeconfig "$KC" -n di-tenant-identity get workloaddeployment identity -o jsonpath='{.spec.replicas}')" \
+       || { echo 'STOP: cannot read the old workload'; return 1; }
+     [ "$r" = 0 ] || { echo "STOP: the old workload has replicas='$r'"; return 1; }
+     h="$(curl -s -o /dev/null -m 10 -w '%{http_code}' -H 'Host: identity.identity.localhost' "$GW/health")"
+     [ "$h" != 200 ] || { echo 'STOP: the old guest still answers /health'; return 1; }
+     n="$(psql_directory "$others")" || { echo 'STOP: cannot count the connections to directory'; return 1; }
+     [ "$n" = 0 ] || { echo "STOP: $n other connections to directory"; return 1; }
+     echo 'frozen: ok'
+   }
    deadline=$(( $(date +%s) + 600 ))
-   until [ "$(psql_directory "$others")" = 0 ]; do
-     if [ "$(date +%s)" -ge "$deadline" ]; then echo 'still connected after 10 minutes'; break; fi
+   until freeze_check >/dev/null; do
+     if [ "$(date +%s)" -ge "$deadline" ]; then echo 'not frozen after 10 minutes'; break; fi
      sleep 15
    done
-   psql_directory "$others"   # must print 0
+   freeze_check   # must print 'frozen: ok'; anything else is a STOP: do not export
    ```
    Optional, instead of waiting: end only the old guest's **idle** connections. They come from
    the tenant host pods' IPs, so list those first and look at what matches:
@@ -910,16 +950,17 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
    psql_directory "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE $old_guest"
    ```
    Only with `replicas: 0` and `/health` not answering: the filter keeps connections that are
-   running a statement or in a transaction, and connections from any other address. Then run
-   the count again. If it does not reach 0, find the client
+   running a statement or in a transaction, and connections from any other address. (An empty
+   `HOST_IPS` gives `'{}'`, which matches nothing, so it ends nothing.) Then run `freeze_check`
+   again. If it does not reach 0, find the client
    (`SELECT usename, application_name, client_addr, state FROM pg_stat_activity WHERE datname = current_database() AND pid <> pg_backend_pid()`)
    and stop it before step 3. Anything written after step 3 is lost.
 3. **Export** (read-only on `directory`):
    `bun deploy/cutover/export.ts --kubeconfig "$KC" --context "$CTX" --namespace di-runtime-identity --service directory --out "$OUT/export"`.
    Expect `source schema V15`. If it refuses unknown runtime rows, review them (P0); do not edit
-   the tool's mapping. A failed export leaves no `$OUT/export` behind. Then repeat both checks of
-   step 2: the old workload's `replicas` must still be `0` (a controller may have restored it)
-   and the `pg_stat_activity` count `0`. Otherwise stop the writer again, delete the old export
+   the tool's mapping. A failed export leaves no `$OUT/export` behind. Then run `freeze_check`
+   again: it must still print `frozen: ok` (a controller may have restored the replicas).
+   Otherwise stop the writer again, delete the old export
    first (`rm -rf "$OUT/export"`: it holds secrets, and `export.ts` refuses a non-empty `--out`),
    and export again.
 4. **Key:** `bun deploy/guest/runtime-secrets.ts pglite-key --values "$OUT/export/values.json"`.
@@ -1047,8 +1088,10 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
       again); `runtime-secrets.ts apply` is the recovery only once the WorkloadDeployment
       exists, and `deploy.sh` prints it only then. The workload must reference the tenant
       registry:
-      `kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" get workloaddeployment identity -o jsonpath='{.spec.template.spec.components[*].image}'`
-      starts with `tenant-registry.di-runtime-$NEW.svc/identity`.
+      ```sh
+      image="$(kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" get workloaddeployment identity -o jsonpath='{.spec.template.spec.components[*].image}')"
+      case "$image" in "tenant-registry.di-runtime-$NEW.svc/identity"[:@]*) echo "image ok: $image" ;; *) echo "STOP: image '$image'" ;; esac
+      ```
    4. **Clean up the push credentials, on every path:** `cleanup_push` after a successful
       deploy, after a failed one you will not retry at once, and before any rollback. From a
       new shell, define `KC`, `NEW`, `PUSHER`, `OUT` and the function again: it finds the keys
@@ -1074,21 +1117,60 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
    `AUTH_BOOTSTRAP_ORGANIZATION_SLUG`, else the compiled-in `platform`
    (`apps/guest/src/bindings.ts`). It exits 1 unless `/ready` and that read answer 200; its
    `login` field signs in the bootstrap owner with the bootstrap password, which fails if the
-   owner changed it (see step 6) and does not change the exit code. Then compare
-   `curl -s -H "Host: identity.$NEW.localhost" "$GW/oauth2/jwks" | jq -r '.keys[].kid'`
-   with `jq -r '.AUTH_ACTIVE_PRIVATE_JWK | fromjson | .kid' "$OUT/export/values.json"` (a public
-   key id, and `$OLD_KID` from P1). This proves the guest, not the route: relying parties use
-   `$ISSUER`.
+   owner changed it (see step 6) and does not change the exit code. Then compare the key ids
+   (public; nothing else of the key is printed):
+   ```sh
+   NEW_KID="$(jq -r '.AUTH_ACTIVE_PRIVATE_JWK | fromjson | .kid' "$OUT/export/values.json")"
+   served_kid="$(curl -s -m 10 -H "Host: identity.$NEW.localhost" "$GW/oauth2/jwks" | jq -r '.keys[].kid')"
+   [ -n "$NEW_KID" ] && [ "$NEW_KID" != null ] && [ "$served_kid" = "$NEW_KID" ] && [ "$NEW_KID" = "$OLD_KID" ] \
+     && echo "kid ok: $NEW_KID" || echo "STOP: values '$NEW_KID', served '$served_kid', old guest '$OLD_KID'"
+   ```
+   This proves the guest, not the route: relying parties use `$ISSUER`.
 10. **Switch the public route** to tenant `$NEW` with the gateway alias (P1).
     1. **One signer only.** Every other guest holding this signing key must be at 0 replicas
-       before `$ISSUER` reaches `$NEW`. That is the old guest, frozen at 0 since step 2, and
-       any guest a rolled-back attempt left behind:
+       before `$ISSUER` reaches `$NEW`: the old guest, frozen at 0 since step 2, any guest a
+       rolled-back attempt left behind, and any workload, under any name, whose
+       `<workload>-control` Secret holds a key with the same `kid`. `check_signers` prints
+       `one signer: ok` only if all of these hold, and a `STOP` line for anything else,
+       including a failed `kubectl` or an empty list:
+       - `kubectl` lists the WorkloadDeployments;
+       - `di-tenant-identity/identity` is listed at `replicas=0`;
+       - `di-tenant-$NEW/identity` is listed at `replicas=1`;
+       - every other workload named `identity` is at `replicas=0`;
+       - every other running workload has no `<workload>-control` Secret whose
+         `AUTH_ACTIVE_PRIVATE_JWK` has `$NEW_KID` (step 9). Only the `kid` is decoded and compared;
+         the key is never printed or written to a file.
        ```sh
-       kubectl --kubeconfig "$KC" get workloaddeployments -A -o json \
-         | jq -r '.items[] | select(.metadata.name == "identity") | "\(.metadata.namespace) replicas=\(.spec.replicas)"'
+       check_signers() {
+         case "$NEW_KID" in ''|null) echo 'STOP: no kid (step 9)'; return 1 ;; esac
+         kubectl --kubeconfig "$KC" get workloaddeployments -A -o json > "$OUT/workloads.json" \
+           || { echo 'STOP: cannot list the workloads'; return 1; }
+         jq -r '.items[] | "\(.metadata.namespace) \(.metadata.name) \(.spec.replicas)"' "$OUT/workloads.json" > "$OUT/workloads.txt" \
+           || { echo 'STOP: cannot read the workload list'; return 1; }
+         bad=0
+         grep -qx 'di-tenant-identity identity 0' "$OUT/workloads.txt" || { echo 'STOP: the old guest is not listed at replicas=0'; bad=1; }
+         grep -qx "di-tenant-$NEW identity 1" "$OUT/workloads.txt" || { echo "STOP: the new guest is not listed at replicas=1"; bad=1; }
+         while read -r ns name replicas; do
+           [ "$ns $name" = "di-tenant-$NEW identity" ] && continue
+           [ "$replicas" = 0 ] && continue
+           if [ "$name" = identity ]; then echo "STOP: $ns/$name runs with replicas=$replicas"; bad=1; continue; fi
+           jwk="$(kubectl --kubeconfig "$KC" -n "$ns" get secret "$name-control" --ignore-not-found -o 'jsonpath={.data.AUTH_ACTIVE_PRIVATE_JWK}')" \
+             || { echo "STOP: cannot read $ns/$name-control"; bad=1; continue; }
+           [ -n "$jwk" ] || continue
+           kid="$(printf '%s' "$jwk" | jq -Rr '@base64d | fromjson | .kid // empty')" \
+             || { echo "STOP: unreadable key in $ns/$name-control"; bad=1; continue; }
+           [ "$kid" != "$NEW_KID" ] || { echo "STOP: $ns/$name signs with kid $kid and runs with replicas=$replicas"; bad=1; }
+         done < "$OUT/workloads.txt"
+         unset jwk
+         [ "$bad" = 0 ] && echo 'one signer: ok'
+         return "$bad"
+       }
+       check_signers || echo 'STOP: do not switch'
        ```
-       Every line but `di-tenant-$NEW` must read `replicas=0`. Scale any other to 0 first, as in
-       step 2. Then the tenant-auth check: `tenant_auth_state | diff "$OUT/tenant-auth.baseline" -`
+       Scale a stray signer to 0 first, as in step 2, and run it again. Limitation: a guest that
+       keeps its key somewhere other than a `<workload>-control` Secret is found only by its
+       workload name. The Postgres-era guest is one (its key is in `directory`), which is why
+       `di-tenant-identity/identity` is checked by name. Then the tenant-auth check: `tenant_auth_state | diff "$OUT/tenant-auth.baseline" -`
        must print nothing (`$NEW`'s new workload does not show in it); otherwise roll back (P2,
        "The frozen issuer").
     2. **Switch:**
@@ -1105,12 +1187,17 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
        `up` fails, `up_platform "$OUT/platform.json"` first (the rules above), then retry or
        roll back.
     3. **Verify against the real issuer host**, as a relying party sees it:
-       `curl -s "$ISSUER/.well-known/openid-configuration" | jq -r .issuer` must equal `$ISSUER`
-       and `jq -r .ISSUER_URL "$OUT/export/values.json"`; the `jwks_uri` it names must serve the
-       kid from step 9 (`curl -s "$(curl -s "$ISSUER/.well-known/openid-configuration" | jq -r .jwks_uri)" | jq -r '.keys[].kid'`);
-       and
-       `bun apps/guest/scripts/live-check.ts --values "$OUT/export/values.json" --url "$ISSUER" --host "${ISSUER#http://}" --read-only`
-       must pass. If any check fails, roll back (below).
+       ```sh
+       discovery="$(curl -s -m 10 "$ISSUER/.well-known/openid-configuration")"
+       iss="$(printf '%s' "$discovery" | jq -r .issuer)"
+       jwks_kid="$(curl -s -m 10 "$(printf '%s' "$discovery" | jq -r .jwks_uri)" | jq -r '.keys[].kid')"
+       [ -n "$ISSUER" ] && [ "$iss" = "$ISSUER" ] && [ "$iss" = "$(jq -r .ISSUER_URL "$OUT/export/values.json")" ] \
+         && [ -n "$NEW_KID" ] && [ "$jwks_kid" = "$NEW_KID" ] \
+         && echo 'issuer ok' || echo "STOP: issuer '$iss', kid '$jwks_kid'"
+       bun apps/guest/scripts/live-check.ts --values "$OUT/export/values.json" --url "$ISSUER" --host "${ISSUER#http://}" --read-only \
+         && echo 'live-check ok' || echo 'STOP: live-check failed'
+       ```
+       Both must print `ok`. If either prints `STOP`, roll back (below).
 11. **Soak.** Leave the old workload at 0 replicas and `directory` untouched for the soak period
     the coordinator sets, watching sign-ins, token refreshes and the guest's logs. Rollback is
     still available. Browser sessions expire after 30 minutes without use
@@ -1165,6 +1252,7 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
       the host uid's 0700 files and change nothing; the target mounted read-only):
       ```sh
       NEW_REPLICAS="$(kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" get workloaddeployment identity -o jsonpath='{.spec.replicas}')"
+      case "$NEW_REPLICAS" in ''|*[!0-9]*) echo "STOP: could not read the replicas: '$NEW_REPLICAS'" ;; esac
       echo "recorded replicas: $NEW_REPLICAS"   # keep this; it is restored below
       kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" patch workloaddeployment identity --type merge -p '{"spec":{"replicas":0}}'
       # wait until Host: identity.$NEW.localhost no longer answers /health
@@ -1241,17 +1329,32 @@ old guest was proven on it before the freeze.
 
 Before step 1, run `cleanup_push` (step 8, item 4) if the push credentials may still exist.
 
-1. Stop the **new** guest first:
-   `kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" patch workloaddeployment identity --type merge -p '{"spec":{"replicas":0}}'`,
-   and check that `Host: identity.$NEW.localhost` no longer answers `/health`.
+1. Stop the **new** guest first, and confirm it is stopped (any `STOP` line: do not go on):
+   ```sh
+   kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" patch workloaddeployment identity --type merge -p '{"spec":{"replicas":0}}'
+   r="$(kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" get workloaddeployment identity -o jsonpath='{.spec.replicas}')"
+   h="$(curl -s -o /dev/null -m 10 -w '%{http_code}' -H "Host: identity.$NEW.localhost" "$GW/health")"
+   [ "$r" = 0 ] && [ "$h" != 200 ] && echo 'new guest stopped' || echo "STOP: replicas '$r', /health $h"
+   ```
+   Repeat the last three lines until it prints `new guest stopped`.
 2. If the alias is set (step 10), remove it: `up_platform "$OUT/platform.json"` (the same file
    without `routeAliases`), then
    `kubectl --kubeconfig "$KC" -n wasmcloud rollout status deploy/di-platform-gateway --timeout=300s`.
    On pgprove this took about 17 s; the gateway roll drops open connections for under a second
    (platform#223). If the `up` fails, run it again with the same file (the rules above); do
    not continue to step 3 while `$ISSUER` may still reach `$NEW`.
-3. Only then restore the old guest's replicas from step 2 and check that
-   `Host: identity.identity.localhost` answers `/health` (and `$ISSUER`, if the route moved).
+3. Only then restore the old guest's replicas from step 2 (`$OUT/old-replicas`) and check
+   that it answers again:
+   ```sh
+   OLD_REPLICAS="$(cat "$OUT/old-replicas")"
+   case "$OLD_REPLICAS" in ''|*[!0-9]*) echo "STOP: no recorded replicas: '$OLD_REPLICAS'" ;;
+     *) kubectl --kubeconfig "$KC" -n di-tenant-identity patch workloaddeployment identity --type merge -p "{\"spec\":{\"replicas\":$OLD_REPLICAS}}" ;;
+   esac
+   h="$(curl -s -o /dev/null -m 10 -w '%{http_code}' -H 'Host: identity.identity.localhost' "$GW/health")"
+   [ "$h" = 200 ] && echo 'old guest answers' || echo "not yet: /health $h"
+   ```
+   Repeat the last two lines until it prints `old guest answers` (the host may pull the
+   component first), then check `$ISSUER` the same way if the route moved.
    Discovery answers again from here. Run P2 item 7's loop: a tenant-auth pod that restarted
    while the issuer was frozen recovers on its own within its retry budget, or needs one
    `rollout restart` if it is still crash-looping.
