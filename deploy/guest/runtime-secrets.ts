@@ -183,7 +183,9 @@ function preflight(): { values: Record<string, string>; workload: string } {
 /**
  * The target check (assertDeployTarget): authproto, recognised by the instance argument, by
  * its kubeconfig in kube's state directory or by any `directory` BackingService on the cluster,
- * only as the confirmed cutover into a new tenant on the exclusive host build.
+ * only as the confirmed cutover into a new tenant on the exclusive host build. A tenant developer
+ * kubeconfig that may not list BackingServices cluster-wide gets the per-tenant check only, with a
+ * warning, unless the instance or the kubeconfig is authproto's.
  */
 async function guard(tenant: string): Promise<void> {
   const kubeconfig = required('kubeconfig');
@@ -200,6 +202,7 @@ async function guard(tenant: string): Promise<void> {
     tenant,
     confirmation: process.env[CUTOVER_CONFIRM_ENV],
     legacyKubeconfig,
+    warn: (line) => console.error(`warning: ${line}`),
   });
   if (allowed === 'authproto-cutover') {
     console.log(`authproto cutover confirmed for the new tenant ${tenant}`);

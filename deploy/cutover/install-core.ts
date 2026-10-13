@@ -284,7 +284,8 @@ export interface InstallOptions {
  * The install (install.ts). Reads and checks everything first (marker KCV against the values,
  * the tenant's `directory`, the tenant uid, the storage root, the node, no WorkloadDeployment
  * yet); without `yes` it stops there. With `yes` it runs the helper pod, refuses a non-empty
- * target before sending anything, extracts the archive, sets modes then owner, compares every
+ * target before sending anything, extracts the archive, sets the modes below the target (and the
+ * target's own 0700 only when root owns it, i.e. kubelet just created it) then owner, compares every
  * digest and owner, and always deletes the pod: a failed delete is an error that names the pod.
  */
 export async function installCommand(
@@ -371,11 +372,26 @@ export async function installCommand(
     if (present.length > 0) {
       throw new Error(`${target} is not empty (${present.length} entries); refusing to install`);
     }
+    // Who owns the target itself: root when kubelet just created it, the host uid when the
+    // platform's storage init already handed it over. Without FOWNER root cannot chmod a
+    // directory it does not own, so the target's own mode is set only in the first case.
+    const [ownerBefore, modeBefore] = (await exec("stat -c '%u %a' /target")).trim().split(/\s+/);
+    const fresh = ownerBefore === '0';
     await exec('tar -x -o -f - -C /target', tarball(options.data, tree));
     await exec(
-      'cd /target && find . -type d -exec chmod 700 {} + && find . -type f -exec chmod 600 {} + && ' +
-        `chown -R ${HOST_UID}:${HOST_UID} .`,
+      'cd /target && find . -mindepth 1 -type d -exec chmod 700 {} + && ' +
+        'find . -mindepth 1 -type f -exec chmod 600 {} + && ' +
+        `${fresh ? 'chmod 700 . && ' : ''}chown -R ${HOST_UID}:${HOST_UID} .`,
     );
+    const modeAfter = (await exec('stat -c %a /target')).trim();
+    if (fresh && modeAfter !== '700') {
+      throw new Error(`${target} has mode ${modeAfter} after the install, not 700`);
+    }
+    if (!fresh) {
+      deps.log(
+        `the target was owned by uid ${ownerBefore} before the install (the platform's storage init); its mode ${modeBefore} is left as it was`,
+      );
+    }
     const digests = compareDigests(
       tree,
       await exec('cd /target && find . -type f -exec sha256sum {} +'),

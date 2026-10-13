@@ -604,6 +604,12 @@ export function kubeconfigServer(text: string): string | undefined {
 /**
  * Whether `kubeconfig` points at authproto whatever the instance argument says: it is
  * authproto's kubeconfig in kube's state directory, or it names the same API server.
+ *
+ * The server match is textual and reads only the first `server:` line of each file: an alias of
+ * the same address (`localhost` for `127.0.0.1`, another port forward) or a multi-cluster
+ * kubeconfig used with `--context` does not match. While a `directory` BackingService exists the
+ * cluster-wide check in `assertDeployTarget` still recognises authproto; after it is retired only
+ * the instance name, this path and this server match do.
  */
 export function kubeconfigIsLegacy(
   kubeconfig: string,
@@ -627,6 +633,10 @@ const EXCLUSIVE_HOST_IMAGE = /(^|\/)wash:[^\s@]*exclusive/;
  *   kubeconfig is authproto's (`legacyKubeconfig`), or when the cluster has a `directory`
  *   BackingService in any namespace, as the Pulumi preflight does. Then the cutover must be
  *   confirmed for this tenant, and the tenant's host must run the exclusive-instance wash build;
+ * - a tenant developer kubeconfig may not list BackingServices cluster-wide. When that list is
+ *   Forbidden and neither the instance nor the kubeconfig names authproto, the cluster-wide check
+ *   is skipped (and `warn` says so); a Forbidden list on a target named authproto, and any other
+ *   failed list, refuses;
  * - the tenant itself must not have the `directory` BackingService.
  *
  * Every failed kubectl call refuses.
@@ -638,6 +648,8 @@ export async function assertDeployTarget(
     tenant: string;
     confirmation: string | undefined;
     legacyKubeconfig: boolean;
+    /** Told when the cluster-wide check is skipped (a forbidden list, see below). */
+    warn?: (line: string) => void;
   },
 ): Promise<'other-target' | 'authproto-cutover'> {
   assertTenantName(target.tenant);
@@ -648,12 +660,22 @@ export async function assertDeployTarget(
     '-o',
     'jsonpath={range .items[*]}{.metadata.namespace}/{.metadata.name}{"\\n"}{end}',
   ]);
-  if (listed.code !== 0) {
+  // A tenant developer kubeconfig (namespaced Role di-developer) may not list cluster-wide. Only
+  // then, and only for a target not already recognised as authproto, the per-tenant check below
+  // stands alone; every other failure refuses.
+  const forbidden = listed.code !== 0 && /\bForbidden\b/i.test(listed.stderr);
+  const named = target.instance === LEGACY_INSTANCE || target.legacyKubeconfig;
+  if (listed.code !== 0 && (!forbidden || named)) {
     throw new Error(
-      `cannot list BackingServices (kubectl exit ${listed.code}); refusing to deploy`,
+      `cannot list BackingServices (kubectl exit ${listed.code}${forbidden ? ', Forbidden' : ''}); refusing to deploy`,
     );
   }
-  const directories = listed.stdout
+  if (forbidden) {
+    target.warn?.(
+      `this kubeconfig may not list BackingServices in every namespace; skipped the cluster-wide \`${LEGACY_DATABASE}\` check, checking di-tenant-${target.tenant} only`,
+    );
+  }
+  const directories = (forbidden ? '' : listed.stdout)
     .split('\n')
     .map((line) => line.trim())
     .filter((line) => line.endsWith(`/${LEGACY_DATABASE}`));

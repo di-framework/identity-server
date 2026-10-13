@@ -12,7 +12,11 @@
 # The variables di-framework.deploy.toml interpolates for target `identity` default to the
 # instance's admin kubeconfig and the in-cluster `examples-registry` behind a port-forward on
 # REGISTRY_FORWARD_PORT; override any of them through the environment. A tenant developer
-# kubeconfig works too: the Secret steps only create and replace.
+# kubeconfig works too: the Secret steps only create and replace, and since its namespaced Role
+# may not list BackingServices in every namespace, the guard then skips the cluster-wide
+# `directory` check with a warning and checks di-tenant-<tenant> only. It does not skip it for a
+# target named authproto (the instance, or authproto's kubeconfig by path or API server): there a
+# forbidden list refuses, so the cutover needs the admin kubeconfig.
 #
 # The script refuses a tenant whose di-tenant-<tenant> namespace still has the Postgres
 # `directory` BackingService, i.e. the Postgres-era guest on authproto, however the kubeconfig and

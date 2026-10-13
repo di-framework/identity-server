@@ -426,7 +426,13 @@ target is refused except for a tenant other than `identity` with exactly
 `IDENTITY_AUTHPROTO_CUTOVER=authproto/<tenant>` in the environment (no trimming), whose tenant
 host (`hostgroup-tenant-<tenant>` in `di-runtime-<tenant>`) runs the exclusive-instance wash build.
 Every target still refuses a tenant whose `di-tenant-<tenant>` has the `directory` BackingService,
-and every entry point refuses a tenant name that is not a DNS-1123 label. The Pulumi program accepts `kubeInstance: authproto` only with
+and every entry point refuses a tenant name that is not a DNS-1123 label. A tenant developer
+kubeconfig (namespaced Role `di-developer`) may not list BackingServices cluster-wide; when that
+list is Forbidden and neither the instance nor the kubeconfig names authproto, the guard warns and
+checks `di-tenant-<tenant>` only. On a target named authproto a forbidden (or any failed) list
+refuses, so the cutover runs with authproto's admin kubeconfig. The kubeconfig match compares the
+first `server:` line as text: an alias of the same address or a multi-cluster kubeconfig used with
+`--context` does not match, which matters once `directory` (the cluster-wide signal) is retired. The Pulumi program accepts `kubeInstance: authproto` only with
 `cutoverConfirm: authproto/<tenant>`, and still refuses any cluster with a `directory`
 BackingService, because `kube up` would rewrite authproto's whole install, tenant `identity`
 included; so the cutover uses `deploy.sh`, not Pulumi.
@@ -523,7 +529,9 @@ P2. **The exclusive tenant host image.** Create the new tenant now (the old gues
    Expect `source schema V15`. If it refuses unknown runtime rows, review them; do not edit the
    tool's mapping. A failed export leaves no `$OUT/export` behind. Then repeat both checks of
    step 2: the old workload's `replicas` must still be `0` (a controller may have restored it)
-   and the `pg_stat_activity` count `0`; otherwise export again.
+   and the `pg_stat_activity` count `0`. Otherwise stop the writer again, delete the old export
+   first (`rm -rf "$OUT/export"`: it holds secrets, and `export.ts` refuses a non-empty `--out`),
+   and export again.
 4. **Key:** `bun deploy/guest/runtime-secrets.ts pglite-key --values "$OUT/export/values.json"`.
    Record the KCV it prints, and back the key (the whole `values.json`) up apart from any volume
    backup. Optional: `runtime-secrets.ts column-keys --values "$OUT/export/values.json" --enable`
@@ -578,7 +586,11 @@ P2. **The exclusive tenant host image.** Create the new tenant now (the old gues
     `directory` is never dropped without a restorable copy verified this way.
 13. **Retire** the old workload, the `directory` BackingService and tenant `identity`. Destroy
     `$OUT` once the new guest's own backups run; `directory.dump`, the old volume and every older
-    backup of `directory` stay secret-bearing until destroyed.
+    backup of `directory` stay secret-bearing until destroyed. After the retirement the guard
+    still recognises authproto by its kubeconfig (path or API server) and by the instance name,
+    so **every later** `deploy.sh` or `runtime-secrets.ts apply` with authproto's kubeconfig,
+    including routine redeploys of `$NEW`, still needs `IDENTITY_AUTHPROTO_CUTOVER=authproto/$NEW`
+    and still checks the exclusive tenant host image. That is intended.
 
 **Rollback** (any time before step 13; the export never writes to `directory`). Never let the two
 guests run at once: they share the signing key, and their refresh-token state diverges.

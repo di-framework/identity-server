@@ -18,7 +18,9 @@
  *      mounted;
  *   2. refuses unless that directory is empty, before sending anything;
  *   3. streams the directory in as a tar archive on kubectl's stdin, extracted without owners;
- *   4. sets directories 0700 and files 0600, then owner 65532:65532 (the tenant host's uid);
+ *   4. sets directories 0700 and files 0600 below the target, and the target itself 0700 when
+ *      root owns it (a target the platform already handed to 65532 keeps its mode), then owner
+ *      65532:65532 (the tenant host's uid);
  *   5. compares every file's SHA-256 on the node with the local file, and the owner;
  *   6. deletes the helper pod, also on failure; a failed delete is an error naming the pod.
  *

@@ -172,8 +172,8 @@ export function privateFile(path: string, data: string | Uint8Array): void {
  * Everything is written into a new 0700 sibling of `out` and renamed to `out` only once the
  * backup and the manifest are written, so `out` either holds a complete export or does not
  * exist. On any error the sibling, with whatever secrets it already held, is removed. `out`
- * must not exist or be an empty directory. The values are checked as `runtime-secrets.ts`
- * checks a values file before anything is written.
+ * must not exist or be an empty directory; missing parents are created mode 0700. The values
+ * are checked as `runtime-secrets.ts` checks a values file before anything is written.
  */
 export async function writeExport(
   out: string,
@@ -185,7 +185,7 @@ export async function writeExport(
 ): Promise<ExportManifest> {
   parseRuntimeValues(JSON.stringify(snapshot.runtime.values), 'the runtime secret rows');
   const replaceEmpty = assertFreshTarget(out);
-  mkdirSync(dirname(out), { recursive: true });
+  mkdirSync(dirname(out), { recursive: true, mode: 0o700 });
   const dir = mkdtempSync(join(dirname(out), `.${basename(out)}.partial-`));
   try {
     chmodSync(dir, 0o700);

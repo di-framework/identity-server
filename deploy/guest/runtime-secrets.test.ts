@@ -195,7 +195,7 @@ describe('deploy.sh', () => {
     // STUB_READY is what the WorkloadDeployment's Ready condition reads (default True).
     record(
       'kubectl',
-      `case "$*" in *" create --raw "*|*" replace --raw "*) cat >"${calls}/$n.stdin" ;; *" get workloaddeployment "*) printf '%s' "\${STUB_READY:-True}" ;; *" --all-namespaces "*) printf '%s' "\${STUB_BACKINGSERVICES:-}" ;; *" get deployment hostgroup-tenant-"*) printf '%s' "\${STUB_HOST_IMAGE:-ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive}" ;; esac\nexit 0`,
+      `case "$*" in *" create --raw "*|*" replace --raw "*) cat >"${calls}/$n.stdin" ;; *" get workloaddeployment "*) printf '%s' "\${STUB_READY:-True}" ;; *" --all-namespaces "*) if [ -n "\${STUB_FORBIDDEN:-}" ]; then echo 'Error from server (Forbidden): backingservices.platform.di-framework.dev is forbidden' >&2; exit 1; fi; printf '%s' "\${STUB_BACKINGSERVICES:-}" ;; *" get deployment hostgroup-tenant-"*) printf '%s' "\${STUB_HOST_IMAGE:-ghcr.io/di-framework/wash:2.8.0-wasi-tls-exclusive}" ;; esac\nexit 0`,
     );
     return { bin, calls };
   }
@@ -415,6 +415,24 @@ describe('deploy.sh', () => {
       IDENTITY_AUTHPROTO_CUTOVER: 'authproto/identity-pg',
     });
     expect(confirmed).toMatchObject({ code: 0, built: true });
+
+    // A tenant developer kubeconfig may not list cluster-wide: deployed, with a warning.
+    const developer = deploy({ STUB_FORBIDDEN: '1' });
+    expect(developer).toMatchObject({ code: 0, built: true });
+    expect(developer.stderr).toContain(
+      'warning: this kubeconfig may not list BackingServices in every namespace; skipped the cluster-wide `directory` check',
+    );
+    // On authproto's kubeconfig the forbidden list refuses, even confirmed.
+    const forbiddenLegacy = deploy({
+      STUB_FORBIDDEN: '1',
+      IDENTITY_KUBECONFIG: copy,
+      IDENTITY_AUTHPROTO_CUTOVER: 'authproto/identity-pg',
+    });
+    expect(forbiddenLegacy).toMatchObject({ built: false });
+    expect(forbiddenLegacy.code).not.toBe(0);
+    expect(forbiddenLegacy.stderr).toContain(
+      'cannot list BackingServices (kubectl exit 1, Forbidden); refusing to deploy',
+    );
   });
 
   test('refuses a values file without the data directory key before touching the cluster', () => {

@@ -435,6 +435,53 @@ describe('the Pulumi preflight before any resource', () => {
     await expect(
       assertDeployTarget(kubectl({ '--all-namespaces': { code: 1 } }).run, target),
     ).rejects.toThrow('cannot list BackingServices (kubectl exit 1); refusing to deploy');
+
+    // A tenant developer kubeconfig may not list cluster-wide: the per-tenant check only, said.
+    const forbidden = {
+      '--all-namespaces': {
+        code: 1,
+        stderr:
+          'Error from server (Forbidden): backingservices.platform.di-framework.dev is forbidden: User "pgdev" cannot list resource "backingservices" in API group "platform.di-framework.dev" at the cluster scope',
+      },
+    };
+    const warnings: string[] = [];
+    const developer = kubectl(forbidden);
+    expect(
+      await assertDeployTarget(developer.run, {
+        ...target,
+        instance: 'pgprove',
+        warn: (line) => warnings.push(line),
+      }),
+    ).toBe('other-target');
+    expect(warnings).toEqual([
+      'this kubeconfig may not list BackingServices in every namespace; skipped the cluster-wide `directory` check, checking di-tenant-identity-pg only',
+    ]);
+    expect(developer.calls[1]?.join(' ')).toContain('di-tenant-identity-pg');
+    expect(await assertDeployTarget(kubectl(forbidden).run, target)).toBe('other-target');
+    // The per-tenant check still refuses the Postgres-era tenant.
+    await expect(
+      assertDeployTarget(
+        kubectl({
+          ...forbidden,
+          'di-tenant-identity-pg get': { stdout: 'backingservice/directory' },
+        }).run,
+        { ...target, instance: 'pgprove' },
+      ),
+    ).rejects.toThrow('di-tenant-identity-pg has the Postgres BackingService `directory`');
+    // A target named authproto, by instance or kubeconfig, refuses a forbidden list, confirmed or not.
+    for (const named of [
+      { instance: 'authproto' },
+      { instance: 'pgprove', legacyKubeconfig: true },
+    ]) {
+      await expect(
+        assertDeployTarget(kubectl({ ...forbidden, ...exclusive }).run, {
+          ...confirmed,
+          ...named,
+        }),
+      ).rejects.toThrow(
+        'cannot list BackingServices (kubectl exit 1, Forbidden); refusing to deploy',
+      );
+    }
     await expect(assertDeployTarget(kubectl({}).run, { ...target, tenant: 'Bad' })).rejects.toThrow(
       'is not a DNS-1123 label',
     );

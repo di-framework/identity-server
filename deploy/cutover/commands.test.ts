@@ -102,6 +102,11 @@ describe('the export directory is written whole or not at all', () => {
       'exists and is not an empty directory',
     );
     expect(leftovers(parent)).toEqual(['empty', 'export']);
+    // Missing parents are created private too.
+    const nested = join(parent, 'a', 'b', 'export');
+    await writeExport(nested, snapshot(), { createdAt: 'x' });
+    expect(statSync(join(parent, 'a')).mode & 0o777).toBe(0o700);
+    expect(statSync(join(parent, 'a', 'b')).mode & 0o777).toBe(0o700);
   });
 
   test('a failing backup removes everything already written, secrets included', async () => {
@@ -596,6 +601,8 @@ describe('installCommand', () => {
         'get tenants.platform.di-framework.dev': uid,
         'get deployments --all-namespaces': `/var/lib/kubesolo/di-tenants/${uid}/workloads/other\n`,
         'get nodes': 'node-1',
+        "stat -c '%u %a' /target": '0 755',
+        'stat -c %a /target': '700',
         sha256sum: digests,
       };
       const fallback = Object.keys(defaults).find((part) => line.includes(part));
@@ -662,10 +669,14 @@ describe('installCommand', () => {
     expect(pod.spec.volumes[0].hostPath).toEqual({ path: target, type: 'DirectoryOrCreate' });
     expect(pod.spec.nodeName).toBe('n');
     const exec = steps.filter((line) => line.includes(' exec '));
+    // A fresh target (root-owned, as kubelet creates it): everything below it, then the target
+    // itself while root still owns it, then the owner; never a chmod of a 65532-owned target.
     expect(exec.map((line) => line.split(' -- sh -c ')[1])).toEqual([
       'ls -A /target',
+      "stat -c '%u %a' /target",
       'tar -x -o -f - -C /target',
-      'cd /target && find . -type d -exec chmod 700 {} + && find . -type f -exec chmod 600 {} + && chown -R 65532:65532 .',
+      'cd /target && find . -mindepth 1 -type d -exec chmod 700 {} + && find . -mindepth 1 -type f -exec chmod 600 {} + && chmod 700 . && chown -R 65532:65532 .',
+      'stat -c %a /target',
       'cd /target && find . -type f -exec sha256sum {} +',
       'cd /target && find . ! -user 65532',
     ]);
@@ -676,6 +687,25 @@ describe('installCommand', () => {
       'installed: 2/2 files match, 0 missing, 0 changed, 0 extra; 0 not owned by 65532',
     );
     expect(deleted(stand)).toBe(true);
+  });
+
+  test('a target the platform already handed to 65532 is never chmodded itself', async () => {
+    // Without FOWNER, root cannot chmod a directory it does not own (`chmod: .: Operation not
+    // permitted`), so only the entries below the target get modes; the owner check covers it.
+    const stand = cluster({ "stat -c '%u %a' /target": { stdout: '65532 755\n' } });
+    const sink = { logs: [] as string[], warnings: [] as string[] };
+    expect(await run(stand, { allowExistingWorkload: true }, sink)).toBe('installed');
+    const modes = stand.calls.find((call) => call.args.includes('chmod'))?.args ?? '';
+    expect(modes.split(' -- sh -c ')[1]).toBe(
+      'cd /target && find . -mindepth 1 -type d -exec chmod 700 {} + && find . -mindepth 1 -type f -exec chmod 600 {} + && chown -R 65532:65532 .',
+    );
+    expect(sink.logs).toContain(
+      "the target was owned by uid 65532 before the install (the platform's storage init); its mode 755 is left as it was",
+    );
+    // A fresh target whose mode did not end up 0700 fails, and the pod is still deleted.
+    const loose = cluster({ 'stat -c %a /target': { stdout: '755\n' } });
+    await expect(run(loose)).rejects.toThrow(`${target} has mode 755 after the install, not 700`);
+    expect(deleted(loose)).toBe(true);
   });
 
   test('a non-empty target is refused before any archive is sent, and the pod is deleted', async () => {
