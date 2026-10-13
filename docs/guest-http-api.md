@@ -662,12 +662,18 @@ P1. **The issuer host and the route alias.** While the old guest is still up, re
     then fails step 6's rehearsal (`/ready` 503, `smtp: false`) during the freeze. Check the
     names P0 read:
     ```sh
-    grep -qx SMTP_HOST "$OUT/source-row-names" && echo 'smtp: ok' || echo 'no SMTP_HOST row: choose a relay now'
+    grep -qx SMTP_HOST "$OUT/source-row-names" && echo 'smtp: ok' \
+      || echo 'STOP: no SMTP_HOST row; record the relay decision before the freeze'
     ```
-    Without one, choose the relay before the freeze and record it as a deviation. authproto's
-    choice: Mailpit as in `deploy/platform/components/mailpit.ts`, at its fixed ClusterIP
-    `10.43.250.25:1025`, which needs that destination in the platform's
-    `egressAllowedDestinations`. Step 6 adds `SMTP_HOST` to the values first. Mailpit and its
+    Without one, STOP: choose the relay before the freeze, record it as a deviation, and set
+    it for step 6, which adds `SMTP_HOST` to the values:
+    ```sh
+    SMTP_RELAY_HOST=10.43.250.25   # authproto: Mailpit, recorded deviation
+    ```
+    authproto's choice was Mailpit (`deploy/platform/components/mailpit.ts`, port 1025, matching
+    the guest's compiled-in `SMTP_PORT`) at the ClusterIP `deploy/platform/index.ts` defaults
+    `mailpitClusterIP` to (`10.43.250.25`), which needs `10.43.250.25:1025` in the platform's
+    `egressAllowedDestinations`. Mailpit and its
     egress grant can follow the switch (step 10); until then mail from the new guest fails,
     which `/ready` does not check.
 P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the exclusive image, and
@@ -774,23 +780,25 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
        membership in `$NEW` only, rather than by editing User objects with `kubectl`.
 
        A stack without `tenantAuth.registry` stops the builder (authproto's had none). Setting
-       it in the builder (`config.tenantAuth.registry = { component: "<oci-registry image>" }`;
-       authproto used
-       `ghcr.io/di-framework/oci-registry@sha256:a92bf0b24662149bf3a6256723dd7eb59533090d9385a62b71c2ed2b89e9361a`)
-       is a recorded deviation.
+       it in the builder, immediately before the `tenantAuth.registry` check
+       (`config.tenantAuth.registry ??= { component: "<oci-registry image>" };` authproto used
+       `ghcr.io/di-framework/oci-registry@sha256:a92bf0b24662149bf3a6256723dd7eb59533090d9385a62b71c2ed2b89e9361a`),
+       is a recorded deviation. It gives **every** tenant a registry (`identity` and `acme` too),
+       and item 6 then restarts their `tenant-controller`s.
 
        **The tenant-auth image.** Step 8 pushes through `$NEW`'s `tenant-controller`, which must
-       serve the registry front (`TENANT_CONTROLLER_REGISTRY_FRONT_PORT`, 8790). Images older
-       than `@di-framework/platform` 6.0.13's pin do not. They cannot be upgraded during the
-       freeze: `Controller.start` awaits `discover(issuer)` before it opens any listener
-       (platform#225), so with the issuer frozen a restarted controller serves neither pushes
-       nor pulls. Check the files' image, and if it is older, set the pin in both files now:
+       serve the registry front (`TENANT_CONTROLLER_REGISTRY_FRONT_PORT`, 8790). Images without
+       the front do not, e.g. authproto's `tenant-auth@sha256:48a431cc…`; item 6d is the test.
+       Such an image cannot be upgraded during the freeze: `Controller.start` awaits
+       `discover(issuer)` before it opens any listener (platform#225), so with the issuer frozen
+       a restarted controller serves neither pushes nor pulls. Set `@di-framework/platform`
+       6.0.13's pin in both files now (a no-op where it is already set):
        ```sh
        TENANT_AUTH_IMAGE=ghcr.io/di-framework/tenant-auth@sha256:5b8c89887ef5bb91603bdd74148e76a1982e1c9d09413c4cc529756908ef149b   # platform 6.0.13
-       jq -r '.tenantAuth.image' "$OUT/platform.json" "$OUT/platform-alias.json"
-       for f in platform.json platform-alias.json; do   # only if the image above is older than the pin
+       for f in platform.json platform-alias.json; do
+         [ "$(jq -r '.tenantAuth.image' "$OUT/$f")" = "$TENANT_AUTH_IMAGE" ] && { echo "$f: tenant-auth pin ok"; continue; }
          (umask 077 && jq --arg image "$TENANT_AUTH_IMAGE" '.tenantAuth.image = $image' "$OUT/$f" > "$OUT/$f.new" \
-           && mv "$OUT/$f.new" "$OUT/$f") || echo "STOP: cannot update $f"
+           && mv "$OUT/$f.new" "$OUT/$f") && echo "$f: tenant-auth set to the pin" || echo "STOP: cannot update $f"
        done
        ```
        The upgrade (item 6) then restarts every tenant's `tenant-controller` and
@@ -1081,9 +1089,10 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
    `0 without a header; .di-encfs KCV matches: true; plaintext needles found: 0`. A failed import
    removes `$OUT/data` again, so it can simply be re-run. The runner was built in P0; if it is
    missing, the import builds it with the first `cargo` on `PATH`, which must be rustup's (P0).
-6. **Rehearse.** If P1 found no `SMTP_HOST` row, first add the relay chosen there to the
-   values (a recorded deviation; the import does not read SMTP settings, so no re-import):
-   `(umask 077 && jq '.SMTP_HOST = "10.43.250.25"' "$OUT/export/values.json" > "$OUT/values.new" && mv "$OUT/values.new" "$OUT/export/values.json")`.
+6. **Rehearse.** If P1 found no `SMTP_HOST` row, first add the relay recorded there
+   (`$SMTP_RELAY_HOST`) to the values (a recorded deviation; the import does not read SMTP
+   settings, so no re-import):
+   `(umask 077 && [ -n "$SMTP_RELAY_HOST" ] && jq --arg host "$SMTP_RELAY_HOST" '.SMTP_HOST = $host' "$OUT/export/values.json" > "$OUT/values.new" && mv "$OUT/values.new" "$OUT/export/values.json") || echo 'STOP: cannot add SMTP_HOST'`.
    Then
    `bun deploy/cutover/rehearse.ts --data "$OUT/data" --values "$OUT/export/values.json" --export "$OUT/export"`.
    Every line must be `ok` or `note`, including `bootstrap not reconciled` and
@@ -1231,10 +1240,21 @@ P2. **Upgrade the platform: declare `$NEW`, switch every tenant host to the excl
    recommended. That registry is plain HTTP and takes unauthenticated pushes, so anything that
    reaches it in the cluster could replace the identity provider's component. It would also
    tie the new guest to an allowlist entry that exists only for the old guest and `acme`, and
-   it is not the path proven on pgprove. It is the recorded fallback if `$NEW`'s registry or
-   its front (P2 item 6d) cannot take the push: authproto used it, and its 6.0.13 tenant hosts
-   pulled from it because `insecureRegistries` lists it. Afterwards, once the issuer serves
-   again, upgrade `tenantAuth.image` (P2 item 3), re-push into `$NEW`'s registry and redeploy.
+   it is not the path proven on pgprove. Use it only as a recorded decision if `$NEW`'s
+   registry cannot be made Ready or cannot take the push, decided by the coordinator at that
+   moment. authproto is the precedent: its 6.0.13 tenant hosts pulled from it because
+   `insecureRegistries` lists it. On this path item 3 runs with `deploy.sh`'s registry defaults
+   and no push key or wrapper, and item 3's image check is replaced by this one:
+   ```sh
+   kubectl --kubeconfig "$KC" -n wasmcloud port-forward svc/examples-registry 25001:5000 &
+   PF=$!
+   IDENTITY_AUTHPROTO_CUTOVER="authproto/$NEW" deploy/guest/deploy.sh authproto "$NEW" "$OUT/export/values.json" \
+     || echo 'STOP: the deploy failed'
+   image="$(kubectl --kubeconfig "$KC" -n "di-tenant-$NEW" get workloaddeployment identity -o jsonpath='{.spec.template.spec.components[*].image}')"
+   case "$image" in "examples-registry.wasmcloud.svc.cluster.local:5000/identity"[:@]*) echo "image ok: $image" ;; *) echo "STOP: image '$image'" ;; esac
+   ```
+   Afterwards, once the issuer serves again, fix what stopped the push (on authproto, the
+   tenant-auth image), re-push into `$NEW`'s registry and redeploy.
 9. **Verify on the tenant host** (`Host: identity.$NEW.localhost`):
    `bun apps/guest/scripts/live-check.ts --values "$OUT/export/values.json" --url "$GW" --host identity.$NEW.localhost --read-only`.
    With `--read-only` and no `--slug` it reads the bootstrap organization, which bootstrap
