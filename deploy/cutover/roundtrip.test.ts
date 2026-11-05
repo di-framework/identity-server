@@ -577,6 +577,24 @@ test('non-default bootstrap identity rows are carried and the new guest does not
     for (const value of [...Object.values(identity), ...Object.values(values)]) {
       if (value.length > 4) expect(printed).not.toContain(value);
     }
+
+    // An import without the source's fingerprint fails the bootstrap check by name.
+    await db.run("DELETE FROM identity_runtime_secret WHERE name = 'bootstrap_fingerprint'");
+    const unimported = await withContainer(async () => {
+      try {
+        resetGuest();
+        useContainer().register(BootstrapReconciler);
+        useContainer().register(Readiness);
+        return await rehearseChecks(db, runtime, loaded, { databaseRoot: root });
+      } finally {
+        await restoreContainer();
+      }
+    });
+    expect(unimported.find((result) => result.name === 'bootstrap not reconciled')).toEqual({
+      name: 'bootstrap not reconciled',
+      status: 'fail',
+      detail: 'no fingerprint was imported',
+    });
   } finally {
     await fixture.shutdown();
   }

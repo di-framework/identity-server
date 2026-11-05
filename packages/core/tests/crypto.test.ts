@@ -225,6 +225,9 @@ describe('signing keys', () => {
       [{ ...akp, pub: 7 }, 'ML-DSA-65', '', 'must be 1952 bytes'],
       [{ ...akp, priv: undefined }, 'ML-DSA-65', '', '32-byte private seed'],
       [{ ...akp, pub: akpPrivateJwk('other').pub }, 'ML-DSA-65', '', 'public key does not match'],
+      [{ ...rsa, e: '' }, 'RS256', '', 'Active private JWK is malformed'],
+      [{ ...rsa, n: 7 }, 'RS256', '', 'Active private JWK is malformed'],
+      [{ ...rsa, n: rsaPrivateJwk('rsa-2').n }, 'RS256', '', 'public key does not match'],
       [rsa, 'RS256', '{', 'Previous public JWK set is not valid JSON'],
       [rsa, 'RS256', '{"keys":{}}', 'must contain a keys array'],
       [rsa, 'RS256', '{"keys":[7]}', 'Previous public JWK must be an object'],
@@ -243,6 +246,23 @@ describe('signing keys', () => {
       expect((error as Error).message).toContain(message);
       expect((error as Error).message).not.toContain(String(rsa.d));
     }
+  });
+
+  test('a native RSA signer whose signatures do not verify is refused at load', () => {
+    // The guest has no native RSA and a host's could be linked to a different OpenSSL; a signer
+    // that cannot reproduce the JWK's public half must not sign tokens.
+    const runtime = process as unknown as { getBuiltinModule: (id: string) => unknown };
+    const original = runtime.getBuiltinModule;
+    runtime.getBuiltinModule = (id: string) =>
+      id === 'node:crypto'
+        ? { createPrivateKey: () => ({}), sign: () => Buffer.alloc(256) }
+        : original.call(process, id);
+    try {
+      expect(() => load(rsa)).toThrow('public key does not match');
+    } finally {
+      runtime.getBuiltinModule = original;
+    }
+    expect(load(rsa).sign({ sub: 'u' })).toMatch(/^[\w-]+\.[\w-]+\.[\w-]+$/);
   });
 
   test('verification rejects malformed, foreign, and unsigned tokens', () => {
@@ -270,5 +290,9 @@ describe('signing keys', () => {
     expect(() => verifyJws(nullClaims, [], ['RS256'])).toThrow('Invalid token signature');
     const primitive = `${Buffer.from('7').toString('base64url')}.${claims}.x`;
     expect(() => verifyJws(primitive, [], ['RS256'])).toThrow('Malformed token');
+    const akpToken = load(akp, 'ML-DSA-65').sign({ sub: 'u' });
+    expect(() =>
+      verifyJws(akpToken, [{ kty: 'AKP', kid: 'akp-1', pub: 'not base64url' }], ['ML-DSA-65']),
+    ).toThrow('Invalid token signature');
   });
 });

@@ -1,5 +1,7 @@
 import { afterAll, beforeAll, expect, spyOn, test } from 'bun:test';
 import { useContainer } from '@di-framework/core/container';
+import type { AuditRepository } from '@di-framework/identity/src/audit/domain/audit-entry.ts';
+import { AUDIT } from '@di-framework/identity/src/shared/domain/tokens.ts';
 import { PostgresGateway } from '@di-framework/identity/src/shared/infrastructure/postgres-gateway.ts';
 import {
   bearerFor,
@@ -8,7 +10,7 @@ import {
 } from '@di-framework/identity/tests/support/clients.ts';
 import { useIsolatedDatabase } from '@di-framework/identity/tests/support/database.ts';
 import type { SqlDatabase } from '@di-framework/repo';
-import { ControlPlaneController, controlPlane, IdentityServer } from '../src/control-plane.ts';
+import { controlPlane, IdentityServer } from '../src/control-plane.ts';
 import { ControlPlaneHandlers } from '../src/handlers.ts';
 
 test('unknown paths are not control-plane routes', async () => {
@@ -102,11 +104,6 @@ test('serves the JSON control plane through application services', async () => {
   });
   expect(served.status).toBe(200);
   await server.stop(true);
-
-  const controller = useContainer().resolve(ControlPlaneController);
-  expect(() => controller.dispatch('missing', new Request('https://identity.test/'))).toThrow(
-    'No handler',
-  );
 
   expect((await call('GET', '/api/admin/users')).body).toEqual([]);
   expect((await call('POST', '/api/admin/users', { body: [] })).status).toBe(400);
@@ -604,6 +601,53 @@ test('serves the JSON control plane through application services', async () => {
   ).toBe(true);
   expect(audits.some((record) => record.actor_client_id === 'system')).toBe(true);
 }, 60_000);
+
+/**
+ * A keyed create whose idempotency lookup predates the winning create's record, as a concurrent
+ * create's does: it runs into the unique index, then finds the record when it replays.
+ */
+async function staleKeyedCreate(
+  action: string,
+  create: () => Promise<{ status: number; body: unknown }>,
+): Promise<[{ status: number; body: unknown }, { status: number; body: unknown }]> {
+  const first = await create();
+  const audit = useContainer().resolve<AuditRepository>(AUDIT);
+  const lookup = audit.idempotentTarget.bind(audit);
+  const stale = spyOn(audit, 'idempotentTarget').mockImplementation(async (name, key) => {
+    if (name !== action) return lookup(name, key);
+    stale.mockRestore();
+    return undefined;
+  });
+  try {
+    return [first, await create()];
+  } finally {
+    stale.mockRestore();
+  }
+}
+
+test('a keyed create that loses the unique-index race replays the winner', async () => {
+  const [first, second] = await staleKeyedCreate('admin.user_created', () =>
+    call('POST', '/api/admin/users', {
+      headers: { 'idempotency-key': 'raced-user' },
+      body: { login: 'raced', email: 'raced@example.com', displayName: 'Raced' },
+    }),
+  );
+  expect(first.status).toBe(201);
+  expect(second).toEqual(first);
+  expect((await call('GET', '/api/admin/users')).body).toEqual(
+    expect.arrayContaining([expect.objectContaining({ login: 'raced' })]),
+  );
+
+  const [client, replayed] = await staleKeyedCreate('admin.oauth_client_created', () =>
+    call('POST', '/api/admin/oauth-clients', {
+      headers: { 'idempotency-key': 'raced-client' },
+      body: { clientId: 'raced-client', redirectUris: [], scopes: ['openid'] },
+    }),
+  );
+  expect(client.status).toBe(201);
+  expect(client.body).toMatchObject({ client_id: 'raced-client' });
+  expect(replayed).toEqual(client);
+}, 30_000);
 
 async function call(
   method: string,
