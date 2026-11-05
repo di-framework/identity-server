@@ -19,13 +19,15 @@ interface Row {
   scopes: string;
   client_settings: string;
   organization_slug: string | null;
+  audiences: string | null;
   revoked_at: unknown;
   created_at: unknown;
 }
 
 const SELECT = `SELECT c.id, c.client_id, c.client_name, c.client_secret, c.client_authentication_methods,
          c.authorization_grant_types, c.redirect_uris, c.scopes, c.client_settings,
-         l.organization_slug, l.revoked_at, COALESCE(l.created_at, c.client_id_issued_at) AS created_at
+         l.organization_slug, l.audiences, l.revoked_at,
+         COALESCE(l.created_at, c.client_id_issued_at) AS created_at
   FROM oauth2_registered_client c
   LEFT JOIN oauth_client_lifecycle l ON l.client_id = c.client_id`;
 
@@ -102,8 +104,8 @@ export class PostgresRegisteredClientRepository implements RegisteredClientRepos
          ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          RETURNING client_id
        )
-       INSERT INTO oauth_client_lifecycle (client_id, organization_slug)
-       SELECT client_id, ?::varchar FROM registered`,
+       INSERT INTO oauth_client_lifecycle (client_id, organization_slug, audiences)
+       SELECT client_id, ?::varchar, ?::varchar FROM registered`,
       [
         crypto.randomUUID(),
         client.clientId,
@@ -116,6 +118,7 @@ export class PostgresRegisteredClientRepository implements RegisteredClientRepos
         ClientColumns.settings(client.settings),
         ClientColumns.tokenSettings(),
         client.organizationSlug,
+        ClientColumns.list(client.audiences ?? []),
       ],
     );
   }
@@ -151,10 +154,20 @@ export class PostgresRegisteredClientRepository implements RegisteredClientRepos
         params: [...params, clientId],
       });
     }
+    const lifecycle: string[] = [];
+    const lifecycleParams: unknown[] = [];
     if (changes.organizationSlug !== undefined) {
+      lifecycle.push('organization_slug = ?');
+      lifecycleParams.push(changes.organizationSlug);
+    }
+    if (changes.audiences !== undefined) {
+      lifecycle.push('audiences = ?');
+      lifecycleParams.push(ClientColumns.list(changes.audiences));
+    }
+    if (lifecycle.length > 0) {
       statements.push({
-        sql: `UPDATE oauth_client_lifecycle SET organization_slug = ? WHERE client_id = ?`,
-        params: [changes.organizationSlug, clientId],
+        sql: `UPDATE oauth_client_lifecycle SET ${lifecycle.join(', ')} WHERE client_id = ?`,
+        params: [...lifecycleParams, clientId],
       });
     }
     const [first, second] = statements;
@@ -191,6 +204,7 @@ export class PostgresRegisteredClientRepository implements RegisteredClientRepos
       scopes: ClientColumns.parse(row.scopes),
       settings: ClientColumns.readSettings(row.client_settings),
       organizationSlug: row.organization_slug,
+      audiences: ClientColumns.parse(row.audiences),
       revokedAt: row.revoked_at == null ? null : Timestamps.ms(row.revoked_at),
       createdAt: Timestamps.ms(row.created_at),
     };

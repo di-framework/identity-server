@@ -10,8 +10,27 @@ import { Membership, OAuthClient, Organization, User } from '@di-framework/ident
 const org = new Organization('acme', { slug: 'acme', name: 'Acme' });
 const ada = new User('ada', { login: 'ada', email: 'ada@example.com', displayName: 'Ada' });
 new Membership('ada-acme', { organizationSlug: org.slug, userId: ada.userId, role: 'owner' });
-new OAuthClient('portal', { clientId: 'portal', organizationSlug: 'acme', scopes: ['openid'] });
+new OAuthClient('portal', {
+  clientId: 'portal',
+  organizationSlug: 'acme',
+  redirectUris: ['https://portal.acme.example/callback'],
+  scopes: ['openid'],
+  audiences: ['https://api.acme.example'],
+  browser: true,
+});
+new OAuthClient('acme-cli', {
+  clientId: 'acme-cli',
+  organizationSlug: 'acme',
+  redirectUris: ['http://127.0.0.1/callback'],
+  scopes: ['openid'],
+  tokenEndpointAuthMethod: 'none',
+});
 ```
+
+An `OAuthClient` belongs to an organization (`organizationSlug` is required). `audiences` are the
+token `aud` values its tokens carry (the client id alone when empty). `tokenEndpointAuthMethod`
+`none` registers a public PKCE client on loopback redirects with no secret; changing the method
+replaces the client. See `docs/admin-oauth-clients.md`.
 
 Configuration:
 
@@ -32,7 +51,8 @@ Behavior matches `pulumi-provider-gas`:
   408, 429, 500, 502, 503, and 504.
 - Deleting a user archives it; deleting a client revokes it; delete treats 404 and 410 as done.
 - Client secrets are write-only on the server: an imported client has no `clientSecret` until
-  `secretRotationVersion` changes.
+  `secretRotationVersion` changes. A public client never has one, and its
+  `secretRotationVersion` does nothing.
 
 Dynamic providers run in Pulumi's Node language host. Pulumi serializes the provider with the
 TypeScript compiler API, which TypeScript 7 no longer exposes, so this package depends on

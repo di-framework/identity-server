@@ -53,7 +53,8 @@ export function writeOpenApiSpec(path = openApiSpecFile): string {
     },
   };
   mkdirSync(dirname(path), { recursive: true });
-  writeFileSync(path, YAML.stringify(JSON.parse(JSON.stringify(document))));
+  // Block style: `oas-normalize` (generate:types) reads a document that starts with `{` as JSON.
+  writeFileSync(path, YAML.stringify(JSON.parse(JSON.stringify(document)), null, 2));
   return path;
 }
 

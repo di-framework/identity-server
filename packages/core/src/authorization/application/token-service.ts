@@ -13,6 +13,7 @@ import {
 import { Hashing } from '../../shared/infrastructure/crypto/hashing.ts';
 import type { SigningKeys } from '../../shared/infrastructure/crypto/signing-keys.ts';
 import type { IdentitySettings } from '../../shared/infrastructure/identity-settings.ts';
+import { idTokenAudience } from '../domain/audience.ts';
 import {
   type Authorization,
   type AuthorizationRepository,
@@ -272,7 +273,7 @@ export class TokenService {
       const claims: Record<string, unknown> = {
         iss: this.settings.issuer,
         sub: authorization.principalName,
-        aud: [client.clientId],
+        aud: idTokenAudience(client),
         azp: client.clientId,
         iat: issuedAt,
         exp: issuedAt + ID_TOKEN_TTL_SECONDS,

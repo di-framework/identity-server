@@ -232,17 +232,23 @@ export interface components {
             role?: string;
         };
         UpdateOAuthClientRequest: {
-            organizationSlug?: string;
+            organizationSlug: string;
             redirectUris?: string[];
             scopes?: string[];
+            audiences?: string[];
             browser?: boolean;
+            /** @enum {string} */
+            tokenEndpointAuthMethod?: "client_secret_basic" | "none";
         };
         OAuthClientResponse: {
             client_id?: string;
             organization_slug?: string;
             redirect_uris?: string[];
             scopes?: string[];
+            audiences?: string[];
             browser?: boolean;
+            /** @enum {string} */
+            token_endpoint_auth_method?: "client_secret_basic" | "none";
             /** Format: date-time */
             revoked_at?: string;
             /** Format: date-time */
@@ -266,14 +272,17 @@ export interface components {
             slug?: string;
         };
         CreateOAuthClientRequest: {
-            clientId?: string;
-            organizationSlug?: string;
+            clientId: string;
+            organizationSlug: string;
             redirectUris?: string[];
             scopes?: string[];
+            audiences?: string[];
             browser?: boolean;
+            /** @enum {string} */
+            tokenEndpointAuthMethod?: "client_secret_basic" | "none";
         };
         OAuthClientSecretResponse: {
-            client_id?: string;
+            client_id: string;
             client_secret?: string;
         };
         RotateOAuthClientSecretRequest: {
@@ -573,7 +582,10 @@ export interface operations {
                         organization_slug?: string;
                         redirect_uris?: string[];
                         scopes?: string[];
+                        audiences?: string[];
                         browser?: boolean;
+                        /** @enum {string} */
+                        token_endpoint_auth_method?: "client_secret_basic" | "none";
                         /** Format: date-time */
                         revoked_at?: string;
                         /** Format: date-time */
@@ -595,11 +607,14 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": {
-                    clientId?: string;
-                    organizationSlug?: string;
+                    clientId: string;
+                    organizationSlug: string;
                     redirectUris?: string[];
                     scopes?: string[];
+                    audiences?: string[];
                     browser?: boolean;
+                    /** @enum {string} */
+                    tokenEndpointAuthMethod?: "client_secret_basic" | "none";
                 };
             };
         };
@@ -611,7 +626,7 @@ export interface operations {
                 };
                 content: {
                     "application/json": {
-                        client_id?: string;
+                        client_id: string;
                         client_secret?: string;
                     };
                 };
@@ -924,7 +939,10 @@ export interface operations {
                         organization_slug?: string;
                         redirect_uris?: string[];
                         scopes?: string[];
+                        audiences?: string[];
                         browser?: boolean;
+                        /** @enum {string} */
+                        token_endpoint_auth_method?: "client_secret_basic" | "none";
                         /** Format: date-time */
                         revoked_at?: string;
                         /** Format: date-time */
@@ -948,10 +966,13 @@ export interface operations {
         requestBody: {
             content: {
                 "application/json": {
-                    organizationSlug?: string;
+                    organizationSlug: string;
                     redirectUris?: string[];
                     scopes?: string[];
+                    audiences?: string[];
                     browser?: boolean;
+                    /** @enum {string} */
+                    tokenEndpointAuthMethod?: "client_secret_basic" | "none";
                 };
             };
         };
@@ -967,7 +988,10 @@ export interface operations {
                         organization_slug?: string;
                         redirect_uris?: string[];
                         scopes?: string[];
+                        audiences?: string[];
                         browser?: boolean;
+                        /** @enum {string} */
+                        token_endpoint_auth_method?: "client_secret_basic" | "none";
                         /** Format: date-time */
                         revoked_at?: string;
                         /** Format: date-time */
@@ -1025,7 +1049,7 @@ export interface operations {
                 };
                 content: {
                     "application/json": {
-                        client_id?: string;
+                        client_id: string;
                         client_secret?: string;
                     };
                 };

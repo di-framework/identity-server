@@ -282,7 +282,7 @@ serves, so it owns the tables and could undo the latch. The pglite guest has no 
 | `/health`, `/ready` | Liveness (`{"ok":true}`) and readiness (database, signing key, SMTP, bootstrap; 503 when any fails). |
 | `/.well-known/openid-configuration`, `/.well-known/oauth-authorization-server`, `/oauth2/jwks` | Discovery and public keys. |
 | `/oauth2/authorize`, `/oauth2/consent`, `/oauth2/token`, `/oauth2/introspect`, `/oauth2/revoke`, `/userinfo` | Authorization server. |
-| `/api/admin/**` | Admin API; opaque bearer token with `admin:read` (reads) or `admin:write` (writes). |
+| `/api/admin/**` | Admin API; opaque bearer token with `admin:read` (reads) or `admin:write` (writes). OAuth clients: [admin-oauth-clients.md](admin-oauth-clients.md). |
 | `/api/v1/organizations/{slug}/members` | Directory API; `directory:read`. |
 | `/api/v1/account/identity-links` | Account API; the browser session or a user bearer token. |
 | `/login`, `/passwordless`, `/account/**`, `/admin/**` | Browser pages. |

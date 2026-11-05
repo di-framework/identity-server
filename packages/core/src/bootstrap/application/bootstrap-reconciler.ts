@@ -1,4 +1,5 @@
 import { Component, Container } from '@di-framework/core/decorators';
+import { isLoopbackRedirect } from '../../authorization/domain/loopback.ts';
 import type { RegisteredClientRepository } from '../../authorization/domain/models.ts';
 import type { DirectoryRepository } from '../../directory/domain/directory-repository.ts';
 import { DIRECTORY, IDENTITY_SETTINGS, REGISTERED_CLIENTS } from '../../shared/domain/tokens.ts';
@@ -93,7 +94,7 @@ export class BootstrapReconciler {
       require(!duplicate, 'CLI client id must differ from the other bootstrap clients');
       require(clients.cli.redirectUris.length > 0, 'CLI client redirect URIs are required');
       for (const uri of clients.cli.redirectUris)
-        require(loopbackOnly(uri), 'CLI client redirect URIs must be loopback http URIs');
+        require(isLoopbackRedirect(uri), 'CLI client redirect URIs must be loopback http URIs');
     }
 
     // Atomic on a pooled server. On a database that runs every statement on its own, a run that
@@ -262,16 +263,6 @@ export class BootstrapReconciler {
 
 function require(condition: boolean, message: string): void {
   if (!condition) throw new BootstrapError(message);
-}
-
-/** The loopback redirect a native client registers; the port is matched at authorize time. */
-function loopbackOnly(uri: string): boolean {
-  try {
-    const url = new URL(uri);
-    return url.protocol === 'http:' && (url.hostname === '127.0.0.1' || url.hostname === '[::1]');
-  } catch {
-    return false;
-  }
 }
 
 /** `java.net.URI.isAbsolute` with no fragment: a scheme is present and there is no `#`. */

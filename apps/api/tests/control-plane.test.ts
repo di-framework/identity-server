@@ -453,12 +453,16 @@ test('serves the JSON control plane through application services', async () => {
   );
   expect((await call('DELETE', '/api/admin/organizations/acme')).status).toBe(409);
   expect(
-    (await call('POST', '/api/admin/oauth-clients', { body: { clientId: 'machine' } })).status,
+    (
+      await call('POST', '/api/admin/oauth-clients', {
+        body: { clientId: 'machine', organizationSlug: 'acme' },
+      })
+    ).status,
   ).toBe(409);
   expect(
     (
       await call('POST', '/api/admin/oauth-clients', {
-        body: { clientId: 'browser', browser: true },
+        body: { clientId: 'browser', organizationSlug: 'globex', browser: true },
       })
     ).status,
   ).toBe(400);
@@ -480,6 +484,7 @@ test('serves the JSON control plane through application services', async () => {
     headers: { 'idempotency-key': 'client-key' },
     body: {
       clientId: 'browser',
+      organizationSlug: 'globex',
       browser: true,
       redirectUris: ['https://app.example/callback', 1],
       scopes: ['openid'],
@@ -492,6 +497,7 @@ test('serves the JSON control plane through application services', async () => {
         headers: { 'idempotency-key': 'client-key' },
         body: {
           clientId: 'browser',
+          organizationSlug: 'globex',
           browser: true,
           redirectUris: ['https://app.example/callback'],
           scopes: ['openid'],
@@ -505,6 +511,7 @@ test('serves the JSON control plane through application services', async () => {
         headers: { 'idempotency-key': 'client-key' },
         body: {
           clientId: 'browser',
+          organizationSlug: 'globex',
           browser: true,
           redirectUris: ['https://app.example/callback'],
           scopes: ['openid', 'profile'],
@@ -521,14 +528,18 @@ test('serves the JSON control plane through application services', async () => {
     (
       await call('POST', '/api/admin/oauth-clients', {
         headers: { 'idempotency-key': 'client-missing' },
-        body: { clientId: 'fresh' },
+        body: { clientId: 'fresh', organizationSlug: 'globex' },
       })
     ).status,
   ).toBe(201);
   expect((await call('GET', '/api/admin/oauth-clients/missing')).status).toBe(404);
   expect((await call('POST', '/api/admin/oauth-clients', { body: {} })).status).toBe(400);
   expect(
-    (await call('PUT', '/api/admin/oauth-clients/browser', { body: { browser: true } })).status,
+    (
+      await call('PUT', '/api/admin/oauth-clients/browser', {
+        body: { organizationSlug: 'globex', browser: true },
+      })
+    ).status,
   ).toBe(400);
   expect(
     (
@@ -543,7 +554,11 @@ test('serves the JSON control plane through application services', async () => {
   expect(
     (
       await call('PUT', '/api/admin/oauth-clients/browser', {
-        body: { redirectUris: ['https://app.example/cb'], scopes: ['openid'] },
+        body: {
+          organizationSlug: 'globex',
+          redirectUris: ['https://app.example/cb'],
+          scopes: ['openid'],
+        },
       })
     ).status,
   ).toBe(200);
@@ -578,7 +593,11 @@ test('serves the JSON control plane through application services', async () => {
   expect((await call('DELETE', '/api/admin/oauth-clients/machine')).status).toBe(204);
   expect((await call('DELETE', '/api/admin/oauth-clients/machine')).status).toBe(204);
   expect(
-    (await call('PUT', '/api/admin/oauth-clients/machine', { body: { scopes: ['a'] } })).status,
+    (
+      await call('PUT', '/api/admin/oauth-clients/machine', {
+        body: { organizationSlug: 'acme', scopes: ['a'] },
+      })
+    ).status,
   ).toBe(409);
   expect(
     (
@@ -641,7 +660,12 @@ test('a keyed create that loses the unique-index race replays the winner', async
   const [client, replayed] = await staleKeyedCreate('admin.oauth_client_created', () =>
     call('POST', '/api/admin/oauth-clients', {
       headers: { 'idempotency-key': 'raced-client' },
-      body: { clientId: 'raced-client', redirectUris: [], scopes: ['openid'] },
+      body: {
+        clientId: 'raced-client',
+        organizationSlug: 'acme',
+        redirectUris: [],
+        scopes: ['openid'],
+      },
     }),
   );
   expect(client.status).toBe(201);
