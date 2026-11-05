@@ -27,6 +27,8 @@ export interface RegisteredClient {
   scopes: string[];
   settings: ClientSettings;
   organizationSlug: string | null;
+  /** Token audiences from the lifecycle row; empty means the client id is the only audience. */
+  audiences: string[];
   revokedAt: number | null;
   createdAt: number;
 }
@@ -101,6 +103,8 @@ export interface NewRegisteredClient {
   scopes: string[];
   settings: ClientSettings;
   organizationSlug: string | null;
+  /** Token audiences; omitted or empty leaves the client id as the only audience. */
+  audiences?: string[];
 }
 
 export interface RegisteredClientRepository {

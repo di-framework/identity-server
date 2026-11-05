@@ -36,11 +36,19 @@ export type MembershipOutputs = MembershipInputs;
 
 export interface OAuthClientInputs extends ResourceInputs {
   clientId: string;
-  organizationSlug?: string;
+  /** The tenant the client belongs to; every admin-registered client has one. */
+  organizationSlug: string;
   redirectUris?: string[];
   scopes?: string[];
+  /** Token `aud` values; empty means tokens carry the client id alone. */
+  audiences?: string[];
   browser?: boolean;
-  /** Changing this value rotates the client secret. */
+  /**
+   * `client_secret_basic` (the default) registers a confidential client with a secret; `none` a
+   * public PKCE client on loopback redirects with no secret. Changing it replaces the client.
+   */
+  tokenEndpointAuthMethod?: 'client_secret_basic' | 'none';
+  /** Changing this value rotates the client secret. Ignored for a public client. */
   secretRotationVersion?: string;
 }
 export interface OAuthClientOutputs extends OAuthClientInputs {
@@ -88,14 +96,42 @@ function key(inputs: ResourceInputs): string {
   return inputs.idempotencyKey;
 }
 
+function isPublic(inputs: OAuthClientInputs): boolean {
+  return inputs.tokenEndpointAuthMethod === 'none';
+}
+
 /**
  * A new, non-empty `secretRotationVersion` rotates the secret. Clearing it is not a rotation: the
- * server refuses an empty version, and the current secret stays valid.
+ * server refuses an empty version, and the current secret stays valid. A public client has no
+ * secret, so the version never rotates anything.
  */
 function rotates(olds: OAuthClientInputs, news: OAuthClientInputs): boolean {
   return (
+    !isPublic(news) &&
     Boolean(news.secretRotationVersion) &&
     (olds.secretRotationVersion ?? '') !== news.secretRotationVersion
+  );
+}
+
+/** The `PUT /api/admin/oauth-clients/{clientId}` body, and the metadata part of a create. */
+function clientMetadata(inputs: OAuthClientInputs) {
+  return {
+    organizationSlug: inputs.organizationSlug,
+    redirectUris: inputs.redirectUris ?? [],
+    scopes: inputs.scopes ?? [],
+    audiences: inputs.audiences ?? [],
+    browser: inputs.browser ?? false,
+    tokenEndpointAuthMethod: inputs.tokenEndpointAuthMethod ?? 'client_secret_basic',
+  };
+}
+
+function metadataChanged(olds: OAuthClientInputs, news: OAuthClientInputs): boolean {
+  return (
+    olds.organizationSlug !== news.organizationSlug ||
+    !sameSet(olds.redirectUris, news.redirectUris) ||
+    !sameSet(olds.scopes, news.scopes) ||
+    !sameSet(olds.audiences, news.audiences) ||
+    Boolean(olds.browser) !== Boolean(news.browser)
   );
 }
 
@@ -305,13 +341,11 @@ export function gasProviders(transport?: HttpFetch, retry?: RetryOptions) {
     async diff(_id, olds, news) {
       return diff([
         [olds.clientId !== news.clientId, 'clientId', true],
-        [
-          (olds.organizationSlug ?? '') !== (news.organizationSlug ?? ''),
-          'organizationSlug',
-          false,
-        ],
+        [isPublic(olds) !== isPublic(news), 'tokenEndpointAuthMethod', true],
+        [olds.organizationSlug !== news.organizationSlug, 'organizationSlug', false],
         [!sameSet(olds.redirectUris, news.redirectUris), 'redirectUris', false],
         [!sameSet(olds.scopes, news.scopes), 'scopes', false],
+        [!sameSet(olds.audiences, news.audiences), 'audiences', false],
         [Boolean(olds.browser) !== Boolean(news.browser), 'browser', false],
         [rotates(olds, news), 'secretRotationVersion', false],
       ]);
@@ -319,19 +353,15 @@ export function gasProviders(transport?: HttpFetch, retry?: RetryOptions) {
     async create(inputs) {
       const { response, data } = await api(inputs.connection).POST('/api/admin/oauth-clients', {
         params: { header: { 'Idempotency-Key': key(inputs) } },
-        body: {
-          clientId: inputs.clientId,
-          ...(inputs.organizationSlug ? { organizationSlug: inputs.organizationSlug } : {}),
-          redirectUris: inputs.redirectUris ?? [],
-          scopes: inputs.scopes ?? [],
-          browser: inputs.browser ?? false,
-        },
+        body: { clientId: inputs.clientId, ...clientMetadata(inputs) },
       });
       if (response.status !== 201) throw unexpectedStatus('create OAuth client', response);
-      if (!data?.client_id || !data.client_secret) {
+      if (!data?.client_id || (!isPublic(inputs) && !data.client_secret)) {
         throw new ProviderError('create OAuth client: response omitted client ID or secret');
       }
-      return { id: data.client_id, outs: { ...inputs, clientSecret: data.client_secret } };
+      const outs: OAuthClientOutputs = { ...inputs };
+      if (data.client_secret) outs.clientSecret = data.client_secret;
+      return { id: data.client_id, outs };
     },
     async read(id, props) {
       const { response, data } = await api(props.connection).GET(
@@ -351,27 +381,20 @@ export function gasProviders(transport?: HttpFetch, retry?: RetryOptions) {
           organizationSlug: data.organization_slug ?? '',
           redirectUris: data.redirect_uris ?? [],
           scopes: data.scopes ?? [],
+          audiences: data.audiences ?? [],
           browser: data.browser ?? false,
+          tokenEndpointAuthMethod: data.token_endpoint_auth_method ?? 'client_secret_basic',
         },
       };
     },
     async update(id, olds, news) {
-      const outs: OAuthClientOutputs = { ...news, clientSecret: olds.clientSecret };
-      const metadataChanged =
-        (olds.organizationSlug ?? '') !== (news.organizationSlug ?? '') ||
-        !sameSet(olds.redirectUris, news.redirectUris) ||
-        !sameSet(olds.scopes, news.scopes) ||
-        Boolean(olds.browser) !== Boolean(news.browser);
+      const outs: OAuthClientOutputs = { ...news };
+      if (olds.clientSecret) outs.clientSecret = olds.clientSecret;
       const client = api(news.connection);
-      if (metadataChanged) {
+      if (metadataChanged(olds, news)) {
         const { response } = await client.PUT('/api/admin/oauth-clients/{clientId}', {
           params: { path: { clientId: id }, header: { 'Idempotency-Key': key(news) } },
-          body: {
-            ...(news.organizationSlug ? { organizationSlug: news.organizationSlug } : {}),
-            redirectUris: news.redirectUris ?? [],
-            scopes: news.scopes ?? [],
-            browser: news.browser ?? false,
-          },
+          body: clientMetadata(news),
         });
         if (response.status !== 200)
           throw unexpectedStatus('update OAuth client metadata', response);

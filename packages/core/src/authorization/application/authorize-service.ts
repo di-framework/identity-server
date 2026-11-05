@@ -2,6 +2,7 @@ import { Component, Container } from '@di-framework/core/decorators';
 import type { Clock } from '../../shared/domain/clock.ts';
 import { AUTHORIZATIONS, CLOCK, REGISTERED_CLIENTS } from '../../shared/domain/tokens.ts';
 import { Hashing } from '../../shared/infrastructure/crypto/hashing.ts';
+import { parseLoopback } from '../domain/loopback.ts';
 import {
   type Authorization,
   type AuthorizationRepository,
@@ -214,19 +215,6 @@ export class AuthorizeService {
     });
     return registered ? requested : undefined;
   }
-}
-
-/** Host and path of an `http` URI on a loopback address, ignoring its port. */
-function parseLoopback(uri: string): { host: string; path: string } | undefined {
-  let url: URL;
-  try {
-    url = new URL(uri);
-  } catch {
-    return undefined;
-  }
-  if (url.protocol !== 'http:') return undefined;
-  if (url.hostname !== '127.0.0.1' && url.hostname !== '[::1]') return undefined;
-  return { host: url.hostname, path: `${url.pathname}${url.search}` };
 }
 
 function login(params: URLSearchParams): AuthorizeResult {

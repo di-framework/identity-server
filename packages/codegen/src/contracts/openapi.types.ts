@@ -10,7 +10,9 @@ export interface UpdateOAuthClientRequest {
   organizationSlug?: string;
   redirectUris?: string[];
   scopes?: string[];
+  audiences?: string[];
   browser?: boolean;
+  tokenEndpointAuthMethod?: string;
 }
 
 export interface OAuthClientResponse {
@@ -18,7 +20,9 @@ export interface OAuthClientResponse {
   organization_slug?: string;
   redirect_uris?: string[];
   scopes?: string[];
+  audiences?: string[];
   browser?: boolean;
+  token_endpoint_auth_method?: string;
   revoked_at?: string;
   created_at?: string;
 }
@@ -49,7 +53,9 @@ export interface CreateOAuthClientRequest {
   organizationSlug?: string;
   redirectUris?: string[];
   scopes?: string[];
+  audiences?: string[];
   browser?: boolean;
+  tokenEndpointAuthMethod?: string;
 }
 
 export interface OAuthClientSecretResponse {

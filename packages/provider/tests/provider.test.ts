@@ -180,6 +180,7 @@ describe('resources against the admin API', () => {
       clientId: `gas-client-${t}`,
       organizationSlug: slug,
       scopes: ['openid'],
+      audiences: ['https://api.gas.example'],
     };
     const client = await gas.oauthClient.create(clientInputs);
     expect(client.outs.clientSecret).toMatch(/^[A-Za-z0-9_-]{43}$/);
@@ -190,7 +191,9 @@ describe('resources against the admin API', () => {
       clientSecret: client.outs.clientSecret,
       organizationSlug: slug,
       scopes: ['openid'],
+      audiences: ['https://api.gas.example'],
       browser: false,
+      tokenEndpointAuthMethod: 'client_secret_basic',
     });
     expect(
       await gas.oauthClient.diff(client.id, client.outs, { ...clientInputs, scopes: ['openid'] }),
@@ -205,15 +208,28 @@ describe('resources against the admin API', () => {
       changes: true,
       replaces: ['clientId'],
     });
+    expect(
+      await gas.oauthClient.diff(client.id, client.outs, {
+        ...clientInputs,
+        tokenEndpointAuthMethod: 'none',
+      }),
+    ).toEqual({ changes: true, replaces: ['tokenEndpointAuthMethod'] });
+    expect(
+      await gas.oauthClient.diff(client.id, client.outs, { ...clientInputs, audiences: [] }),
+    ).toEqual({ changes: true, replaces: [] });
     const metadata = await gas.oauthClient.update(client.id, client.outs, {
       ...clientInputs,
       browser: true,
       redirectUris: ['https://gas.example/cb'],
-      organizationSlug: undefined,
+      audiences: ['https://api.gas.example', 'https://other.gas.example'],
     });
     expect(metadata.outs.clientSecret).toBe(client.outs.clientSecret);
     expect(await gas.oauthClient.read(client.id, metadata.outs)).toMatchObject({
-      props: { browser: true, organizationSlug: '' },
+      props: {
+        browser: true,
+        organizationSlug: slug,
+        audiences: ['https://api.gas.example', 'https://other.gas.example'],
+      },
     });
     const rotated = await gas.oauthClient.update(client.id, metadata.outs, {
       ...metadata.outs,
@@ -238,8 +254,35 @@ describe('resources against the admin API', () => {
       connection,
       idempotencyKey: `urn:min:${t}`,
       clientId: `gas-min-${t}`,
+      organizationSlug: slug,
     });
     expect(minimal.id).toBe(`gas-min-${t}`);
+
+    // A public PKCE client: no secret on create, and a rotation version rotates nothing.
+    const cliInputs = {
+      connection,
+      idempotencyKey: `urn:cli:${t}`,
+      clientId: `gas-cli-${t}`,
+      organizationSlug: slug,
+      redirectUris: ['http://127.0.0.1/callback'],
+      scopes: ['openid'],
+      audiences: ['https://api.gas.example'],
+      tokenEndpointAuthMethod: 'none' as const,
+    };
+    const cli = await gas.oauthClient.create(cliInputs);
+    expect(cli.outs).not.toHaveProperty('clientSecret');
+    expect(await gas.oauthClient.read(cli.id, cli.outs)).toMatchObject({
+      props: { tokenEndpointAuthMethod: 'none', browser: true, audiences: cliInputs.audiences },
+    });
+    const versioned = { ...cliInputs, secretRotationVersion: 'v1' };
+    expect(await gas.oauthClient.diff(cli.id, cli.outs, versioned)).toEqual({
+      changes: false,
+      replaces: [],
+    });
+    expect((await gas.oauthClient.update(cli.id, cli.outs, versioned)).outs).not.toHaveProperty(
+      'clientSecret',
+    );
+    await gas.oauthClient.delete(cli.id, cli.outs);
 
     const secrets = {
       connection,
@@ -333,7 +376,7 @@ describe('client behavior', () => {
       status: 'active',
     };
     const member = { ...outs, organizationSlug: 'o', userId: 'u', role: 'member' };
-    const client = { ...outs, clientId: 'c', secretRotationVersion: '1' };
+    const client = { ...outs, clientId: 'c', organizationSlug: 'acme', secretRotationVersion: '1' };
     const cases: Array<[() => Promise<unknown>, string]> = [
       [() => failing.organization.create(org), 'create organization'],
       [() => failing.organization.read('s', org), 'read organization'],

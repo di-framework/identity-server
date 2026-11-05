@@ -2,6 +2,7 @@ import { Component, Container } from '@di-framework/core/decorators';
 import type { Clock } from '../../shared/domain/clock.ts';
 import { AUTHORIZATIONS, CLOCK, REGISTERED_CLIENTS } from '../../shared/domain/tokens.ts';
 import { Hashing } from '../../shared/infrastructure/crypto/hashing.ts';
+import { tokenAudience } from '../domain/audience.ts';
 import type {
   Authorization,
   AuthorizationRepository,
@@ -55,7 +56,7 @@ export class Introspector {
       active: true,
       client_id: found.client.clientId,
       sub: authorization.principalName,
-      aud: [found.client.clientId],
+      aud: tokenAudience(found.client),
       scope: (authorization.access?.scopes ?? authorization.authorizedScopes).join(' '),
       iat: Math.floor(stored.issuedAt / 1000),
       exp: Math.floor(stored.expiresAt / 1000),

@@ -13,6 +13,7 @@ export const schemas = {
   },
   UpdateOAuthClientRequest: {
     type: 'object',
+    required: ['organizationSlug'],
     properties: {
       organizationSlug: {
         type: 'string',
@@ -31,8 +32,19 @@ export const schemas = {
         },
         uniqueItems: true,
       },
+      audiences: {
+        type: 'array',
+        items: {
+          type: 'string',
+        },
+        uniqueItems: true,
+      },
       browser: {
         type: 'boolean',
+      },
+      tokenEndpointAuthMethod: {
+        type: 'string',
+        enum: ['client_secret_basic', 'none'],
       },
     },
   },
@@ -59,8 +71,19 @@ export const schemas = {
         },
         uniqueItems: true,
       },
+      audiences: {
+        type: 'array',
+        items: {
+          type: 'string',
+        },
+        uniqueItems: true,
+      },
       browser: {
         type: 'boolean',
+      },
+      token_endpoint_auth_method: {
+        type: 'string',
+        enum: ['client_secret_basic', 'none'],
       },
       revoked_at: {
         type: 'string',
@@ -121,6 +144,7 @@ export const schemas = {
   },
   CreateOAuthClientRequest: {
     type: 'object',
+    required: ['clientId', 'organizationSlug'],
     properties: {
       clientId: {
         type: 'string',
@@ -142,13 +166,25 @@ export const schemas = {
         },
         uniqueItems: true,
       },
+      audiences: {
+        type: 'array',
+        items: {
+          type: 'string',
+        },
+        uniqueItems: true,
+      },
       browser: {
         type: 'boolean',
+      },
+      tokenEndpointAuthMethod: {
+        type: 'string',
+        enum: ['client_secret_basic', 'none'],
       },
     },
   },
   OAuthClientSecretResponse: {
     type: 'object',
+    required: ['client_id'],
     properties: {
       client_id: {
         type: 'string',
