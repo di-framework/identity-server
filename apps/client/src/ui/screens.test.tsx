@@ -71,6 +71,8 @@ describe('identity client screens', () => {
         message: 'A user with this email or login already exists.',
       },
       { page: 'error', ...actor, title: 'Not Found', message: '' },
+      { page: 'error', ...guest, title: 'Bad Request', message: 'The request is not valid.' },
+      { page: 'not-found', ...guest },
       {
         page: 'users',
         ...actor,
@@ -370,6 +372,13 @@ describe('identity client screens', () => {
         await user.type(screen.getByRole('textbox', { name: /Email or login/ }), 'ada');
         expect(screen.queryByText('signed out')).toBeNull();
         expect(document.querySelector('input[name="_csrf"]')).toBeTruthy();
+      }
+      if (page.page === 'error' || page.page === 'not-found') {
+        // The masthead offers sign-out only to a signed-in user; a guest's brand link goes to login.
+        expect(screen.queryByRole('button', { name: 'Log out' }) !== null).toBe(page.signedIn);
+        expect(screen.getByRole('link', { name: 'Identity' }).getAttribute('href')).toBe(
+          page.signedIn ? '/account/identity-links' : '/login',
+        );
       }
       if (page.page === 'consent' && page.scopes.length > 0) {
         expect(screen.queryByRole('button', { name: 'Deny' })).toBeNull();

@@ -84,15 +84,6 @@ export class ControlPlaneController {
     @Component(LinkService) private readonly links: LinkService,
   ) {}
 
-  dispatch(operationId: string, request: RouteRequest): Promise<ServiceResult<unknown>> {
-    const candidate = (this as unknown as Record<string, unknown>)[operationId];
-    if (typeof candidate !== 'function') throw new Error(`No handler for ${operationId}`);
-    return (candidate as (request: RouteRequest) => Promise<ServiceResult<unknown>>).call(
-      this,
-      request,
-    );
-  }
-
   users(): Promise<ServiceResult<unknown>> {
     return this.directory.listUsers();
   }

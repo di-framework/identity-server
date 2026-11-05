@@ -136,7 +136,7 @@ export function App({
   path?: string;
   search?: string;
   load?: typeof globalThis.fetch;
-} = {}) {
+}) {
   const resource = useResource(
     path ?? window.location.pathname,
     search ?? window.location.search,

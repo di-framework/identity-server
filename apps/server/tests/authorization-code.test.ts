@@ -500,6 +500,10 @@ describe('authorization code flow', () => {
       form: { client_id: app.clientId, state: 'nope' },
     });
     expect(missing.status).toBe(400);
+    const stateless = await browser.send('POST', '/oauth2/authorize', {
+      form: { client_id: app.clientId, scope: 'openid' },
+    });
+    expect(stateless.status).toBe(400);
     const denied = await browser.send('POST', '/oauth2/authorize', {
       form: { client_id: app.clientId, state, scope: 'openid' },
     });

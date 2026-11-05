@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test';
+import net from 'node:net';
 import { useContainer } from '@di-framework/core/container';
 import { IdentityModule } from '../src/composition.ts';
 import { Mailer } from '../src/mail/application/mailer.ts';
@@ -8,6 +9,7 @@ import {
   SmtpError,
   SmtpMailSender,
   type SmtpOptions,
+  type TlsLoader,
   UnconfiguredMailSender,
 } from '../src/mail/infrastructure/smtp-mail-sender.ts';
 import { loadIdentitySettings } from '../src/shared/infrastructure/identity-settings.ts';
@@ -25,20 +27,32 @@ function server(options: FakeSmtpOptions = {}): FakeSmtpServer {
   return instance;
 }
 
-function sender(port: number, options: Partial<SmtpOptions> = {}): SmtpMailSender {
-  return new SmtpMailSender({
-    host: '127.0.0.1',
-    port,
-    username: '',
-    password: '',
-    from: 'no-reply@identity.test',
-    auth: false,
-    starttls: false,
-    ssl: false,
-    timeoutMs: 2000,
-    ...options,
-  });
+function sender(port: number, options: Partial<SmtpOptions> = {}, tls?: TlsLoader): SmtpMailSender {
+  return new SmtpMailSender(
+    {
+      host: '127.0.0.1',
+      port,
+      username: '',
+      password: '',
+      from: 'no-reply@identity.test',
+      auth: false,
+      starttls: false,
+      ssl: false,
+      timeoutMs: 2000,
+      ...options,
+    },
+    tls,
+  );
 }
+
+/** A TLS runtime that reports the handshake complete with the peer not authorized. */
+const unauthorizedTls: TlsLoader = async () => ({
+  connect: () => {
+    const socket = Object.assign(new net.Socket(), { authorized: false });
+    setImmediate(() => socket.emit('secureConnect'));
+    return socket;
+  },
+});
 
 const message = {
   to: 'ada@example.com',
@@ -131,6 +145,26 @@ describe('SMTP client', () => {
     }).send(message);
     expect(smtp.messages).toHaveLength(1);
     expect(smtp.commands).not.toContain('STARTTLS');
+
+    const untrusted = server({ implicitTls: true });
+    await expect(sender(untrusted.port, { ssl: true }).send(message)).rejects.toThrow(
+      'SMTP TLS handshake failed',
+    );
+    expect(untrusted.messages).toHaveLength(0);
+  });
+
+  test('refuses a handshake the TLS runtime completes without authorizing the peer', async () => {
+    const implicit = server({ implicitTls: true });
+    await expect(
+      sender(implicit.port, { ssl: true }, unauthorizedTls).send(message),
+    ).rejects.toThrow('SMTP TLS handshake failed');
+
+    const upgraded = server({ starttls: true });
+    await expect(
+      sender(upgraded.port, { starttls: true }, unauthorizedTls).send(message),
+    ).rejects.toThrow('SMTP TLS handshake failed');
+    expect(upgraded.commands).toContain('STARTTLS');
+    expect(upgraded.messages).toHaveLength(0);
   });
 
   test('fails with the reply code and never the message content', async () => {

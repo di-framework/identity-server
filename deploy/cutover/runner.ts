@@ -123,7 +123,6 @@ export async function startRunner(
     stdout: 'pipe',
     stderr: 'pipe',
   });
-  const replies: string[] = [];
   const waiting: Array<(line: string) => void> = [];
   let ended = false;
   const lines = async (stream: ReadableStream<Uint8Array>, onLine: (line: string) => void) => {
@@ -141,9 +140,9 @@ export async function startRunner(
   const stdout = lines(child.stdout, (line) => {
     const reply = replyLine(line);
     if (reply === undefined) return;
-    const next = waiting.shift();
-    if (next) next(reply);
-    else replies.push(reply);
+    // The bridge awaits each reply before it sends the next request, so a reply always has its
+    // receiver waiting; a reply nobody asked for is dropped like the engine's other output.
+    waiting.shift()?.(reply);
   }).finally(() => {
     ended = true;
     for (const next of waiting.splice(0)) next(LOST);
@@ -158,8 +157,6 @@ export async function startRunner(
       child.stdin.flush();
     },
     receive() {
-      const ready = replies.shift();
-      if (ready !== undefined) return Promise.resolve(ready);
       if (ended) return Promise.resolve(LOST);
       return new Promise((resolve) => waiting.push(resolve));
     },

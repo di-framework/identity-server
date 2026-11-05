@@ -330,7 +330,7 @@ export class WebApp {
           result.status,
         );
       }
-      return this.admin(result, () => page({ page: 'not-found' }));
+      return this.admin(result);
     }
     const userAction = /^\/admin\/users\/([^/]+)\/(archive|restore|password-reset)$/.exec(path);
     if (userAction && !get) {
@@ -341,7 +341,7 @@ export class WebApp {
           : action === 'restore'
             ? await this.users.restore(actor, id)
             : await this.users.passwordReset(actor, id);
-      return this.admin(result, () => page({ page: 'not-found' }));
+      return this.admin(result);
     }
     const userDetail = /^\/admin\/users\/([^/]+)$/.exec(path);
     if (userDetail && get) return this.userPage(actor, userDetail[1] ?? '', q);
@@ -362,7 +362,7 @@ export class WebApp {
           result.status,
         );
       }
-      return this.admin(result, () => page({ page: 'not-found' }));
+      return this.admin(result);
     }
     const orgAction = /^\/admin\/organizations\/([^/]+)\/(settings|archive)$/.exec(path);
     if (orgAction && !get) {
@@ -371,7 +371,7 @@ export class WebApp {
         action === 'settings'
           ? await this.organizations.updateSettings(actor, id, value('name'))
           : await this.organizations.archive(actor, id);
-      return this.admin(result, () => page({ page: 'not-found' }));
+      return this.admin(result);
     }
     const orgDetail = /^\/admin\/organizations\/([^/]+)$/.exec(path);
     if (orgDetail && get) return this.organizationPage(actor, orgDetail[1] ?? '', q);
@@ -384,7 +384,6 @@ export class WebApp {
           userLoginOrEmail: value('userLoginOrEmail'),
           role: value('role'),
         }),
-        () => page({ page: 'not-found' }),
       );
     }
     if (path === '/admin/memberships/role-change' && !get) {
@@ -394,7 +393,6 @@ export class WebApp {
           userId: value('userId'),
           newRole: value('newRole'),
         }),
-        () => page({ page: 'not-found' }),
       );
     }
     if (path === '/admin/memberships/remove' && !get) {
@@ -403,7 +401,6 @@ export class WebApp {
           orgSlug: value('orgSlug'),
           userId: value('userId'),
         }),
-        () => page({ page: 'not-found' }),
       );
     }
 
@@ -444,7 +441,7 @@ export class WebApp {
           await this.clients.rotateSecret(actor, id),
           'secret-rotated',
         );
-      return this.admin(await this.clients.revoke(actor, id), () => page({ page: 'not-found' }));
+      return this.admin(await this.clients.revoke(actor, id));
     }
     const clientDetail = /^\/admin\/oauth-clients\/([^/]+)$/.exec(path);
     if (clientDetail && get) return this.clientPage(actor, clientDetail[1] ?? '', q);
@@ -549,7 +546,7 @@ export class WebApp {
 
   private async organizationPage(actor: string, id: string, q: Query): Promise<Result> {
     const detail = await this.organizations.detail(actor, id);
-    if (detail.kind !== 'ok') return this.admin(detail, () => page({ page: 'not-found' }));
+    if (detail.kind !== 'ok') return this.admin(detail);
     const { organization, memberCount, clientCount, canArchive } = detail.value;
     const canEdit = await this.policy.authorized(actor, 'ORG_EDIT_SETTINGS', {
       orgSlug: organization.slug,
@@ -675,15 +672,20 @@ export class WebApp {
     );
   }
 
+  /**
+   * Maps an admin action's result to a page. An action whose result is `AdminResult<never>` only
+   * redirects or fails, so it passes no `ok` handler; the fallback stands for a result that cannot
+   * occur.
+   */
   private async admin<T>(
     result: AdminResult<T>,
-    ok: (value: T) => Result | Promise<Result>,
+    ok?: (value: T) => Result | Promise<Result>,
   ): Promise<Result> {
     if (result.kind === 'redirect') return redirect(result.location);
     if (result.kind === 'error') {
       return page({ page: 'error', title: result.title, message: result.message }, result.status);
     }
-    return ok(result.value);
+    return ok ? ok(result.value) : page({ page: 'not-found' });
   }
 
   // ---- linked identities -------------------------------------------------------------------

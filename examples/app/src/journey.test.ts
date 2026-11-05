@@ -71,6 +71,15 @@ describe('example app journeys', () => {
     expect(meBody.sub).toBe(registeredBody.principal?.sub);
     expect(me.headers.get('cache-control')).toBe('no-store');
 
+    const session = await call('/auth/session', { headers: { cookie: pair(sid ?? '') } });
+    expect(session.ok).toBe(true);
+    expect(((await session.json()) as { principal?: { sub?: string } }).principal?.sub).toBe(
+      registeredBody.principal?.sub,
+    );
+    const noSession = await call('/auth/session');
+    expect(noSession.ok).toBe(true);
+    expect(await noSession.json()).toEqual({ principal: null });
+
     const forged = await call('/me', { headers: { cookie: '__Host-sid=forged' } });
     expect(forged.status).toBe(401);
 

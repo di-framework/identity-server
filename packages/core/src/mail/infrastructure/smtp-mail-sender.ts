@@ -45,6 +45,9 @@ type TlsConnect = (options: {
   ca?: string;
 }) => Socket;
 
+/** Loads the TLS module ({@link loadSmtpTls} by default). */
+export type TlsLoader = () => Promise<{ connect: TlsConnect }>;
+
 /**
  * `node:tls` when the host linked it. A variable specifier keeps the guest bundle from importing
  * `wasi:tls` until a relay actually asks for TLS; a host without that link fails the send.
@@ -68,10 +71,14 @@ async function loadNodeTls(): Promise<{ connect: TlsConnect }> {
 
 /** Minimal RFC 5321 client on `node:net`: EHLO, STARTTLS, AUTH, MAIL, RCPT, DATA, QUIT. */
 export class SmtpMailSender implements MailSender {
-  constructor(private readonly options: SmtpOptions) {}
+  /** `tls` is the TLS module loader; tests substitute one to drive handshake outcomes. */
+  constructor(
+    private readonly options: SmtpOptions,
+    private readonly tls: TlsLoader = loadSmtpTls,
+  ) {}
 
   async send(message: MailMessage): Promise<void> {
-    const session = await SmtpSession.open(this.options);
+    const session = await SmtpSession.open(this.options, this.tls);
     try {
       await session.deliver(message);
     } finally {
@@ -122,14 +129,15 @@ class SmtpSession {
 
   private constructor(
     private readonly options: SmtpOptions,
+    private readonly tls: TlsLoader,
     socket: Socket,
   ) {
     this.active = socket;
   }
 
-  static async open(options: SmtpOptions): Promise<SmtpSession> {
-    const socket = options.ssl ? await connectTls(options) : await connectPlain(options);
-    const session = new SmtpSession(options, socket);
+  static async open(options: SmtpOptions, tls: TlsLoader): Promise<SmtpSession> {
+    const socket = options.ssl ? await connectTls(options, tls) : await connectPlain(options);
+    const session = new SmtpSession(options, tls, socket);
     session.watch(socket);
     return session;
   }
@@ -183,7 +191,7 @@ class SmtpSession {
   }
 
   private async upgrade(): Promise<void> {
-    const tls = await loadSmtpTls();
+    const tls = await this.tls();
     this.unwatch(this.active);
     // Bytes after the 220 arrived in plaintext; read as TLS replies they would let anyone on
     // the path forge the post-upgrade EHLO (STARTTLS response injection).
@@ -326,8 +334,8 @@ function connectPlain(options: SmtpOptions): Promise<Socket> {
   });
 }
 
-async function connectTls(options: SmtpOptions): Promise<Socket> {
-  const tls = await loadSmtpTls();
+async function connectTls(options: SmtpOptions, load: TlsLoader): Promise<Socket> {
+  const tls = await load();
   const verify = options.tls?.rejectUnauthorized ?? true;
   return new Promise((resolve, reject) => {
     let settled = false;
